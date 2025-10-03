@@ -8,15 +8,30 @@ import jax
 
 def process_array(arr):
     """
-    Checks for duplicate values in a sorted numpy array.
+    Check for duplicate values in array and perturb them to ensure uniqueness.
+
     If duplicates exist, perturbs the values slightly to make them unique
-    and resorts the array if necessary after perturbation.
+    and resorts the array if necessary after perturbation. This is useful
+    for creating monotonic interpolators that require strictly increasing inputs.
 
-    Parameters:
-    arr (numpy.ndarray): A sorted numpy array.
+    Parameters
+    ----------
+    arr : numpy.ndarray
+        Input array (will be sorted internally).
 
-    Returns:
-    numpy.ndarray: The processed array with no duplicates.
+    Returns
+    -------
+    numpy.ndarray
+        Processed array with no duplicate values.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from coppuccino.bijections import process_array
+    >>> arr = np.array([1.0, 2.0, 2.0, 3.0, 3.0, 3.0, 4.0])
+    >>> processed = process_array(arr)
+    >>> len(processed) == len(np.unique(processed))
+    True
     """
     # Convert to float for perturbation
     arr = np.sort(arr)
@@ -63,14 +78,43 @@ def process_array(arr):
 
 def make_empirical_cdf_spline(samples, num_points=200, min_eps=1e-7):
     """
-    Create empirical CDF and PDF (autodiff on CDF).
+    Create empirical CDF, inverse CDF (quantile), and PDF functions from samples.
+
+    This function constructs smooth monotonic spline interpolators for the empirical
+    CDF and its inverse based on input samples. The PDF is computed via automatic
+    differentiation of the CDF spline.
 
     Parameters
     ----------
-    x_grid : array_like
-        Grid points for CDF evaluation
     samples : array_like
-        Training data samples
+        Training data samples from which to construct the empirical distribution.
+    num_points : int, optional
+        Number of grid points to use for spline construction. Default is 200.
+    min_eps : float, optional
+        Minimum epsilon to avoid CDF values exactly 0 or 1. Default is 1e-7.
+
+    Returns
+    -------
+    cdf_vals : numpy.ndarray
+        Empirical CDF values at the grid points.
+    cdf_fn : callable
+        Function mapping x → CDF(x), with extrapolation handling.
+    quantile_fn : callable
+        Function mapping u ∈ [0,1] → x (inverse CDF).
+    pdf_fn : callable
+        Function mapping x → PDF(x) via automatic differentiation.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from coppuccino.bijections import make_empirical_cdf_spline
+    >>> samples = np.random.normal(0, 1, 1000)
+    >>> cdf_vals, cdf_fn, quantile_fn, pdf_fn = make_empirical_cdf_spline(samples)
+    >>> # Evaluate CDF at a point
+    >>> import jax.numpy as jnp
+    >>> cdf_fn(jnp.array(0.0))  # Should be approximately 0.5 for standard normal
+    >>> # Get median via quantile function
+    >>> quantile_fn(jnp.array(0.5))  # Should be approximately 0.0
     """
     x_grid = np.quantile(samples, np.linspace(0, 1, num_points))
     # Sort the grid
@@ -126,7 +170,43 @@ def make_empirical_cdf_spline(samples, num_points=200, min_eps=1e-7):
 
 class EmpiricalMarginalToGaussian(AbstractBijection):
     """
-    Transform from empirical marginal to standard Gaussian.
+    Bijection transforming empirical marginal distribution to standard Gaussian.
+
+    This bijection uses the probability integral transform (PIT) combined with
+    the inverse normal CDF to map samples from an empirical distribution to
+    a standard Gaussian distribution. It's useful for copula modeling where
+    marginals need to be transformed to Gaussian.
+
+    Attributes
+    ----------
+    samples : np.ndarray
+        Original data samples used to construct the empirical distribution.
+    cdf_fn : Callable
+        Empirical CDF function.
+    quantile_fn : Callable
+        Inverse CDF (quantile) function.
+    pdf_fn : Callable
+        Empirical PDF function (derivative of CDF).
+    min_eps : float, default=1e-7
+        Minimum epsilon to avoid CDF values of exactly 0 or 1.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> import jax.numpy as jnp
+    >>> from coppuccino.bijections import EmpiricalMarginalToGaussian, make_empirical_cdf_spline
+    >>> # Generate samples from a non-Gaussian distribution
+    >>> samples = np.random.exponential(2.0, 1000)
+    >>> cdf_vals, cdf_fn, quantile_fn, pdf_fn = make_empirical_cdf_spline(samples)
+    >>> # Create bijection
+    >>> bij = EmpiricalMarginalToGaussian(
+    ...     samples=samples, cdf_fn=cdf_fn, quantile_fn=quantile_fn, pdf_fn=pdf_fn
+    ... )
+    >>> # Transform sample to Gaussian space
+    >>> x = jnp.array(2.0)
+    >>> z, log_det = bij.inverse_and_log_det(x)
+    >>> # Transform back
+    >>> x_recovered, log_det_fwd = bij.transform_and_log_det(z)
     """
     samples: np.ndarray
     cdf_fn: Callable
@@ -137,7 +217,31 @@ class EmpiricalMarginalToGaussian(AbstractBijection):
     shape: ClassVar[tuple[int, ...]] = ()
 
     def inverse_and_log_det(self, x, condition=None):
-        """Transform from original space to standard Gaussian with smooth extrapolation."""
+        """
+        Transform from original space to standard Gaussian.
+
+        Applies the probability integral transform using the empirical CDF,
+        then maps the uniform variable to Gaussian via the inverse normal CDF.
+
+        Parameters
+        ----------
+        x : array_like
+            Values in the original (empirical) space.
+        condition : None
+            Not used (for API compatibility).
+
+        Returns
+        -------
+        z : jax.Array
+            Transformed values in standard Gaussian space.
+        log_det : float
+            Log absolute determinant of the Jacobian.
+
+        Examples
+        --------
+        >>> import jax.numpy as jnp
+        >>> z, log_det = bij.inverse_and_log_det(jnp.array([1.0, 2.0, 3.0]))
+        """
         # Get CDF value using smooth interpolation
         u = self.cdf_fn(x)
 
@@ -153,7 +257,32 @@ class EmpiricalMarginalToGaussian(AbstractBijection):
         return z, jnp.sum(log_det)
 
     def transform_and_log_det(self, z, condition=None):
-        """Transform from standard Gaussian to original space with smooth extrapolation."""
+        """
+        Transform from standard Gaussian to original space.
+
+        Applies the normal CDF to get a uniform variable, then maps to the
+        original space using the empirical quantile function.
+
+        Parameters
+        ----------
+        z : array_like
+            Values in standard Gaussian space.
+        condition : None
+            Not used (for API compatibility).
+
+        Returns
+        -------
+        x : jax.Array
+            Transformed values in the original (empirical) space.
+        log_det : float
+            Log absolute determinant of the Jacobian.
+
+        Examples
+        --------
+        >>> import jax.numpy as jnp
+        >>> z = jnp.array([0.0, 1.0, -1.0])
+        >>> x, log_det = bij.transform_and_log_det(z)
+        """
         # Transform to uniform using JAX normal CDF
         u = ndtr(z)  # JAX equivalent of norm.cdf
         # Clip u to ensure it's in valid range for quantile function

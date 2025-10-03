@@ -16,19 +16,39 @@ from coppuccino.bijections import make_empirical_cdf_spline
 
 def _create_empirical_transforms(samples: np.ndarray, min_eps: float = 1e-12):
     """
-    Create empirical marginal transforms for a single source's data.
+    Create empirical marginal transforms for copula modeling.
+
+    Constructs individual empirical CDF transforms for each parameter dimension
+    and stacks them into a single bijection. This is the first step in copula
+    modeling, transforming marginals to Gaussian.
 
     Parameters
     ----------
-    samples : ndarray
-        Samples with shape (n_samples, n_params)
+    samples : np.ndarray
+        Input samples with shape (n_samples, n_params).
+    min_eps : float, optional
+        Minimum epsilon for CDF bounds. Default is 1e-12.
 
     Returns
     -------
     transform : Stack
-        Stacked empirical transforms for each parameter
+        Stacked empirical transforms for each parameter dimension.
     inverse_log_det : callable
-        JIT-compiled inverse log determinant function
+        JIT-compiled vectorized function computing inverse transform and log determinant.
+
+    Raises
+    ------
+    ValueError
+        If any parameter has fewer than 20 samples.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from coppuccino.copula_flows import _create_empirical_transforms
+    >>> samples = np.random.randn(1000, 3)
+    >>> transform, inverse_log_det = _create_empirical_transforms(samples)
+    >>> # Transform samples to Gaussian space
+    >>> x_gaussian, log_det = inverse_log_det(samples)
     """
     x = samples[~np.isnan(samples).any(axis=1)]
     empirical_transforms = []
@@ -49,6 +69,53 @@ def _create_empirical_transforms(samples: np.ndarray, min_eps: float = 1e-12):
 
 
 def fit_chain_entry(input_flow, transform, inverse_log_det, chain_entry: np.ndarray, patience=20, learning_rate=1e-4, rng_seed: int = 999, max_epochs: int = 200):
+    """
+    Fit a normalizing flow to data with empirical marginal transforms.
+
+    This is an internal helper function that trains a flow on data after
+    transforming it through empirical marginal transforms.
+
+    Parameters
+    ----------
+    input_flow : Transformed
+        Initial flow to be fitted.
+    transform : Stack
+        Empirical marginal transforms.
+    inverse_log_det : callable
+        Function computing inverse transform and log determinant.
+    chain_entry : np.ndarray
+        Training data with shape (n_samples, n_params).
+    patience : int, optional
+        Early stopping patience. Default is 20.
+    learning_rate : float, optional
+        Learning rate for optimization. Default is 1e-4.
+    rng_seed : int, optional
+        Random seed for reproducibility. Default is 999.
+    max_epochs : int, optional
+        Maximum number of training epochs. Default is 200.
+
+    Returns
+    -------
+    Transformed
+        Fitted flow with empirical marginal transforms applied.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> import jax.numpy as jnp
+    >>> import jax.random as jr
+    >>> from flowjax.flows import triangular_spline_flow
+    >>> from flowjax.distributions import Normal
+    >>> from coppuccino.copula_flows import _create_empirical_transforms, fit_chain_entry
+    >>> # Create data and transforms
+    >>> data = np.random.randn(1000, 3)
+    >>> transform, inverse_log_det = _create_empirical_transforms(data)
+    >>> # Create initial flow
+    >>> key = jr.key(0)
+    >>> flow = triangular_spline_flow(key, base_dist=Normal(jnp.zeros(3)), flow_layers=4)
+    >>> # Fit the flow
+    >>> fitted_flow = fit_chain_entry(flow, transform, inverse_log_det, data)
+    """
     key = jr.key(rng_seed)
     key, subkey_2 = jr.split(key)
     x_train, __ = inverse_log_det(chain_entry)
@@ -83,37 +150,58 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
                           knots: int = 16, patience: int = 20, learning_rate: float = 1e-4,
                           max_epochs: int = 200, flow_layers: int = 8) -> Transformed:
     """
-    Fit a composite flow to the chain: MAF → Triangular Spline.
+    Fit a copula normalizing flow to multivariate data.
+
+    This function implements a copula-based normalizing flow by:
+    1. Transforming each marginal to Gaussian via empirical CDF
+    2. Modeling the Gaussian copula dependencies with a triangular spline flow
+
+    The approach combines flexibility in modeling marginals (via empirical CDFs)
+    with powerful dependency modeling (via normalizing flows).
 
     Parameters
     ----------
-    chain : ndarray, shape (n_samples, n_params)
-        Posterior samples, possibly containing NaNs for missing sources.
+    chain : np.ndarray
+        Training samples with shape (n_samples, n_params). May contain NaN values
+        which will be removed before fitting.
     rng_seed : int, optional
-        Random seed for reproducibility (default is 999).
+        Random seed for reproducibility. Default is 999.
     knots : int, optional
-        Number of knots for spline transformations (default is 16).
+        Number of knots for rational quadratic spline transformations. Default is 16.
     patience : int, optional
-        Training patience for early stopping (default is 20).
+        Early stopping patience (epochs without improvement). Default is 20.
     learning_rate : float, optional
-        Learning rate for training (default is 1e-4).
+        Learning rate for Adam optimizer. Default is 1e-4.
     max_epochs : int, optional
-        Maximum training epochs (default is 200).
-    maf_layers : int, optional
-        Number of MAF layers for handling bimodality (default is 8).
-    spline_layers : int, optional
-        Number of triangular spline layers for refining correlations (default is 8).
-    nn_depth : int, optional
-        Depth of neural networks in MAF (default is 2).
-    nn_width : int, optional
-        Width of neural networks in MAF (default is 128).
-    use_maf : bool, optional
-        If True, use MAF → Triangular chain. If False, use only Triangular (default is True).
+        Maximum number of training epochs. Default is 200.
+    flow_layers : int, optional
+        Number of coupling layers in the triangular spline flow. Default is 8.
 
     Returns
     -------
     Transformed
-        Fitted composite flow.
+        Fitted copula flow model that can be used for sampling and density evaluation.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from coppuccino.copula_flows import normalizing_flows_fit, sample
+    >>> # Generate correlated data
+    >>> np.random.seed(42)
+    >>> mean = [0, 0]
+    >>> cov = [[1, 0.8], [0.8, 1]]
+    >>> data = np.random.multivariate_normal(mean, cov, 1000)
+    >>> # Fit copula flow
+    >>> flow = normalizing_flows_fit(data, rng_seed=42, flow_layers=4, max_epochs=100)
+    >>> # Generate new samples
+    >>> new_samples = sample(flow, n_samples=500, rng_seed=123)
+    >>> new_samples.shape
+    (500, 2)
+
+    Notes
+    -----
+    The triangular spline flow uses autoregressive transformations that are
+    particularly efficient for capturing dependencies in high-dimensional data.
     """
     key = jr.key(rng_seed)
     # key1, key2 = jr.split(key)
@@ -173,21 +261,36 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
 
 def sample(flow: Callable, n_samples: int, rng_seed: int = 999) -> np.ndarray:
     """
-    Generate samples from the fitted flow.
+    Generate samples from a fitted copula flow.
+
+    Draws random samples from the learned distribution by sampling from the
+    base Gaussian distribution and transforming through the trained flow.
 
     Parameters
     ----------
     flow : Callable
-        The fitted flow.
+        Fitted flow model (typically a Transformed distribution).
     n_samples : int
         Number of samples to generate.
     rng_seed : int, optional
-        Random seed for reproducibility (default is 999).
+        Random seed for reproducibility. Default is 999.
 
     Returns
     -------
-    ndarray
+    np.ndarray
         Generated samples with shape (n_samples, n_params).
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from coppuccino.copula_flows import normalizing_flows_fit, sample
+    >>> # Fit a flow to data
+    >>> data = np.random.randn(1000, 3)
+    >>> flow = normalizing_flows_fit(data, max_epochs=50)
+    >>> # Generate 100 new samples
+    >>> new_samples = sample(flow, n_samples=100, rng_seed=42)
+    >>> new_samples.shape
+    (100, 3)
 
     Notes
     -----
@@ -204,19 +307,37 @@ def sample(flow: Callable, n_samples: int, rng_seed: int = 999) -> np.ndarray:
 
 def log_prob(flow: Transformed, samples: np.ndarray) -> np.ndarray:
     """
-    Compute log probabilities of given samples under the fitted flow.
+    Compute log probability density of samples under a fitted copula flow.
+
+    Evaluates the log probability density function at the given sample points.
+    This is useful for model evaluation, likelihood computation, and outlier detection.
 
     Parameters
     ----------
-    flow : Callable
-        The fitted flow.
-    samples : ndarray
-        Samples for which to compute log probabilities, shape (n_samples, n_params).
+    flow : Transformed
+        Fitted copula flow model.
+    samples : np.ndarray
+        Samples at which to evaluate log probability, shape (n_samples, n_params).
 
     Returns
     -------
-    ndarray
-        Log probabilities of the samples, shape (n_samples,).
+    np.ndarray
+        Log probability densities, shape (n_samples,).
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from coppuccino.copula_flows import normalizing_flows_fit, log_prob
+    >>> # Fit flow to training data
+    >>> train_data = np.random.randn(1000, 2)
+    >>> flow = normalizing_flows_fit(train_data, max_epochs=50)
+    >>> # Evaluate log probability on test data
+    >>> test_data = np.random.randn(100, 2)
+    >>> log_probs = log_prob(flow, test_data)
+    >>> log_probs.shape
+    (100,)
+    >>> # Higher values indicate higher probability density
+    >>> np.mean(log_probs)
     """
     log_probs = filter_jit(flow.log_prob)(samples)
     return np.array(log_probs)
@@ -224,23 +345,43 @@ def log_prob(flow: Transformed, samples: np.ndarray) -> np.ndarray:
 
 def sample_and_log_prob(flow: Transformed, n_samples: int, rng_seed: int = 999) -> tuple[np.ndarray, np.ndarray]:
     """
-    Generate samples and compute their log probabilities under the fitted flow.
+    Generate samples and compute their log probabilities simultaneously.
+
+    This is more efficient than calling `sample` and `log_prob` separately,
+    as it avoids redundant computations when both samples and their densities
+    are needed (e.g., for importance sampling or MCMC).
 
     Parameters
     ----------
-    flow : Callable
-        The fitted flow.
+    flow : Transformed
+        Fitted copula flow model.
     n_samples : int
         Number of samples to generate.
     rng_seed : int, optional
-        Random seed for reproducibility (default is 999).
+        Random seed for reproducibility. Default is 999.
 
     Returns
     -------
-    tuple of ndarray
-        Tuple containing:
-        - Generated samples with shape (n_samples, n_params).
-        - Log probabilities of the samples with shape (n_samples,).
+    samples : np.ndarray
+        Generated samples with shape (n_samples, n_params).
+    log_probs : np.ndarray
+        Log probability densities of the generated samples, shape (n_samples,).
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from coppuccino.copula_flows import normalizing_flows_fit, sample_and_log_prob
+    >>> # Fit flow
+    >>> data = np.random.randn(1000, 2)
+    >>> flow = normalizing_flows_fit(data, max_epochs=50)
+    >>> # Generate samples with their log probabilities
+    >>> samples, log_probs = sample_and_log_prob(flow, n_samples=100, rng_seed=42)
+    >>> samples.shape
+    (100, 2)
+    >>> log_probs.shape
+    (100,)
+    >>> # Use for importance sampling weights
+    >>> weights = np.exp(log_probs)
     """
     sample_shape = (n_samples,)
     key = jr.key(rng_seed)
