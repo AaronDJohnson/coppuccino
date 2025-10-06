@@ -3,8 +3,8 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-from flowjax.bijections import Stack, Chain as BijectionChain, RationalQuadraticSpline
-from flowjax.flows import triangular_spline_flow, masked_autoregressive_flow
+from flowjax.bijections import Stack
+from flowjax.flows import triangular_spline_flow
 from flowjax.train import fit_to_data
 from flowjax.distributions import Normal, Transformed
 from paramax import non_trainable
