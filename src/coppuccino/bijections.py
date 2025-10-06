@@ -141,8 +141,16 @@ def make_empirical_cdf_spline(samples, num_points=200, min_eps=1e-7):
 
     def cdf_fn(u):
         u = jnp.asarray(u)
-        y = cdf_spline(u)
-        y = jnp.where(u < data_min, min_eps, jnp.where(u > data_max, 1.0 - min_eps, y))
+        # Handle extrapolation: constant outside domain
+        y = jnp.where(
+            u <= data_min,
+            min_eps,
+            jnp.where(
+                u >= data_max,
+                1.0 - min_eps,
+                cdf_spline(u)
+            )
+        )
         # Final bounds check to ensure we never return exactly 0 or 1
         y = jnp.clip(y, min_eps, 1.0 - min_eps)
         return y
@@ -159,9 +167,9 @@ def make_empirical_cdf_spline(samples, num_points=200, min_eps=1e-7):
 
     def pdf_fn(x):
         x = jnp.asarray(x)
-        grad_fn = jax.grad(cdf_spline)
+        grad_fn = jax.grad(cdf_fn)
         y = grad_fn(x)
-        # Ensure PDF is always positive and bounded away from zero to avoid log(0)
+        # Ensure positive and bounded to avoid log(0)
         y = jnp.maximum(y, min_eps)
         return y
 
