@@ -3,6 +3,65 @@ from coppuccino.copula_flows import normalizing_flows_fit
 from coppuccino.copula_flows import sample_and_log_prob, log_prob
 
 
+def check_in_support(samples: np.ndarray, injection_params: np.ndarray) -> bool:
+    """
+    Check if injection parameters are within the support of the samples.
+
+    Parameters
+    ----------
+    samples : np.ndarray
+        Posterior samples from inference, shape (n_samples, n_params).
+    injection_params : np.ndarray
+        True parameter values to evaluate, shape (n_params,).
+
+    Returns
+    -------
+    in_support : bool
+        True if all injection parameters are within the min/max range of the samples.
+        False otherwise.
+
+    Raises
+    ------
+    ValueError
+        If injection_params is not 1D or its length does not match number of parameters in samples.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from coppuccino.hdr import check_in_support
+    >>> # Generate posterior samples from inference
+    >>> true_params = np.array([1.0, 2.0])
+    >>> posterior = np.random.randn(1000, 2) + true_params
+    >>> # Check if true parameters are within support of posterior samples
+    >>> in_support = check_in_support(posterior, true_params)
+    >>> print(in_support)
+    True
+
+    >>> # Example where injection is outside support
+    >>> out_of_bounds = np.array([10.0, 20.0])
+    >>> in_support = check_in_support(posterior, out_of_bounds)
+    >>> print(in_support)
+    False
+
+    Notes
+    -----
+    This function checks if each component of the injection parameters lies within
+    the minimum and maximum values observed in the corresponding dimension of the samples.
+    It is a simple heuristic to identify injections that are clearly outside the range
+    of the inferred posterior distribution.
+    """
+    if injection_params.ndim != 1:
+        raise ValueError("injection_params must be a 1D array")
+    if injection_params.shape[0] != samples.shape[1]:
+        raise ValueError("injection_params length must match number of parameters in samples")
+
+    mins = np.min(samples, axis=0)
+    maxs = np.max(samples, axis=0)
+
+    in_support = np.all((injection_params >= mins) & (injection_params <= maxs))
+    return in_support
+
+
 def compute_injection_hdr(samples: np.ndarray, injection_params: np.ndarray, num_samples: int = 100_000, return_flow=False, **nf_kwargs):
     """
     Compute Highest Density Region (HDR) credibility for injection parameters.
@@ -92,6 +151,7 @@ def compute_injection_hdr(samples: np.ndarray, injection_params: np.ndarray, num
         raise ValueError("samples contain Infs")
     if injection_params.ndim == 0:
         raise ValueError("injection_params must be at least 1D")
+
     default_kwargs = {'knots':4, 'patience':30, 'learning_rate':1e-3, 'max_epochs':400, 'flow_layers':6}
     # default_kwargs = {'knots': 32,
     #                   'patience': 20,
@@ -107,14 +167,22 @@ def compute_injection_hdr(samples: np.ndarray, injection_params: np.ndarray, num
     flow = normalizing_flows_fit(samples, **kwargs)  # TODO: document kwargs in docstring
     # sample from flow and compute log probability of those samples
     _, gen_log_probs = sample_and_log_prob(flow, n_samples=num_samples)
-    injection_probs = log_prob(flow, injection_params)
+    hdrs = []
 
-    # Sort once for all searchsorted operations
-    sorted_gen_log_probs = np.sort(gen_log_probs)
-    count = num_samples - np.searchsorted(sorted_gen_log_probs, injection_probs, side='right')
-    hdrs = count / num_samples
+    for injection_param in injection_params:
+        # skip in injection is outside support of samples
+        if not check_in_support(samples, injection_param):
+            hdrs.append(1.0)
+            continue
+        injection_prob = log_prob(flow, injection_param)
+
+        # Sort once for all searchsorted operations
+        sorted_gen_log_probs = np.sort(gen_log_probs)
+
+        count = num_samples - np.searchsorted(sorted_gen_log_probs, injection_prob, side='right')
+        hdrs.append(count / num_samples)
 
     if return_flow:
-        return hdrs, flow
+        return np.array(hdrs), flow
 
-    return hdrs
+    return np.array(hdrs)
