@@ -86,6 +86,10 @@ def compute_injection_hdr(samples: np.ndarray, injection_params: np.ndarray, num
     - Increase `max_epochs` if training hasn't converged
     - Increase `knots` for more flexible marginal transformations
     """
+    if np.any(np.isnan(samples)):
+        raise ValueError("samples contain NaNs")
+    if np.any(np.isinf(samples)):
+        raise ValueError("samples contain Infs")
     if injection_params.ndim == 0:
         raise ValueError("injection_params must be at least 1D")
     default_kwargs = {'knots':4, 'patience':30, 'learning_rate':1e-3, 'max_epochs':400, 'flow_layers':6}
@@ -105,20 +109,12 @@ def compute_injection_hdr(samples: np.ndarray, injection_params: np.ndarray, num
     _, gen_log_probs = sample_and_log_prob(flow, n_samples=num_samples)
     injection_probs = log_prob(flow, injection_params)
 
-    hdrs = []
+    # Sort once for all searchsorted operations
+    sorted_gen_log_probs = np.sort(gen_log_probs)
+    count = num_samples - np.searchsorted(sorted_gen_log_probs, injection_probs, side='right')
+    hdrs = count / num_samples
 
-    if injection_params.ndim == 1:
-        fraction = np.sum(gen_log_probs >= injection_probs) / num_samples
-        hdrs.append(fraction)
-    else:
-        # import matplotlib.pyplot as plt
-        for injection_prob in injection_probs:
-            # plt.plot(gen_log_probs)
-            # plt.axhline(injection_prob)
-            # plt.show()
-            fraction = np.sum(gen_log_probs >= injection_prob) / num_samples
-            hdrs.append(fraction)
     if return_flow:
-        return np.array(hdrs), flow
+        return hdrs, flow
 
-    return np.array(hdrs)
+    return hdrs
