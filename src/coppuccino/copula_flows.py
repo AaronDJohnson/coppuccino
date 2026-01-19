@@ -147,8 +147,8 @@ def fit_chain_entry(input_flow, transform, inverse_log_det, chain_entry: np.ndar
 #                           nn_width: int = 128,
 #                           use_maf: bool = True) -> Transformed:
 def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
-                          knots: int = 16, patience: int = 20, learning_rate: float = 1e-4,
-                          max_epochs: int = 200, flow_layers: int = 8) -> Transformed:
+                          knots: int = 4, patience: int = 30, learning_rate: float = 1e-3,
+                          max_epochs: int = 400, flow_layers: int = 6) -> Transformed:
     """
     Fit a copula normalizing flow to multivariate data.
 
