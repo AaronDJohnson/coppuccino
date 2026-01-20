@@ -209,41 +209,6 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
     # Create initial transforms using the helper function
     transform, inverse_log_det = _create_empirical_transforms(chain)
 
-    # if use_maf:
-    #     # Stage 1: MAF to handle bimodality and initial correlation structure
-    #     maf_flow = masked_autoregressive_flow(
-    #         key1,
-    #         base_dist=Normal(jnp.zeros(chain.shape[1])),
-    #         transformer=RationalQuadraticSpline(knots=knots, interval=4),
-    #         invert=True,
-    #         nn_depth=nn_depth,
-    #         nn_width=nn_width,
-    #         flow_layers=maf_layers,
-    #     )
-
-    #     # Stage 2: Triangular spline to refine correlations
-    #     tri_flow = triangular_spline_flow(
-    #         key2,
-    #         base_dist=Normal(jnp.zeros(chain.shape[1])),
-    #         knots=knots,
-    #         flow_layers=spline_layers,
-    #         tanh_max_val=2.0,
-    #         invert=True
-    #     )
-
-    #     # Chain the bijections: MAF first, then Triangular
-    #     composite_bijection = BijectionChain([maf_flow.bijection, tri_flow.bijection])
-
-    #     # Create composite flow
-    #     composite_flow = Transformed(
-    #         Normal(jnp.zeros(chain.shape[1])),
-    #         composite_bijection
-    #     )
-
-    #     flow = fit_chain_entry(composite_flow, transform, inverse_log_det, chain,
-    #                           rng_seed=rng_seed, patience=patience,
-    #                           learning_rate=learning_rate, max_epochs=max_epochs)
-    # else:
     # Use only triangular spline flow (original behavior)
     flow = triangular_spline_flow(
         key,
