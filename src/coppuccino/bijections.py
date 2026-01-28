@@ -4,7 +4,21 @@ import numpy as np
 from flowjax.bijections import AbstractBijection
 from interpax._ppoly import PchipInterpolator
 from jax.scipy.special import ndtri, ndtr
+from jax.scipy.stats import norm as jax_norm
 import jax
+
+# Precision-dependent constants, computed once at import time from the current
+# JAX default dtype (float64 if jax_enable_x64, float32 otherwise).
+_DTYPE = jnp.result_type(0.0)
+
+# Maximum |z| before Gaussian CDF rounds to exactly 0 or 1.
+# Float64: ~8.13, Float32: ~5.17
+_Z_MAX = float(ndtri(1.0 - jnp.finfo(_DTYPE).eps))
+
+# Smallest positive normal float. Used as a floor for PDF values to prevent
+# log(0) = -inf at isolated points where the empirical CDF is flat.
+# Float64: ~2.2e-308, Float32: ~1.2e-38
+_PDF_FLOOR = float(jnp.finfo(_DTYPE).tiny)
 
 def process_array(arr):
     """
@@ -76,13 +90,15 @@ def process_array(arr):
     return new_arr
 
 
-def make_empirical_cdf_spline(samples, num_points=200, min_eps=1e-7):
+def make_empirical_cdf_spline(samples, num_points=200, min_eps=1e-7, tail_percentile=0.02):
     """
     Create empirical CDF, inverse CDF (quantile), and PDF functions from samples.
 
     This function constructs smooth monotonic spline interpolators for the empirical
     CDF and its inverse based on input samples. The PDF is computed via automatic
-    differentiation of the CDF spline.
+    differentiation of the CDF spline. It uses Gaussian tail extrapolation for values
+    outside the training data range, with C^1 continuity at the splice points. This
+    ensures proper normalization for Bayesian model comparison.
 
     Parameters
     ----------
@@ -92,17 +108,34 @@ def make_empirical_cdf_spline(samples, num_points=200, min_eps=1e-7):
         Number of grid points to use for spline construction. Default is 200.
     min_eps : float, optional
         Minimum epsilon to avoid CDF values exactly 0 or 1. Default is 1e-7.
+    tail_percentile : float, optional
+        Percentile from edge to use as splice point for Gaussian tails.
+        Default is 0.02 (2nd and 98th percentiles).
+        Smaller values = more of the distribution handled by the spline.
+        Larger values = Gaussian tails extend further into the data.
 
     Returns
     -------
     cdf_vals : numpy.ndarray
         Empirical CDF values at the grid points.
     cdf_fn : callable
-        Function mapping x → CDF(x), with extrapolation handling.
+        Function mapping x → CDF(x), with Gaussian tail extrapolation.
     quantile_fn : callable
         Function mapping u ∈ [0,1] → x (inverse CDF).
     pdf_fn : callable
         Function mapping x → PDF(x) via automatic differentiation.
+
+    Notes
+    -----
+    The Gaussian tail parameters are determined by C^1 matching at the splice
+    points. This means:
+    1. The CDF is continuous everywhere
+    2. The PDF (derivative of CDF) is continuous at splice points
+    3. The PDF integrates to 1 over (-infinity, +infinity)
+
+    For nested sampling / Bayes factor calculations, this ensures that models
+    whose spectra extend beyond the training data bounds are not artificially
+    penalized or favored due to normalization issues.
 
     Examples
     --------
@@ -119,61 +152,166 @@ def make_empirical_cdf_spline(samples, num_points=200, min_eps=1e-7):
     x_grid = np.quantile(samples, np.linspace(0, 1, num_points))
     # Sort the grid
     x_grid = np.asarray(x_grid)
-    sort_idx = np.argsort(x_grid)
-    xg = x_grid[sort_idx]
+    x_grid = np.sort(x_grid)
 
     # Empirical CDF
     sorted_chain = process_array(samples)
-    counts = np.searchsorted(sorted_chain, xg, side='right')
+    counts = np.searchsorted(sorted_chain, x_grid, side='right')
     cdf_vals = counts / len(sorted_chain)
 
     # Data bounds
     data_min, data_max = np.min(samples), np.max(samples)
+    data_range = data_max - data_min
 
     # Clip CDF values to avoid 0 and 1, which cause issues with inverse normal CDF
     cdf_vals = np.clip(cdf_vals, min_eps, 1.0 - min_eps)
-    # Store actual CDF bounds after clipping (may differ from min_eps due to empirical CDF)
-    cdf_min, cdf_max = float(np.min(cdf_vals)), float(np.max(cdf_vals))
 
-    # Create monotonic spline for CDF
-    cdf_spline = PchipInterpolator(xg, cdf_vals, extrapolate=False, check=False)
-    inverse_cdf_spline = PchipInterpolator(cdf_vals, xg, extrapolate=False, check=False)
+    cdf_spline = PchipInterpolator(x_grid, cdf_vals, extrapolate=False, check=False)
+    inverse_spline = PchipInterpolator(cdf_vals, x_grid, extrapolate=False, check=False)
 
-    def cdf_fn(u):
-        u = jnp.asarray(u)
-        # Handle extrapolation: constant outside domain
-        y = jnp.where(
-            u <= data_min,
-            min_eps,
-            jnp.where(
-                u >= data_max,
-                1.0 - min_eps,
-                cdf_spline(u)
-            )
+    # Splice points: slightly inside data range to get reliable slope estimates
+    # (PCHIP can have zero slope at exact data boundaries)
+    x_splice_lower = np.quantile(samples, tail_percentile)
+    x_splice_upper = np.quantile(samples, 1 - tail_percentile)
+
+    # CDF values at splice points
+    cdf_at_lower = cdf_spline(x_splice_lower)
+    cdf_at_upper = cdf_spline(x_splice_upper)
+
+    # PDF (slope) at splice points via autodiff
+    pdf_at_lower = jax.grad(lambda x: cdf_spline(x))(x_splice_lower)
+    pdf_at_upper = jax.grad(lambda x: cdf_spline(x))(x_splice_upper)
+
+    # PCHIP guarantees monotonicity but can have zero slope at flat regions.
+    # A zero PDF at the splice point would give sigma = inf (flat tail),
+    # defeating the purpose of Gaussian extrapolation. Floor to a small
+    # scale-invariant value to prevent this.
+    min_pdf = 1.0 / (100 * data_range)
+    pdf_at_lower = jnp.max(pdf_at_lower, min_pdf)
+    pdf_at_upper = jnp.max(pdf_at_upper, min_pdf)
+
+    # Gaussian sigma from PDF (derivative) continuity:
+    # At splice point, we want: pdf_gaussian(x_splice) = pdf_empirical(x_splice)
+    #
+    # Lower tail: F(x) = 2 * u_lower * Gaussian CDF((x - x_splice) / sigma)
+    #             f(x) = 2 * u_lower * Gaussian PDF((x - x_splice) / sigma) / sigma
+    #             f(x_splice) = 2 * u_lower * Gaussian PDF(0) / sigma = pdf_at_lower
+    #             => sigma = 2 * u_lower * PDF(0) / pdf_at_lower
+    #
+    # Upper tail: Similar with (1 - u_upper) instead of u_lower
+
+    phi_0 = jax_norm.pdf(0.0)
+    sigma_lower = 2 * cdf_at_lower * phi_0 / pdf_at_lower
+    sigma_upper = 2 * (1 - cdf_at_upper) * phi_0 / pdf_at_upper
+
+    def cdf_fn(x):
+        """
+        Evaluate CDF at x with Gaussian tail extrapolation.
+
+        Parameters
+        ----------
+        x : scalar
+            Point at which to evaluate CDF.
+
+        Returns
+        -------
+        scalar
+            CDF value in (min_eps, 1 - min_eps).
+        """
+        x = jnp.asarray(x, dtype=jnp.float64)
+
+        # Bulk: evaluate spline (clip input to avoid NaN)
+        # The clip doesn't affect values in [x_splice_lower, x_splice_upper]
+        # For values outside, we use the Gaussian tail anyway, so the clipped
+        # spline value is never selected — but this prevents NaN gradient leakage
+        x_clipped = jnp.clip(x, x_splice_lower, x_splice_upper)
+        cdf_bulk = cdf_spline(x_clipped)
+
+        # Lower Gaussian tail: F(x) = 2 * u_lower * Gaussian CDF((x - x_splice) / sigma)
+        # This equals u_lower when x = x_splice (since Gaussian CDF(0) = 0.5)
+        z_lower = (x - x_splice_lower) / sigma_lower
+        cdf_lower = 2 * cdf_at_lower * jax_norm.cdf(z_lower)
+
+        # Upper Gaussian tail:
+        # F(x) = u_upper + 2*(1-u_upper)*(Gaussian CDF((x - x_splice) / sigma) - 0.5)
+        # This equals u_upper when x = x_splice (since Gaussian CDF(0) - 0.5 = 0)
+        z_upper = (x - x_splice_upper) / sigma_upper
+        cdf_upper = cdf_at_upper + 2 * (1 - cdf_at_upper) * (
+            jax_norm.cdf(z_upper) - 0.5
         )
-        # Final bounds check to ensure we never return exactly 0 or 1
-        y = jnp.clip(y, min_eps, 1.0 - min_eps)
-        return y
+
+        # Select appropriate region
+        return jnp.where(
+            x < x_splice_lower,
+            cdf_lower,
+            jnp.where(x > x_splice_upper, cdf_upper, cdf_bulk),
+        )
 
     def quantile_fn(u):
+        """
+        Evaluate inverse CDF (quantile function) at u.
+
+        Parameters
+        ----------
+        u : scalar
+            Probability value in (0, 1).
+
+        Returns
+        -------
+        scalar
+            Quantile value x such that CDF(x) ~ u.
+        """
         u = jnp.asarray(u)
-        # Clip u to the actual CDF range to prevent NaN from extrapolation
-        # Use cdf_min/cdf_max (actual bounds) instead of min_eps (which may be smaller)
-        u_clipped = jnp.clip(u, cdf_min, cdf_max)
-        y = inverse_cdf_spline(u_clipped)
-        # Handle extreme values by mapping to data bounds
-        y = jnp.where(u < cdf_min, data_min, jnp.where(u > cdf_max, data_max, y))
-        return y
+        u_safe = jnp.clip(u, min_eps, 1.0 - min_eps)
+
+        # Bulk: use inverse spline (clip input to valid range)
+        u_clipped = jnp.clip(u_safe, cdf_at_lower, cdf_at_upper)
+        x_bulk = inverse_spline(u_clipped)
+
+        # Lower tail inverse: u = 2 * u_lower * Gaussian CDF(z)
+        #                   => Gaussian CDF(z) = u / (2 * u_lower)
+        #                   => z = Gaussian CDF^-1(u / (2 * u_lower))
+        #                   => x = x_splice + sigma * z
+        arg_lower = jnp.clip(u_safe / (2 * cdf_at_lower), min_eps, 1 - min_eps)
+        z_lower = jax_norm.ppf(arg_lower)
+        x_lower = x_splice_lower + sigma_lower * z_lower
+
+        # Upper tail inverse: u = u_upper + 2*(1-u_upper)*(Gaussian CDF(z) - 0.5)
+        #                   => Gaussian CDF(z) = 0.5 + (u - u_upper) / (2*(1 - u_upper))
+        arg_upper = 0.5 + (u_safe - cdf_at_upper) / (2 * (1 - cdf_at_upper))
+        arg_upper = jnp.clip(arg_upper, min_eps, 1 - min_eps)
+        z_upper = jax_norm.ppf(arg_upper)
+        x_upper = x_splice_upper + sigma_upper * z_upper
+
+        # Select appropriate region
+        return jnp.where(
+            u_safe < cdf_at_lower,
+            x_lower,
+            jnp.where(u_safe > cdf_at_upper, x_upper, x_bulk),
+        )
 
     def pdf_fn(x):
-        x = jnp.asarray(x)
-        grad_fn = jax.grad(cdf_fn)
-        y = grad_fn(x)
-        # Ensure positive and bounded to avoid log(0)
-        y = jnp.maximum(y, min_eps)
-        return y
+        """
+        Evaluate PDF at x via automatic differentiation of CDF.
 
-    return cdf_vals[np.argsort(sort_idx)], cdf_fn, quantile_fn, pdf_fn
+        The PDF naturally decays in the tails via Gaussian extrapolation.
+        A floor of the smallest positive normal float (_PDF_FLOOR) is applied
+        to prevent exactly 0 values at isolated points where the empirical CDF
+        may be flat due to data gaps.
+
+        Parameters
+        ----------
+        x : scalar
+            Point at which to evaluate PDF.
+
+        Returns
+        -------
+        scalar
+            PDF value (positive, with tiny floor for numerical stability).
+        """
+        return jnp.maximum(jax.grad(cdf_fn)(x), _PDF_FLOOR)
+
+    return cdf_vals, cdf_fn, quantile_fn, pdf_fn
 
 
 class EmpiricalMarginalToGaussian(AbstractBijection):
@@ -221,6 +359,7 @@ class EmpiricalMarginalToGaussian(AbstractBijection):
     quantile_fn: Callable
     pdf_fn: Callable
     min_eps: float = 1e-7
+    z_max: float = _Z_MAX  # Maximum |z| before Gaussian CDF rounds to 0 or 1
     cond_shape: ClassVar[None] = None
     shape: ClassVar[tuple[int, ...]] = ()
 
@@ -255,6 +394,13 @@ class EmpiricalMarginalToGaussian(AbstractBijection):
 
         # Transform to standard Gaussian
         z = ndtri(u)  # JAX equivalent of norm.ppf
+
+        # Clip z (not u) to handle floating point limits where CDF rounds to exactly 0 or 1
+        # This is better than clipping u because:
+        # 1. Allows larger z range (uses precision-appropriate limit from _Z_MAX)
+        # 2. More accurate mapping for extreme samples
+        # 3. jnp.clip handles inf correctly: clip(inf, -z_max, z_max) = z_max
+        z = jnp.clip(z, -self.z_max, self.z_max)
 
         # Jacobian: |dz/dx| = |dz/du| * |du/dx| = (1/φ(z)) * pdf(x)
         pdf_x = self.pdf_fn(x)
