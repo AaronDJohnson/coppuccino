@@ -1,17 +1,19 @@
-from typing import Callable
-import numpy as np
+from collections.abc import Callable
+from pathlib import Path
+
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
+from equinox import filter_jit
 from flowjax.bijections import Stack
+from flowjax.distributions import Normal, Transformed
 from flowjax.flows import triangular_spline_flow
 from flowjax.train import fit_to_data
-from flowjax.distributions import Normal, Transformed
 from paramax import non_trainable
-from equinox import filter_jit
 
-from coppuccino.bijections import EmpiricalMarginalToGaussian
-from coppuccino.bijections import make_empirical_cdf_spline
+from coppuccino.bijections import EmpiricalMarginalToGaussian, make_empirical_cdf_spline
 
 
 def _create_empirical_transforms(samples: np.ndarray, min_eps: float = 1e-12):
@@ -68,7 +70,18 @@ def _create_empirical_transforms(samples: np.ndarray, min_eps: float = 1e-12):
     return transform, inverse_log_det
 
 
-def fit_chain_entry(input_flow, transform, inverse_log_det, chain_entry: np.ndarray, patience=20, learning_rate=1e-4, rng_seed: int = 999, max_epochs: int = 200):
+def fit_chain_entry(
+    input_flow,
+    transform,
+    inverse_log_det,
+    chain_entry: np.ndarray,
+    patience=20,
+    learning_rate=1e-4,
+    rng_seed: int = 999,
+    max_epochs: int = 200,
+    condition_data: np.ndarray | None = None,
+    **kwargs,
+):
     """
     Fit a normalizing flow to data with empirical marginal transforms.
 
@@ -93,6 +106,8 @@ def fit_chain_entry(input_flow, transform, inverse_log_det, chain_entry: np.ndar
         Random seed for reproducibility. Default is 999.
     max_epochs : int, optional
         Maximum number of training epochs. Default is 200.
+    condition_data : np.ndarray
+        Conditioning data with shape (n_samples, n_condition_params)
 
     Returns
     -------
@@ -132,7 +147,12 @@ def fit_chain_entry(input_flow, transform, inverse_log_det, chain_entry: np.ndar
     }
 
     # Standard training
-    updated_flow, losses = fit_to_data(subkey_2, input_flow, x_train, **kwargs)
+    updated_flow, losses = fit_to_data(
+        subkey_2,
+        input_flow,
+        (x_train, condition_data) if condition_data is not None else x_train,
+        **kwargs,
+    )
 
     final_flow = Transformed(updated_flow, transform)  # unstandardize and back to uniform distribution
     return final_flow
@@ -146,9 +166,19 @@ def fit_chain_entry(input_flow, transform, inverse_log_det, chain_entry: np.ndar
 #                           nn_depth: int = 2,
 #                           nn_width: int = 128,
 #                           use_maf: bool = True) -> Transformed:
-def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
-                          knots: int = 16, patience: int = 20, learning_rate: float = 1e-4,
-                          max_epochs: int = 200, flow_layers: int = 8) -> Transformed:
+def normalizing_flows_fit(
+    chain: np.ndarray,
+    rng_seed: int = 999,
+    knots: int = 16,
+    patience: int = 20,
+    learning_rate: float = 1e-4,
+    max_epochs: int = 200,
+    flow_layers: int = 8,
+    load_flow_path: Path | None = None,
+    condition_data: np.ndarray | None = None,
+    invert=True,
+    **kwargs,
+) -> Transformed:
     """
     Fit a copula normalizing flow to multivariate data.
 
@@ -176,6 +206,12 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
         Maximum number of training epochs. Default is 200.
     flow_layers : int, optional
         Number of coupling layers in the triangular spline flow. Default is 8.
+    load_flow_path : Path, optional,
+        Path to load trained flow from.
+    condition_data : np.ndarray, optional
+        Array of data to condition flow on.
+    invert : bool
+        If True, much faster log prob at cost of slower sampling. Defaults to True.
 
     Returns
     -------
@@ -251,10 +287,25 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
         knots=knots,
         flow_layers=flow_layers,
         tanh_max_val=3.0,
-        invert=True
+        invert=invert,
+        cond_dim = condition_data.shape[1] if condition_data is not None else None,
     )
-    flow = fit_chain_entry(flow, transform, inverse_log_det, chain, rng_seed=rng_seed,
-                            patience=patience, learning_rate=learning_rate, max_epochs=max_epochs)
+
+    if load_flow_path is not None:
+        return eqx.tree_deserialise_leaves(load_flow_path, Transformed(flow, transform))
+
+    flow = fit_chain_entry(
+        flow,
+        transform,
+        inverse_log_det,
+        chain,
+        rng_seed=rng_seed,
+        patience=patience,
+        learning_rate=learning_rate,
+        max_epochs=max_epochs,
+        condition_data=condition_data,
+        **kwargs,
+    )
 
     return flow
 
