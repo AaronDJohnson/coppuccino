@@ -1,4 +1,4 @@
-from typing import ClassVar, Callable
+from typing import ClassVar, Callable, Optional
 import jax.numpy as jnp
 import numpy as np
 from flowjax.bijections import AbstractBijection
@@ -6,7 +6,10 @@ from interpax._ppoly import PchipInterpolator
 from jax.scipy.special import ndtri, ndtr
 import jax
 
-def process_array(arr):
+__all__ = ["make_empirical_cdf_spline", "EmpiricalMarginalToGaussian"]
+
+
+def _process_array(arr):
     """
     Check for duplicate values in array and perturb them to ensure uniqueness.
 
@@ -27,9 +30,9 @@ def process_array(arr):
     Examples
     --------
     >>> import numpy as np
-    >>> from coppuccino.bijections import process_array
+    >>> from coppuccino.bijections import _process_array
     >>> arr = np.array([1.0, 2.0, 2.0, 3.0, 3.0, 3.0, 4.0])
-    >>> processed = process_array(arr)
+    >>> processed = _process_array(arr)
     >>> len(processed) == len(np.unique(processed))
     True
     """
@@ -76,7 +79,8 @@ def process_array(arr):
     return new_arr
 
 
-def make_empirical_cdf_spline(samples, num_points=200, min_eps=1e-7):
+def make_empirical_cdf_spline(samples, num_points=200, min_eps=1e-7, tail_extension=False,
+                              prior_low=None, prior_high=None):
     """
     Create empirical CDF, inverse CDF (quantile), and PDF functions from samples.
 
@@ -84,14 +88,38 @@ def make_empirical_cdf_spline(samples, num_points=200, min_eps=1e-7):
     CDF and its inverse based on input samples. The PDF is computed via automatic
     differentiation of the CDF spline.
 
+    When ``prior_low`` / ``prior_high`` are provided, the CDF grid is extended to
+    cover the full prior support. This allows the flow to generate samples all the
+    way to the prior boundaries rather than being limited to the most extreme
+    training sample. This is the recommended mode for MCMC chains.
+
+    When ``tail_extension=True``, the CDF and quantile functions are extended
+    beyond the observed data range using a Gaussian tail model fitted to match
+    the empirical CDF at the boundaries. This allows the flow to generate
+    samples beyond the training range. Default is False (clip to data bounds),
+    which is appropriate for MCMC chains bounded by prior support.
+
     Parameters
     ----------
     samples : array_like
         Training data samples from which to construct the empirical distribution.
     num_points : int, optional
         Number of grid points to use for spline construction. Default is 200.
+        Automatically clamped to ``max(20, min(num_points, len(samples) // 3))``
+        to avoid degenerate grids with small sample sizes.
     min_eps : float, optional
         Minimum epsilon to avoid CDF values exactly 0 or 1. Default is 1e-7.
+    tail_extension : bool, optional
+        If True, extend the CDF/quantile functions beyond the observed data
+        range using a Gaussian tail model. Default is False (clip to data
+        bounds), which is appropriate for MCMC chains bounded by prior support.
+    prior_low : float, optional
+        Lower bound of the prior support for this parameter. If provided, the
+        CDF grid is extended down to this value (with CDF = min_eps), allowing
+        the flow to sample all the way to the prior edge.
+    prior_high : float, optional
+        Upper bound of the prior support for this parameter. If provided, the
+        CDF grid is extended up to this value (with CDF = 1 - min_eps).
 
     Returns
     -------
@@ -115,23 +143,42 @@ def make_empirical_cdf_spline(samples, num_points=200, min_eps=1e-7):
     >>> cdf_fn(jnp.array(0.0))  # Should be approximately 0.5 for standard normal
     >>> # Get median via quantile function
     >>> quantile_fn(jnp.array(0.5))  # Should be approximately 0.0
+    >>> # With prior bounds (recommended for MCMC chains)
+    >>> cdf_vals, cdf_fn, quantile_fn, pdf_fn = make_empirical_cdf_spline(
+    ...     samples, prior_low=-5.0, prior_high=5.0)
     """
-    x_grid = np.quantile(samples, np.linspace(0, 1, num_points))
-    # Sort the grid
-    x_grid = np.asarray(x_grid)
-    sort_idx = np.argsort(x_grid)
-    xg = x_grid[sort_idx]
+    # Adaptive grid size: avoid degenerate grids with small N
+    num_points = max(20, min(num_points, len(samples) // 3))
+
+    xg = np.asarray(np.quantile(samples, np.linspace(0, 1, num_points)))
 
     # Empirical CDF
-    sorted_chain = process_array(samples)
+    sorted_chain = _process_array(samples)
     counts = np.searchsorted(sorted_chain, xg, side='right')
     cdf_vals = counts / len(sorted_chain)
 
-    # Data bounds
+    # Data bounds (may be extended by prior bounds)
     data_min, data_max = np.min(samples), np.max(samples)
 
+    # Extend grid to prior bounds if provided
+    if prior_low is not None and prior_low < xg[0]:
+        xg = np.concatenate([[prior_low], xg])
+        cdf_vals = np.concatenate([[0.0], cdf_vals])
+        data_min = prior_low
+    if prior_high is not None and prior_high > xg[-1]:
+        xg = np.concatenate([xg, [prior_high]])
+        cdf_vals = np.concatenate([cdf_vals, [1.0]])
+        data_max = prior_high
     # Clip CDF values to avoid 0 and 1, which cause issues with inverse normal CDF
     cdf_vals = np.clip(cdf_vals, min_eps, 1.0 - min_eps)
+    # Ensure strict monotonicity for the inverse CDF spline: prior bound
+    # extension + clipping can create duplicate CDF values (e.g. the last
+    # quantile grid point and the prior_high point both clip to 1 - min_eps).
+    # PCHIP requires strictly increasing x-values, so bump any ties.
+    eps_bump = min_eps / (len(cdf_vals) * 10)
+    for i in range(1, len(cdf_vals)):
+        if cdf_vals[i] <= cdf_vals[i - 1]:
+            cdf_vals[i] = cdf_vals[i - 1] + eps_bump
     # Store actual CDF bounds after clipping (may differ from min_eps due to empirical CDF)
     cdf_min, cdf_max = float(np.min(cdf_vals)), float(np.max(cdf_vals))
 
@@ -139,41 +186,101 @@ def make_empirical_cdf_spline(samples, num_points=200, min_eps=1e-7):
     cdf_spline = PchipInterpolator(xg, cdf_vals, extrapolate=False, check=False)
     inverse_cdf_spline = PchipInterpolator(cdf_vals, xg, extrapolate=False, check=False)
 
+    # ------------------------------------------------------------------
+    # Gaussian tail model: fit a Gaussian to the marginal and use it for
+    # extrapolation beyond the observed data range.
+    # ------------------------------------------------------------------
+    if tail_extension:
+        mu = float(np.mean(samples))
+        sigma = float(np.std(samples, ddof=1))
+        sigma = max(sigma, 1e-10)  # guard against zero std
+
+        # CDF values of the Gaussian at the data boundaries
+        from scipy.stats import norm as _norm
+        gauss_cdf_lo = float(_norm.cdf(data_min, loc=mu, scale=sigma))
+        gauss_cdf_hi = float(_norm.cdf(data_max, loc=mu, scale=sigma))
+
+        # Empirical CDF at boundaries (from spline)
+        emp_cdf_lo = float(cdf_min)
+        emp_cdf_hi = float(cdf_max)
+
+        # Scale factors so the Gaussian tail joins the empirical CDF at
+        # the boundary.  We want:
+        #   tail_cdf(data_min) = emp_cdf_lo
+        #   tail_cdf(data_max) = emp_cdf_hi
+        # Using:  tail_cdf(x) = emp_cdf_lo * Phi_gauss(x) / Phi_gauss(data_min)   [left]
+        #         tail_cdf(x) = 1 - (1 - emp_cdf_hi) * Phi_gauss_sf(x) / Phi_gauss_sf(data_max)  [right]
+        lo_scale = emp_cdf_lo / max(gauss_cdf_lo, 1e-30)
+        hi_scale = (1.0 - emp_cdf_hi) / max(1.0 - gauss_cdf_hi, 1e-30)
+    # ------------------------------------------------------------------
+
     def cdf_fn(u):
         u = jnp.asarray(u)
-        # Handle extrapolation: constant outside domain
-        y = jnp.where(
-            u <= data_min,
-            min_eps,
-            jnp.where(
-                u >= data_max,
-                1.0 - min_eps,
-                cdf_spline(u)
+        if tail_extension:
+            # Gaussian tail for left extrapolation
+            gauss_cdf = ndtr((u - mu) / sigma)
+            left_tail = lo_scale * gauss_cdf
+            # Gaussian tail for right extrapolation
+            right_tail = 1.0 - hi_scale * (1.0 - gauss_cdf)
+
+            y = jnp.where(
+                u <= data_min,
+                left_tail,
+                jnp.where(
+                    u >= data_max,
+                    right_tail,
+                    cdf_spline(u)
+                )
             )
-        )
+        else:
+            y = jnp.where(
+                u <= data_min,
+                min_eps,
+                jnp.where(
+                    u >= data_max,
+                    1.0 - min_eps,
+                    cdf_spline(u)
+                )
+            )
         # Final bounds check to ensure we never return exactly 0 or 1
         y = jnp.clip(y, min_eps, 1.0 - min_eps)
         return y
 
     def quantile_fn(u):
         u = jnp.asarray(u)
-        # Clip u to the actual CDF range to prevent NaN from extrapolation
-        # Use cdf_min/cdf_max (actual bounds) instead of min_eps (which may be smaller)
-        u_clipped = jnp.clip(u, cdf_min, cdf_max)
-        y = inverse_cdf_spline(u_clipped)
-        # Handle extreme values by mapping to data bounds
-        y = jnp.where(u < cdf_min, data_min, jnp.where(u > cdf_max, data_max, y))
+        if tail_extension:
+            # For values below or above the empirical CDF range, invert
+            # the Gaussian tail model.
+            # Left tail:  u = lo_scale * Phi((x - mu) / sigma)
+            #   => x = mu + sigma * Phi^{-1}(u / lo_scale)
+            left_x = mu + sigma * ndtri(jnp.clip(u / lo_scale, min_eps, 1.0 - min_eps))
+            # Right tail: u = 1 - hi_scale * (1 - Phi((x - mu) / sigma))
+            #   => Phi((x - mu) / sigma) = 1 - (1 - u) / hi_scale
+            right_x = mu + sigma * ndtri(jnp.clip(1.0 - (1.0 - u) / hi_scale, min_eps, 1.0 - min_eps))
+
+            u_clipped = jnp.clip(u, cdf_min, cdf_max)
+            mid_x = inverse_cdf_spline(u_clipped)
+
+            y = jnp.where(
+                u < cdf_min,
+                left_x,
+                jnp.where(u > cdf_max, right_x, mid_x)
+            )
+        else:
+            u_clipped = jnp.clip(u, cdf_min, cdf_max)
+            y = inverse_cdf_spline(u_clipped)
+            y = jnp.where(u < cdf_min, data_min, jnp.where(u > cdf_max, data_max, y))
         return y
+
+    _cdf_grad_fn = jax.grad(cdf_fn)
 
     def pdf_fn(x):
         x = jnp.asarray(x)
-        grad_fn = jax.grad(cdf_fn)
-        y = grad_fn(x)
-        # Ensure positive and bounded to avoid log(0)
+        y = _cdf_grad_fn(x)
         y = jnp.maximum(y, min_eps)
         return y
 
-    return cdf_vals[np.argsort(sort_idx)], cdf_fn, quantile_fn, pdf_fn
+    return cdf_vals, cdf_fn, quantile_fn, pdf_fn
 
 
 class EmpiricalMarginalToGaussian(AbstractBijection):
@@ -221,6 +328,10 @@ class EmpiricalMarginalToGaussian(AbstractBijection):
     quantile_fn: Callable
     pdf_fn: Callable
     min_eps: float = 1e-7
+    num_points: int = 200
+    tail_extension: bool = False
+    prior_low: Optional[float] = None
+    prior_high: Optional[float] = None
     cond_shape: ClassVar[None] = None
     shape: ClassVar[tuple[int, ...]] = ()
 
@@ -305,121 +416,3 @@ class EmpiricalMarginalToGaussian(AbstractBijection):
         log_det = jnp.log(1.0 / pdf_x) + jnp.log(pdf_z)
 
         return x, jnp.sum(log_det)
-
-
-# class NormalToUniform(AbstractBijection):
-#     r"""Bijection mapping x ∈ [a, b] → z ∈ ℝ via a uniform→normal CDF transform.
-
-#     The forward transform is
-
-#         u = clip((x - a) / (b - a), eps, 1 - eps)
-#         z = sqrt(2) * erfinv(2 u - 1)
-
-#     and the inverse is
-
-#         u = 0.5 * (1 + erf(z / sqrt(2)))
-#         x = a + u (b - a)
-
-#     Args
-#     ----
-#     a : array_like or float
-#         Lower bound(s) of the uniform support.
-#     b : array_like or float
-#         Upper bound(s) of the uniform support.
-#     eps : float, default=1e-6
-#         Clamping parameter to avoid CDF values exactly 0 or 1.
-#     """
-
-#     a: float
-#     b: float
-#     eps: float = 1e-6
-#     cond_shape: ClassVar[None] = None
-
-#     shape: ClassVar[tuple[int, ...]] = ()
-
-#     def inverse_and_log_det(self, x, condition=None):
-#         # map into (0,1)
-#         u = (x - self.a) / (self.b - self.a)
-#         u = jnp.clip(u, self.eps, 1.0 - self.eps)
-#         # uniform→normal
-#         y = jnp.sqrt(2.0) * erfinv(2.0 * u - 1.0)
-#         # log|dz/du|
-#         log_dz_du = 0.5 * jnp.log(2.0 * jnp.pi) + erfinv(2.0 * u - 1.0) ** 2
-#         # log|du/dx|
-#         log_du_dx = -jnp.log(self.b - self.a)
-#         log_det = jnp.sum(log_dz_du + log_du_dx)
-#         return y, log_det
-
-#     def transform_and_log_det(self, y, condition=None):
-#         # normal→uniform
-#         u = 0.5 * (1.0 + erf(y / jnp.sqrt(2.0)))
-#         # uniform→original
-#         x = self.a + u * (self.b - self.a)
-#         # log|dx/dy|
-#         log_du_dy = -0.5 * jnp.log(2.0 * jnp.pi) - 0.5 * y ** 2
-#         log_dx_du = jnp.log(self.b - self.a)
-#         log_det = jnp.sum(log_dx_du + log_du_dy)
-#         return x, log_det
-
-
-# class InverseStandardize(AbstractBijection):
-
-#     mean: float
-#     std: float
-#     cond_shape: ClassVar[None] = None
-
-#     shape: ClassVar[tuple[int, ...]] = ()
-
-#     def inverse_and_log_det(self, x, condition=None):
-#         u = (x - self.mean) / self.std
-#         log_du_dx = -jnp.log(self.std)
-#         log_det = jnp.sum(log_du_dx)
-#         return u, log_det
-
-#     def transform_and_log_det(self, y, condition=None):
-#         u = self.std * y + self.mean
-#         log_du_dy = jnp.log(self.std)
-#         log_det = jnp.sum(log_du_dy)
-#         return u, log_det
-
-
-# class NormalToUniformInverseStandardize(AbstractBijection):
-#     a: float
-#     b: float
-#     mean: float
-#     std: float
-#     eps: float = 1e-6
-#     cond_shape: ClassVar[None] = None
-
-#     shape: ClassVar[tuple[int, ...]] = ()
-
-#     def inverse_and_log_det(self, x, condition=None):
-#         # map into (0,1)
-#         u = (x - self.a) / (self.b - self.a)
-#         u = jnp.clip(u, self.eps, 1.0 - self.eps)
-#         # uniform→normal
-#         y = self.mean + self.std * jnp.sqrt(2.0) * erfinv(2.0 * u - 1.0)
-#         # standardize
-#         z = (y - self.mean) / self.std
-#         # log|dz/dy|
-#         log_dz_dy = -jnp.log(self.std)
-#         # log|dy/du|
-#         log_dy_du = jnp.log(self.std) + 0.5 * jnp.log(2.0 * jnp.pi) + erfinv(2.0 * u - 1.0) ** 2
-#         # log|du/dx|
-#         log_du_dx = -jnp.log(self.b - self.a)
-#         log_det = jnp.sum(log_dy_du + log_du_dx + log_dz_dy)
-#         return z, log_det
-
-#     def transform_and_log_det(self, z, condition=None):
-#         # unstandardize
-#         y = self.std * z + self.mean
-#         # normal→uniform
-#         u = 0.5 * (1.0 + erf((y - self.mean) / (self.std * jnp.sqrt(2.0))))
-#         # uniform→original
-#         x = self.a + u * (self.b - self.a)
-#         # jacobians:
-#         log_dz_dy = jnp.log(self.std)
-#         log_du_dy = -0.5 * jnp.log(2.0 * jnp.pi) - 0.5 * ((y - self.mean)/self.std)**2 - jnp.log(self.std)
-#         log_dx_du = jnp.log(self.b - self.a)
-#         log_det = jnp.sum(log_dz_dy + log_dx_du + log_du_dy)
-#         return x, log_det

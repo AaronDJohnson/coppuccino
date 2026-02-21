@@ -12,16 +12,14 @@ from pathlib import Path
 from typing import Union
 
 import equinox as eqx
-import jax
-import jax.numpy as jnp
 import numpy as np
 from flowjax.bijections import Stack
-from flowjax.distributions import Normal, Transformed
-from flowjax.flows import triangular_spline_flow
-import jax.random as jr
+from flowjax.distributions import Transformed
 from paramax import non_trainable, unwrap
 
 from coppuccino.bijections import EmpiricalMarginalToGaussian, make_empirical_cdf_spline
+
+__all__ = ["save_flow", "load_flow"]
 
 
 def _extract_spline_data(flow: Transformed) -> dict:
@@ -47,6 +45,10 @@ def _extract_spline_data(flow: Transformed) -> dict:
     spline_data = {
         'samples': [],
         'min_eps': [],
+        'num_points': [],
+        'tail_extension': [],
+        'prior_low': [],
+        'prior_high': [],
         'num_dims': 0
     }
 
@@ -57,9 +59,15 @@ def _extract_spline_data(flow: Transformed) -> dict:
                 # Unwrap the NonTrainable wrapper to get the actual numpy array
                 samples = unwrap(bij.samples)
                 spline_data['samples'].append(np.array(samples))
-                # min_eps may also be wrapped
                 min_eps = unwrap(bij.min_eps)
                 spline_data['min_eps'].append(float(min_eps))
+                # Save reconstruction metadata
+                spline_data['num_points'].append(int(unwrap(bij.num_points)))
+                spline_data['tail_extension'].append(bool(unwrap(bij.tail_extension)))
+                p_low = unwrap(bij.prior_low)
+                p_high = unwrap(bij.prior_high)
+                spline_data['prior_low'].append(float(p_low) if p_low is not None else None)
+                spline_data['prior_high'].append(float(p_high) if p_high is not None else None)
             else:
                 raise ValueError(f"Unexpected bijection type: {type(bij)}")
     else:
@@ -87,49 +95,25 @@ def _reconstruct_empirical_transforms(spline_data: dict) -> Stack:
     for i in range(spline_data['num_dims']):
         samples = spline_data['samples'][i]
         min_eps = spline_data['min_eps'][i]
+        # Backward-compatible: default to original values for old saved files
+        num_points = spline_data.get('num_points', [200] * spline_data['num_dims'])[i]
+        tail_extension = spline_data.get('tail_extension', [False] * spline_data['num_dims'])[i]
+        prior_low = spline_data.get('prior_low', [None] * spline_data['num_dims'])[i]
+        prior_high = spline_data.get('prior_high', [None] * spline_data['num_dims'])[i]
 
         _, cdf_fn, quantile_fn, pdf_fn = make_empirical_cdf_spline(
-            samples, num_points=200, min_eps=min_eps
+            samples, num_points=num_points, min_eps=min_eps,
+            tail_extension=tail_extension, prior_low=prior_low, prior_high=prior_high
         )
 
         transform = non_trainable(EmpiricalMarginalToGaussian(
-            samples, cdf_fn, quantile_fn, pdf_fn, min_eps=min_eps
+            samples, cdf_fn, quantile_fn, pdf_fn, min_eps=min_eps,
+            num_points=num_points, tail_extension=tail_extension,
+            prior_low=prior_low, prior_high=prior_high
         ))
         empirical_transforms.append(transform)
 
     return Stack(empirical_transforms)
-
-
-def _get_flow_config(flow: Transformed) -> dict:
-    """
-    Extract flow configuration from a fitted flow.
-
-    Parameters
-    ----------
-    flow : Transformed
-        A fitted copula flow.
-
-    Returns
-    -------
-    dict
-        Dictionary containing flow configuration parameters.
-    """
-    # Get the inner flow (before the empirical transform)
-    inner_flow = flow.base_dist
-
-    # Extract dimensionality from the base distribution
-    if hasattr(inner_flow, 'base_dist'):
-        base_dist = inner_flow.base_dist
-        if hasattr(base_dist, 'loc'):
-            num_dims = len(base_dist.loc)
-        else:
-            num_dims = base_dist.shape[0] if hasattr(base_dist, 'shape') else 1
-    else:
-        num_dims = 1
-
-    return {
-        'num_dims': num_dims,
-    }
 
 
 def save_flow(flow: Transformed, path: Union[str, Path]) -> None:
@@ -165,9 +149,6 @@ def save_flow(flow: Transformed, path: Union[str, Path]) -> None:
     # Extract spline data for reconstruction
     spline_data = _extract_spline_data(flow)
 
-    # Extract flow configuration
-    flow_config = _get_flow_config(flow)
-
     # Get the inner flow (the actual normalizing flow without the empirical transform)
     inner_flow = flow.base_dist
 
@@ -178,7 +159,6 @@ def save_flow(flow: Transformed, path: Union[str, Path]) -> None:
 
     save_dict = {
         'spline_data': spline_data,
-        'flow_config': flow_config,
         'inner_flow_bytes': inner_flow_bytes,
         'inner_flow_like': inner_flow,  # Keep structure for deserialization
     }

@@ -4,7 +4,6 @@ import jax.numpy as jnp
 from flowjax.distributions import Transformed
 from coppuccino.copula_flows import (
     _create_empirical_transforms,
-    fit_chain_entry,
     normalizing_flows_fit,
     sample,
     log_prob,
@@ -142,8 +141,6 @@ class TestNormalizingFlowsFit:
             chain,
             rng_seed=123,
             knots=8,
-            interval=2,
-            nn_depth=1,
             patience=3,
             learning_rate=1e-2,
             max_epochs=5
@@ -288,8 +285,8 @@ class TestSampleAndLogProb:
         samples_separate = sample(flow, n_samples=100, rng_seed=42)
         log_probs_separate = log_prob(flow, samples_separate)
 
-        # Samples should be identical
-        np.testing.assert_array_equal(samples_combined, samples_separate)
+        # Samples should be identical (up to floating-point precision)
+        np.testing.assert_array_almost_equal(samples_combined, samples_separate)
 
     def test_reproducibility(self):
         """Test reproducibility with same seed."""

@@ -350,6 +350,77 @@ class TestReconstructEmpiricalTransforms:
         assert jnp.all(jnp.isfinite(log_dets))
 
 
+class TestSaveLoadWithNonDefaultParams:
+    """Test save/load round-trip with non-default parameters."""
+
+    def test_round_trip_with_prior_bounds(self):
+        """Test that prior_bounds are preserved through save/load."""
+        np.random.seed(42)
+        chain = np.random.randn(200, 2)
+        bounds = np.array([[-5.0, 5.0], [-5.0, 5.0]])
+        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2, prior_bounds=bounds)
+
+        original_samples = sample(flow, n_samples=100, rng_seed=999)
+
+        with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as f:
+            path = f.name
+
+        try:
+            save_flow(flow, path)
+            loaded_flow = load_flow(path)
+            loaded_samples = sample(loaded_flow, n_samples=100, rng_seed=999)
+
+            np.testing.assert_array_almost_equal(original_samples, loaded_samples)
+        finally:
+            os.unlink(path)
+
+    def test_spline_data_preserves_metadata(self):
+        """Test that _extract_spline_data preserves new metadata fields."""
+        np.random.seed(42)
+        chain = np.random.randn(200, 2)
+        bounds = np.array([[-5.0, 5.0], [-5.0, 5.0]])
+        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2, prior_bounds=bounds)
+
+        spline_data = _extract_spline_data(flow)
+
+        assert 'num_points' in spline_data
+        assert 'tail_extension' in spline_data
+        assert 'prior_low' in spline_data
+        assert 'prior_high' in spline_data
+        assert len(spline_data['num_points']) == 2
+        assert len(spline_data['tail_extension']) == 2
+        # Prior bounds should be preserved
+        for i in range(2):
+            assert spline_data['prior_low'][i] == pytest.approx(-5.0)
+            assert spline_data['prior_high'][i] == pytest.approx(5.0)
+            assert spline_data['tail_extension'][i] is False
+
+    def test_round_trip_with_tail_extension(self):
+        """Test that tail_extension is preserved through save/load."""
+        np.random.seed(42)
+        chain = np.random.randn(200, 2)
+        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2, tail_extension=True)
+
+        original_samples = sample(flow, n_samples=100, rng_seed=999)
+
+        with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as f:
+            path = f.name
+
+        try:
+            save_flow(flow, path)
+
+            spline_data = _extract_spline_data(flow)
+            for i in range(2):
+                assert spline_data['tail_extension'][i] is True
+
+            loaded_flow = load_flow(path)
+            loaded_samples = sample(loaded_flow, n_samples=100, rng_seed=999)
+
+            np.testing.assert_array_almost_equal(original_samples, loaded_samples)
+        finally:
+            os.unlink(path)
+
+
 class TestEdgeCases:
     """Test edge cases and error handling."""
 

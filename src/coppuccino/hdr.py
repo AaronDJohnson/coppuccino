@@ -2,6 +2,8 @@ import numpy as np
 from coppuccino.copula_flows import normalizing_flows_fit
 from coppuccino.copula_flows import sample_and_log_prob, log_prob
 
+__all__ = ["compute_injection_hdr", "check_in_support"]
+
 
 def check_in_support(samples: np.ndarray, injection_params: np.ndarray) -> bool:
     """
@@ -152,32 +154,23 @@ def compute_injection_hdr(samples: np.ndarray, injection_params: np.ndarray, num
     if injection_params.ndim == 0:
         raise ValueError("injection_params must be at least 1D")
 
-    default_kwargs = {'knots':4, 'patience':30, 'learning_rate':1e-3, 'max_epochs':400, 'flow_layers':6}
-    # default_kwargs = {'knots': 32,
-    #                   'patience': 20,
-    #                   'learning_rate': 1e-4,
-    #                   'max_epochs': 200,
-    #                   'maf_layers': 8,
-    #                   'spline_layers': 8,
-    #                   'nn_depth': 2,
-    #                   'nn_width': 128,
-    #                   'use_maf': True}
-    kwargs = nf_kwargs if nf_kwargs else default_kwargs
-    # fit NF to samples
-    flow = normalizing_flows_fit(samples, **kwargs)  # TODO: document kwargs in docstring
+    # Ensure injection_params is 2D: (n_injections, n_params)
+    if injection_params.ndim == 1:
+        injection_params = injection_params[np.newaxis, :]
+
+    flow = normalizing_flows_fit(samples, **nf_kwargs)
     # sample from flow and compute log probability of those samples
     _, gen_log_probs = sample_and_log_prob(flow, n_samples=num_samples)
     hdrs = []
 
+    sorted_gen_log_probs = np.sort(gen_log_probs)
+
     for injection_param in injection_params:
-        # skip in injection is outside support of samples
+        # skip if injection is outside support of samples
         if not check_in_support(samples, injection_param):
             hdrs.append(1.0)
             continue
-        injection_prob = log_prob(flow, injection_param)
-
-        # Sort once for all searchsorted operations
-        sorted_gen_log_probs = np.sort(gen_log_probs)
+        injection_prob = float(log_prob(flow, injection_param[np.newaxis, :])[0])
 
         count = num_samples - np.searchsorted(sorted_gen_log_probs, injection_prob, side='right')
         hdrs.append(count / num_samples)

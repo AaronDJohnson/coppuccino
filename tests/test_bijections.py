@@ -2,25 +2,25 @@ import pytest
 import numpy as np
 import jax.numpy as jnp
 from coppuccino.bijections import (
-    process_array,
+    _process_array,
     make_empirical_cdf_spline,
     EmpiricalMarginalToGaussian
 )
 
 
 class TestProcessArray:
-    """Test the process_array function for handling duplicates."""
+    """Test the _process_array function for handling duplicates."""
 
     def test_no_duplicates(self):
         """Test that arrays without duplicates are returned unchanged."""
         arr = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
-        result = process_array(arr)
+        result = _process_array(arr)
         np.testing.assert_array_equal(result, arr)
 
     def test_with_duplicates(self):
         """Test that duplicates are perturbed."""
         arr = np.array([1.0, 2.0, 2.0, 3.0, 4.0])
-        result = process_array(arr)
+        result = _process_array(arr)
         # Check that all values are unique
         assert len(result) == len(np.unique(result))
         # Check that array is still sorted
@@ -29,7 +29,7 @@ class TestProcessArray:
     def test_all_duplicates(self):
         """Test array with all identical values."""
         arr = np.array([5.0, 5.0, 5.0, 5.0])
-        result = process_array(arr)
+        result = _process_array(arr)
         # Check that all values are unique
         assert len(result) == len(np.unique(result))
         # Check that array is still sorted
@@ -38,7 +38,7 @@ class TestProcessArray:
     def test_unsorted_input(self):
         """Test that unsorted input is sorted."""
         arr = np.array([3.0, 1.0, 4.0, 1.0, 5.0])
-        result = process_array(arr)
+        result = _process_array(arr)
         # Check that array is sorted
         assert np.all(np.diff(result) >= 0)
         # Check that all values are unique
@@ -47,13 +47,13 @@ class TestProcessArray:
     def test_empty_array(self):
         """Test empty array handling."""
         arr = np.array([])
-        result = process_array(arr)
+        result = _process_array(arr)
         assert len(result) == 0
 
     def test_single_element(self):
         """Test single element array."""
         arr = np.array([42.0])
-        result = process_array(arr)
+        result = _process_array(arr)
         np.testing.assert_array_equal(result, arr)
 
 
@@ -127,6 +127,110 @@ class TestMakeEmpiricalCDFSpline:
 
         # CDF should be approximately linear for uniform distribution
         assert len(cdf_vals) == 100
+
+
+class TestTailExtension:
+    """Test the tail_extension parameter of make_empirical_cdf_spline."""
+
+    def test_tail_extension_produces_wider_range(self):
+        """Test that tail extension allows sampling beyond data range."""
+        np.random.seed(42)
+        samples = np.random.randn(1000)
+
+        _, _, quantile_no_tail, _ = make_empirical_cdf_spline(samples, tail_extension=False)
+        _, _, quantile_tail, _ = make_empirical_cdf_spline(samples, tail_extension=True)
+
+        # With tail extension, extreme quantiles should go beyond data range
+        data_min, data_max = np.min(samples), np.max(samples)
+        low_q = float(quantile_tail(jnp.array(1e-5)))
+        high_q = float(quantile_tail(jnp.array(1.0 - 1e-5)))
+
+        # Without tail, quantiles are clipped to data range
+        low_no_tail = float(quantile_no_tail(jnp.array(1e-5)))
+        high_no_tail = float(quantile_no_tail(jnp.array(1.0 - 1e-5)))
+        assert low_no_tail >= data_min - 0.01
+        assert high_no_tail <= data_max + 0.01
+
+        # With tail, quantiles can extend beyond
+        assert low_q < data_min or high_q > data_max
+
+    def test_tail_extension_cdf_continuity(self):
+        """Test that CDF is continuous at data boundaries with tail extension."""
+        np.random.seed(42)
+        samples = np.random.randn(1000)
+
+        _, cdf_fn, _, _ = make_empirical_cdf_spline(samples, tail_extension=True)
+
+        data_min = np.min(samples)
+
+        # CDF should be continuous at left boundary (right boundary clips at 1-eps)
+        eps = 0.01
+        cdf_at_min = float(cdf_fn(jnp.array(data_min)))
+        cdf_below_min = float(cdf_fn(jnp.array(data_min - eps)))
+
+        assert cdf_below_min < cdf_at_min
+        # Tail CDF should still be positive below data range
+        assert cdf_below_min > 0
+
+    def test_no_tail_clips_to_bounds(self):
+        """Test that without tail extension, CDF clips at data bounds."""
+        np.random.seed(42)
+        samples = np.random.randn(1000)
+
+        _, cdf_fn, _, _ = make_empirical_cdf_spline(samples, tail_extension=False)
+
+        data_min = np.min(samples)
+        # Values well below data range should give min_eps
+        cdf_far_below = float(cdf_fn(jnp.array(data_min - 10.0)))
+        assert cdf_far_below == pytest.approx(1e-7, abs=1e-8)
+
+
+class TestPriorBounds:
+    """Test the prior_bounds parameter of make_empirical_cdf_spline."""
+
+    def test_prior_bounds_extend_range(self):
+        """Test that prior bounds extend the CDF grid."""
+        np.random.seed(42)
+        samples = np.random.randn(1000)
+
+        _, _, quantile_no_prior, _ = make_empirical_cdf_spline(samples)
+        _, _, quantile_with_prior, _ = make_empirical_cdf_spline(
+            samples, prior_low=-10.0, prior_high=10.0)
+
+        # With prior bounds, extreme quantiles should reach toward prior edges
+        low_no_prior = float(quantile_no_prior(jnp.array(1e-5)))
+        low_with_prior = float(quantile_with_prior(jnp.array(1e-5)))
+
+        assert low_with_prior < low_no_prior
+
+    def test_prior_bounds_cdf_at_edges(self):
+        """Test CDF values at prior bound edges."""
+        np.random.seed(42)
+        samples = np.random.randn(1000)
+
+        _, cdf_fn, _, _ = make_empirical_cdf_spline(
+            samples, prior_low=-10.0, prior_high=10.0)
+
+        # CDF at prior bounds should be close to min_eps / 1 - min_eps
+        cdf_at_low = float(cdf_fn(jnp.array(-10.0)))
+        cdf_at_high = float(cdf_fn(jnp.array(10.0)))
+
+        assert cdf_at_low < 0.01
+        assert cdf_at_high > 0.99
+
+    def test_prior_bounds_within_data_range_ignored(self):
+        """Test that prior bounds within data range don't affect grid."""
+        np.random.seed(42)
+        samples = np.random.randn(1000)
+        data_min = np.min(samples)
+
+        # Prior bound within data range should not be added
+        cdf_vals_no_prior, _, _, _ = make_empirical_cdf_spline(samples)
+        cdf_vals_with_prior, _, _, _ = make_empirical_cdf_spline(
+            samples, prior_low=data_min + 0.1)
+
+        # Should have same grid size since prior_low > xg[0]
+        assert len(cdf_vals_no_prior) == len(cdf_vals_with_prior)
 
 
 class TestEmpiricalMarginalToGaussian:

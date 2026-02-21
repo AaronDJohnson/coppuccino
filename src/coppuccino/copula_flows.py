@@ -13,8 +13,12 @@ from equinox import filter_jit
 from coppuccino.bijections import EmpiricalMarginalToGaussian
 from coppuccino.bijections import make_empirical_cdf_spline
 
+__all__ = ["normalizing_flows_fit", "sample", "log_prob", "sample_and_log_prob"]
 
-def _create_empirical_transforms(samples: np.ndarray, min_eps: float = 1e-12):
+
+def _create_empirical_transforms(samples: np.ndarray, min_eps: float = 1e-7,
+                                  num_points: int = 200, tail_extension: bool = False,
+                                  prior_bounds: np.ndarray = None):
     """
     Create empirical marginal transforms for copula modeling.
 
@@ -27,7 +31,18 @@ def _create_empirical_transforms(samples: np.ndarray, min_eps: float = 1e-12):
     samples : np.ndarray
         Input samples with shape (n_samples, n_params).
     min_eps : float, optional
-        Minimum epsilon for CDF bounds. Default is 1e-12.
+        Minimum epsilon for CDF bounds. Default is 1e-7.
+    num_points : int, optional
+        Number of grid points for each marginal CDF spline. Default is 200.
+        Automatically clamped to a sensible range based on sample size.
+    tail_extension : bool, optional
+        If True, extend the CDF/quantile beyond the observed data range using
+        a Gaussian tail model. Default is False (clip to data bounds), which
+        is appropriate for MCMC chains bounded by prior support.
+    prior_bounds : np.ndarray, optional
+        Prior support bounds with shape (n_params, 2), where each row is
+        [low, high] for that parameter. When provided, the CDF grid extends
+        to the prior edges so the flow can sample the full prior support.
 
     Returns
     -------
@@ -56,19 +71,25 @@ def _create_empirical_transforms(samples: np.ndarray, min_eps: float = 1e-12):
     for j in range(x.shape[1]):
         param_samples = x[:, j]
         if len(param_samples) > 20:  # Need sufficient samples for empirical CDF
-            _, cdf_fn, quantile_fn, pdf_fn = make_empirical_cdf_spline(param_samples, num_points=200, min_eps=min_eps)
-            empirical_transforms.append(non_trainable(EmpiricalMarginalToGaussian(param_samples, cdf_fn, quantile_fn, pdf_fn, min_eps=min_eps)))
+            p_low = float(prior_bounds[j, 0]) if prior_bounds is not None else None
+            p_high = float(prior_bounds[j, 1]) if prior_bounds is not None else None
+            _, cdf_fn, quantile_fn, pdf_fn = make_empirical_cdf_spline(
+                param_samples, num_points=num_points, min_eps=min_eps,
+                tail_extension=tail_extension, prior_low=p_low, prior_high=p_high)
+            empirical_transforms.append(non_trainable(EmpiricalMarginalToGaussian(
+                param_samples, cdf_fn, quantile_fn, pdf_fn, min_eps=min_eps,
+                num_points=num_points, tail_extension=tail_extension,
+                prior_low=p_low, prior_high=p_high)))
         else:
             raise ValueError("Insufficient samples for empirical transform")
 
     transform = Stack(empirical_transforms)
     inverse_log_det = jax.jit(jax.vmap(transform.inverse_and_log_det))
-    # inverse_log_det = jax.vmap(transform.inverse_and_log_det)
 
     return transform, inverse_log_det
 
 
-def fit_chain_entry(input_flow, transform, inverse_log_det, chain_entry: np.ndarray, patience=20, learning_rate=1e-4, rng_seed: int = 999, max_epochs: int = 200):
+def _fit_chain_entry(input_flow, transform, inverse_log_det, chain_entry: np.ndarray, patience=20, learning_rate=1e-4, rng_seed: int = 999, max_epochs: int = 200):
     """
     Fit a normalizing flow to data with empirical marginal transforms.
 
@@ -106,7 +127,7 @@ def fit_chain_entry(input_flow, transform, inverse_log_det, chain_entry: np.ndar
     >>> import jax.random as jr
     >>> from flowjax.flows import triangular_spline_flow
     >>> from flowjax.distributions import Normal
-    >>> from coppuccino.copula_flows import _create_empirical_transforms, fit_chain_entry
+    >>> from coppuccino.copula_flows import _create_empirical_transforms, _fit_chain_entry
     >>> # Create data and transforms
     >>> data = np.random.randn(1000, 3)
     >>> transform, inverse_log_det = _create_empirical_transforms(data)
@@ -114,41 +135,30 @@ def fit_chain_entry(input_flow, transform, inverse_log_det, chain_entry: np.ndar
     >>> key = jr.key(0)
     >>> flow = triangular_spline_flow(key, base_dist=Normal(jnp.zeros(3)), flow_layers=4)
     >>> # Fit the flow
-    >>> fitted_flow = fit_chain_entry(flow, transform, inverse_log_det, data)
+    >>> fitted_flow = _fit_chain_entry(flow, transform, inverse_log_det, data)
     """
     key = jr.key(rng_seed)
     key, subkey_2 = jr.split(key)
     x_train, __ = inverse_log_det(chain_entry)
 
-    learning_rate = learning_rate
-    patience = patience
-    epochs = max_epochs
-
-    # Train with adaptive parameters and optional compactness penalty
     kwargs = {
-        'max_epochs': epochs,
+        'max_epochs': max_epochs,
         'max_patience': patience,
         'learning_rate': learning_rate
     }
 
-    # Standard training
     updated_flow, losses = fit_to_data(subkey_2, input_flow, x_train, **kwargs)
 
-    final_flow = Transformed(updated_flow, transform)  # unstandardize and back to uniform distribution
+    final_flow = Transformed(updated_flow, transform)  # apply empirical marginal transforms
     return final_flow
 
 
-# def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
-#                           knots: int = 16, patience: int = 20, learning_rate: float = 1e-4,
-#                           max_epochs: int = 200,
-#                           maf_layers: int = 8,
-#                           spline_layers: int = 8,
-#                           nn_depth: int = 2,
-#                           nn_width: int = 128,
-#                           use_maf: bool = True) -> Transformed:
 def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
                           knots: int = 4, patience: int = 30, learning_rate: float = 1e-3,
-                          max_epochs: int = 400, flow_layers: int = 6) -> Transformed:
+                          max_epochs: int = 400, flow_layers: int = 6,
+                          num_points: int = 200, tail_extension: bool = False,
+                          tanh_max_val: float = 3.0,
+                          prior_bounds: np.ndarray = None) -> Transformed:
     """
     Fit a copula normalizing flow to multivariate data.
 
@@ -167,15 +177,34 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
     rng_seed : int, optional
         Random seed for reproducibility. Default is 999.
     knots : int, optional
-        Number of knots for rational quadratic spline transformations. Default is 16.
+        Number of knots for rational quadratic spline transformations. Default is 4.
     patience : int, optional
-        Early stopping patience (epochs without improvement). Default is 20.
+        Early stopping patience (epochs without improvement). Default is 30.
     learning_rate : float, optional
-        Learning rate for Adam optimizer. Default is 1e-4.
+        Learning rate for Adam optimizer. Default is 1e-3.
     max_epochs : int, optional
-        Maximum number of training epochs. Default is 200.
+        Maximum number of training epochs. Default is 400.
     flow_layers : int, optional
-        Number of coupling layers in the triangular spline flow. Default is 8.
+        Number of coupling layers in the triangular spline flow. Default is 6.
+    num_points : int, optional
+        Number of grid points for each marginal CDF spline. Default is 200.
+        Automatically clamped based on sample size. Increase for distributions
+        with fine structure (e.g. many narrow modes).
+    tail_extension : bool, optional
+        If True, extend the marginal CDF beyond the observed data range using
+        a Gaussian tail model. This allows the flow to generate samples beyond
+        the training range. Default is False, which is appropriate for MCMC
+        chains bounded by prior support.
+    tanh_max_val : float, optional
+        Maximum value for the tanh clipping in the spline flow base space.
+        Default is 3.0. Increase (e.g. 4.0–5.0) for heavy-tailed data where
+        tail dependencies matter.
+    prior_bounds : np.ndarray, optional
+        Prior support bounds with shape (n_params, 2), where each row is
+        [low, high] for that parameter. When provided, the empirical CDF grid
+        extends to the prior edges, allowing the flow to sample the full prior
+        support rather than being limited to the most extreme training sample.
+        Recommended for MCMC chains.
 
     Returns
     -------
@@ -197,6 +226,9 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
     >>> new_samples = sample(flow, n_samples=500, rng_seed=123)
     >>> new_samples.shape
     (500, 2)
+    >>> # With prior bounds (recommended for MCMC chains)
+    >>> bounds = np.array([[-5, 5], [-5, 5]])
+    >>> flow = normalizing_flows_fit(data, prior_bounds=bounds, max_epochs=100)
 
     Notes
     -----
@@ -204,21 +236,25 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
     particularly efficient for capturing dependencies in high-dimensional data.
     """
     key = jr.key(rng_seed)
-    # key1, key2 = jr.split(key)
+
+    # Filter NaN rows once so both transform creation and training use clean data
+    clean_chain = chain[~np.isnan(chain).any(axis=1)]
 
     # Create initial transforms using the helper function
-    transform, inverse_log_det = _create_empirical_transforms(chain)
+    transform, inverse_log_det = _create_empirical_transforms(
+        clean_chain, num_points=num_points, tail_extension=tail_extension,
+        prior_bounds=prior_bounds)
 
     # Use only triangular spline flow (original behavior)
     flow = triangular_spline_flow(
         key,
-        base_dist=Normal(jnp.zeros(chain.shape[1])),
+        base_dist=Normal(jnp.zeros(clean_chain.shape[1])),
         knots=knots,
         flow_layers=flow_layers,
-        tanh_max_val=3.0,
+        tanh_max_val=tanh_max_val,
         invert=True
     )
-    flow = fit_chain_entry(flow, transform, inverse_log_det, chain, rng_seed=rng_seed,
+    flow = _fit_chain_entry(flow, transform, inverse_log_det, clean_chain, rng_seed=rng_seed,
                             patience=patience, learning_rate=learning_rate, max_epochs=max_epochs)
 
     return flow

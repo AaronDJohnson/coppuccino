@@ -181,3 +181,7 @@ cython_debug/
 .cursorindexingignore
 
 .DS_Store
+
+# Project-specific
+diagnostics/
+*.pkl

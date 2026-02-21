@@ -1,7 +1,49 @@
 import pytest
 import numpy as np
 from flowjax.distributions import Transformed
-from coppuccino.hdr import compute_injection_hdr
+from coppuccino.hdr import compute_injection_hdr, check_in_support
+
+
+class TestCheckInSupport:
+    """Test the check_in_support function."""
+
+    def test_inside_support(self):
+        """Test that parameters inside support return True."""
+        samples = np.array([[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]])
+        injection = np.array([1.0, 1.0])
+        assert check_in_support(samples, injection) == True
+
+    def test_outside_support(self):
+        """Test that parameters outside support return False."""
+        samples = np.array([[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]])
+        injection = np.array([5.0, 5.0])
+        assert check_in_support(samples, injection) == False
+
+    def test_at_boundary(self):
+        """Test that parameters at boundary return True."""
+        samples = np.array([[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]])
+        injection = np.array([0.0, 2.0])
+        assert check_in_support(samples, injection) == True
+
+    def test_partially_outside(self):
+        """Test that parameters partially outside return False."""
+        samples = np.array([[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]])
+        injection = np.array([1.0, 5.0])  # 2nd param outside
+        assert check_in_support(samples, injection) == False
+
+    def test_wrong_ndim_raises(self):
+        """Test that non-1D injection raises ValueError."""
+        samples = np.array([[0.0, 0.0], [1.0, 1.0]])
+        injection = np.array([[1.0, 1.0]])  # 2D
+        with pytest.raises(ValueError, match="injection_params must be a 1D array"):
+            check_in_support(samples, injection)
+
+    def test_wrong_length_raises(self):
+        """Test that mismatched length raises ValueError."""
+        samples = np.array([[0.0, 0.0], [1.0, 1.0]])
+        injection = np.array([1.0, 1.0, 1.0])  # 3 params vs 2
+        with pytest.raises(ValueError, match="injection_params length must match"):
+            check_in_support(samples, injection)
 
 
 class TestComputeInjectionHDR:
@@ -107,11 +149,9 @@ class TestComputeInjectionHDR:
 
         custom_kwargs = {
             'knots': 8,
-            'interval': 2,
             'patience': 3,
             'learning_rate': 1e-3,
             'max_epochs': 10,
-            'nn_depth': 2
         }
 
         hdr = compute_injection_hdr(
