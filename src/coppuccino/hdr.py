@@ -69,7 +69,8 @@ def compute_injection_hdr(samples: np.ndarray, injection_params: np.ndarray, num
     Compute Highest Density Region (HDR) credibility for injection parameters.
 
     The HDR credibility is the fraction of samples from the fitted distribution
-    that have equal or lower probability density than the injection parameters.
+    that have equal or higher probability density than the injection parameters
+    (so a point at the mode scores near 0 and a point in the tails near 1).
     This metric is used to validate Bayesian inference: if the inference is
     well-calibrated, HDR values should be uniformly distributed between 0 and 1.
 
