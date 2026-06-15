@@ -420,6 +420,49 @@ class TestSaveLoadWithNonDefaultParams:
         finally:
             os.unlink(path)
 
+    @pytest.mark.parametrize("marginal,expected", [
+        (None, "rqs"),       # default
+        ("rqs", "rqs"),
+        ("pchip", "pchip"),
+    ])
+    def test_round_trip_preserves_marginal(self, marginal, expected):
+        """The marginal family (default RQS, or explicit) survives save/load and
+        the reloaded flow reproduces the original samples exactly."""
+        from paramax import unwrap
+        np.random.seed(42)
+        chain = np.random.randn(200, 2)
+        kwargs = {} if marginal is None else {"marginal": marginal}
+        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2, **kwargs)
+
+        spline_data = _extract_spline_data(flow)
+        assert spline_data['marginal'] == [expected, expected]
+
+        original_samples = sample(flow, n_samples=100, rng_seed=999)
+        with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as f:
+            path = f.name
+        try:
+            save_flow(flow, path)
+            loaded_flow = load_flow(path)
+            loaded_marginals = [str(unwrap(b.marginal)) for b in loaded_flow.bijection.bijections]
+            assert loaded_marginals == [expected, expected]
+            loaded_samples = sample(loaded_flow, n_samples=100, rng_seed=999)
+            np.testing.assert_array_almost_equal(original_samples, loaded_samples)
+        finally:
+            os.unlink(path)
+
+    def test_old_saved_file_without_marginal_defaults_to_pchip(self):
+        """A saved file predating the 'marginal' field reconstructs as PCHIP
+        (what such models were always built with), not the new RQS default."""
+        np.random.seed(42)
+        chain = np.random.randn(200, 2)
+        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2, marginal="pchip")
+        spline_data = _extract_spline_data(flow)
+        # Simulate an older save that never stored the marginal key.
+        del spline_data['marginal']
+        transform = _reconstruct_empirical_transforms(spline_data)
+        from paramax import unwrap
+        assert all(str(unwrap(b.marginal)) == "pchip" for b in transform.bijections)
+
 
 class TestEdgeCases:
     """Test edge cases and error handling."""

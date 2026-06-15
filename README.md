@@ -8,7 +8,7 @@ Fit distributions with normalizing flows + copulas using JAX.
 
 Coppuccino is a JAX-based library for fitting and sampling from complex multivariate probability distributions using copula normalizing flows. It works in two stages:
 
-1. **Empirical marginal transforms** — each dimension is mapped to a Gaussian via a spline-based empirical CDF
+1. **Empirical marginal transforms** — each dimension is mapped to a Gaussian via a spline-based empirical CDF. By default this uses a monotone rational-quadratic spline (`marginal="rqs"`), whose forward, inverse and derivative are closed-form and mutually exact; pass `marginal="pchip"` for the original PCHIP interpolant.
 2. **Normalizing flow** — a triangular spline flow models the dependency structure (copula) in Gaussian space
 
 This approach is particularly well-suited for density estimation on MCMC posterior samples, enabling resampling, density evaluation, and calibration checks (HDR credibility).
@@ -79,3 +79,21 @@ hdr = compute_injection_hdr(posterior_samples, true_params)
 bounds = np.array([[-10, 10], [-5, 5], [0, 100]])
 flow = normalizing_flows_fit(data, prior_bounds=bounds)
 ```
+
+### Marginal interpolant
+
+```python
+# Default: rational-quadratic spline marginals (exact closed-form inverse)
+flow = normalizing_flows_fit(data)                  # marginal="rqs"
+
+# Original PCHIP marginals (for reproducing older fits)
+flow = normalizing_flows_fit(data, marginal="pchip")
+```
+
+Both families use the same empirical-quantile knots and the same tail and
+prior-bound handling, so they are statistically equivalent. `"rqs"` is preferred
+because its forward transform, inverse, and density derivative all come from a
+single parameterization and are mutually exact to machine precision, which keeps
+`sample_and_log_prob` importance weights honest; the `"pchip"` path builds the
+CDF and its inverse as two independent splines that are only approximate
+inverses of each other.

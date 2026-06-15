@@ -79,8 +79,159 @@ def _process_array(arr):
     return new_arr
 
 
+def _fit_gpd(excesses):
+    """Fit a Generalized Pareto Distribution to non-negative excesses.
+
+    Returns (xi, sigma). Falls back to a moment-based estimate when
+    scipy's MLE fails (rare, but happens on tiny or degenerate samples).
+    """
+    from scipy.stats import genpareto
+    excesses = np.asarray(excesses, dtype=float)
+    excesses = excesses[excesses > 0]
+    if len(excesses) < 5:
+        # Too few excesses for any sensible fit — exponential fallback.
+        sigma = float(np.mean(excesses)) if len(excesses) else 1.0
+        return 0.0, max(sigma, 1e-10)
+    try:
+        xi, _, sigma = genpareto.fit(excesses, floc=0)
+    except Exception:
+        # Method-of-moments fallback (Hosking & Wallis 1987).
+        m = float(np.mean(excesses))
+        v = float(np.var(excesses, ddof=1))
+        if v <= 0:
+            return 0.0, max(m, 1e-10)
+        xi = 0.5 * (1.0 - m * m / v)
+        sigma = 0.5 * m * (1.0 + m * m / v)
+    return float(xi), float(max(sigma, 1e-10))
+
+
+def _gpd_cdf(y, xi, sigma, xi_eps=1e-6):
+    """GPD CDF on excesses y ≥ 0. Handles ξ≈0 (exponential) limit."""
+    y = jnp.maximum(y, 0.0)
+    z = y / sigma
+    # For ξ<0 the support is bounded at y = -σ/ξ; clip to keep argument > 0.
+    safe_arg = jnp.maximum(1.0 + xi * z, 1e-30)
+    xi_safe = jnp.where(jnp.abs(xi) < xi_eps, 1.0, xi)  # avoid /0 in unused branch
+    return jnp.where(
+        jnp.abs(xi) < xi_eps,
+        1.0 - jnp.exp(-z),
+        1.0 - jnp.power(safe_arg, -1.0 / xi_safe),
+    )
+
+
+def _gpd_pdf(y, xi, sigma, xi_eps=1e-6):
+    """GPD PDF on excesses y ≥ 0."""
+    y = jnp.maximum(y, 0.0)
+    z = y / sigma
+    safe_arg = jnp.maximum(1.0 + xi * z, 1e-30)
+    xi_safe = jnp.where(jnp.abs(xi) < xi_eps, 1.0, xi)
+    return jnp.where(
+        jnp.abs(xi) < xi_eps,
+        jnp.exp(-z) / sigma,
+        jnp.power(safe_arg, -1.0 / xi_safe - 1.0) / sigma,
+    )
+
+
+def _gpd_quantile(p, xi, sigma, xi_eps=1e-6):
+    """GPD inverse CDF: y(p) for p ∈ [0, 1)."""
+    p = jnp.clip(p, 0.0, 1.0 - 1e-15)
+    xi_safe = jnp.where(jnp.abs(xi) < xi_eps, 1.0, xi)
+    return jnp.where(
+        jnp.abs(xi) < xi_eps,
+        -sigma * jnp.log1p(-p),
+        sigma * (jnp.power(1.0 - p, -xi_safe) - 1.0) / xi_safe,
+    )
+
+
+def _rqs_bulk(xg, cdf_vals):
+    """Build closed-form monotone rational-quadratic spline (RQS) callables.
+
+    Returns ``(cdf, inverse, deriv)`` callables over the bulk knots, matching the
+    call interface of the interpax ``PchipInterpolator`` objects they replace in
+    :func:`make_empirical_cdf_spline`. Unlike the PCHIP pair (two independently
+    constructed splines that are only approximate inverses), the RQS forward,
+    inverse and derivative all come from a single parameterization, so the
+    transform is self-consistent to machine precision.
+
+    Knot derivatives are taken from the PCHIP slopes, so the RQS reproduces the
+    monotone PCHIP shape at the knots while admitting a closed-form inverse
+    (a stable quadratic root per bin) and derivative. Formulas follow
+    Gregory & Delbourgo (1982) / Durkan et al. (2019).
+
+    Parameters
+    ----------
+    xg : array_like
+        Strictly sorted bulk knot locations (CDF domain).
+    cdf_vals : array_like
+        Strictly increasing CDF values at ``xg``.
+
+    Returns
+    -------
+    cdf, inverse, deriv : callables
+        ``cdf(x)`` maps x -> CDF, ``inverse(u)`` maps CDF -> x, ``deriv(x)``
+        is the closed-form CDF derivative (density). All are jnp-vectorized.
+    """
+    from scipy.interpolate import PchipInterpolator as _ScipyPchip
+    xg = np.asarray(xg, dtype=float)
+    yg = np.asarray(cdf_vals, dtype=float)
+    # RQS needs strictly increasing x knots; drop any ties (cdf_vals is already
+    # strictly increasing thanks to the upstream monotonicity bump).
+    keep = np.concatenate([[True], np.diff(xg) > 0])
+    xk, yk = xg[keep], yg[keep]
+    # PCHIP slopes at the knots — monotone by construction, strictly positive
+    # floor so they can sit in RQS denominators without dividing by zero.
+    dk = np.maximum(_ScipyPchip(xk, yk).derivative()(xk), 1e-30)
+
+    xk_j, yk_j, dk_j = jnp.asarray(xk), jnp.asarray(yk), jnp.asarray(dk)
+    w = xk_j[1:] - xk_j[:-1]
+    dy = yk_j[1:] - yk_j[:-1]
+    s = dy / w  # secant slope per bin
+    nbins = len(xk) - 1
+
+    def _bin_x(x):
+        return jnp.clip(jnp.searchsorted(xk_j, x, side="right") - 1, 0, nbins - 1)
+
+    def _bin_y(y):
+        return jnp.clip(jnp.searchsorted(yk_j, y, side="right") - 1, 0, nbins - 1)
+
+    def cdf(x):
+        x = jnp.asarray(x)
+        k = _bin_x(x)
+        xi = (x - xk_j[k]) / w[k]
+        num = dy[k] * (s[k] * xi**2 + dk_j[k] * xi * (1 - xi))
+        den = s[k] + (dk_j[k + 1] + dk_j[k] - 2 * s[k]) * xi * (1 - xi)
+        return yk_j[k] + num / den
+
+    def deriv(x):
+        x = jnp.asarray(x)
+        k = _bin_x(x)
+        xi = (x - xk_j[k]) / w[k]
+        den = s[k] + (dk_j[k + 1] + dk_j[k] - 2 * s[k]) * xi * (1 - xi)
+        num = s[k] ** 2 * (dk_j[k + 1] * xi**2 + 2 * s[k] * xi * (1 - xi)
+                           + dk_j[k] * (1 - xi) ** 2)
+        return num / den**2
+
+    def inverse(u):
+        u = jnp.asarray(u)
+        k = _bin_y(u)
+        alpha = u - yk_j[k]
+        coef = dk_j[k + 1] + dk_j[k] - 2 * s[k]
+        a = dy[k] * (s[k] - dk_j[k]) + alpha * coef
+        b = dy[k] * dk_j[k] - alpha * coef
+        c = -s[k] * alpha
+        disc = jnp.maximum(b**2 - 4 * a * c, 0.0)
+        # Numerically stable root that stays in [0, 1] as a -> 0 (linear bin).
+        xi = 2 * c / (-b - jnp.sqrt(disc))
+        xi = jnp.clip(xi, 0.0, 1.0)
+        return xk_j[k] + xi * w[k]
+
+    return cdf, inverse, deriv
+
+
 def make_empirical_cdf_spline(samples, num_points=200, min_eps=1e-7, tail_extension=False,
-                              prior_low=None, prior_high=None):
+                              prior_low=None, prior_high=None,
+                              tail_model="gaussian", tail_quantile=0.05,
+                              marginal="pchip"):
     """
     Create empirical CDF, inverse CDF (quantile), and PDF functions from samples.
 
@@ -98,6 +249,14 @@ def make_empirical_cdf_spline(samples, num_points=200, min_eps=1e-7, tail_extens
     the empirical CDF at the boundaries. This allows the flow to generate
     samples beyond the training range. Default is False (clip to data bounds),
     which is appropriate for MCMC chains bounded by prior support.
+
+    For heavy-tailed marginals, set ``tail_model="gpd"`` to use a Generalized
+    Pareto Distribution fitted via peaks-over-threshold to the top/bottom
+    ``tail_quantile`` of samples (default 5%). Unlike the Gaussian tail model,
+    the GPD threshold lives *inside* the observed data range — the empirical
+    spline covers only the bulk, and the GPD takes over wherever it is more
+    statistically efficient. This is the recommended choice when accuracy in
+    the tails matters more than absolute simplicity.
 
     Parameters
     ----------
@@ -120,6 +279,25 @@ def make_empirical_cdf_spline(samples, num_points=200, min_eps=1e-7, tail_extens
     prior_high : float, optional
         Upper bound of the prior support for this parameter. If provided, the
         CDF grid is extended up to this value (with CDF = 1 - min_eps).
+    tail_model : str, optional
+        ``"gaussian"`` (default, current behavior) or ``"gpd"`` (peaks-over-
+        threshold Generalized Pareto). ``"gpd"`` activates GPD tails inside
+        the data range and is appropriate for heavy-tailed marginals; it
+        ignores ``tail_extension`` and (for now) ``prior_low``/``prior_high``.
+    tail_quantile : float, optional
+        Fraction of samples in each GPD tail (only used when
+        ``tail_model="gpd"``). Default 0.05 (5%).
+    marginal : str, optional
+        Bulk interpolant family: ``"pchip"`` (default here) builds two
+        independent PCHIP splines for the CDF and its inverse; ``"rqs"`` builds a
+        single monotone rational-quadratic spline whose forward, inverse and
+        derivative are all closed-form and mutually exact (self-consistent to
+        machine precision). Both use the same empirical-quantile knots and the
+        same tail / prior-bound handling, so they are statistically equivalent;
+        ``"rqs"`` differs only by having an exact, cheaper inverse. Note the
+        ``normalizing_flows_fit`` entry point defaults to ``"rqs"``; this
+        low-level function keeps ``"pchip"`` as its default for backward
+        compatibility.
 
     Returns
     -------
@@ -147,18 +325,55 @@ def make_empirical_cdf_spline(samples, num_points=200, min_eps=1e-7, tail_extens
     >>> cdf_vals, cdf_fn, quantile_fn, pdf_fn = make_empirical_cdf_spline(
     ...     samples, prior_low=-5.0, prior_high=5.0)
     """
-    # Adaptive grid size: avoid degenerate grids with small N
-    num_points = max(20, min(num_points, len(samples) // 3))
+    use_gpd = (tail_model == "gpd")
 
-    xg = np.asarray(np.quantile(samples, np.linspace(0, 1, num_points)))
+    # ------------------------------------------------------------------
+    # GPD branch: peaks-over-threshold model with thresholds *inside* the
+    # data range. The spline covers only the bulk [u_lo, u_hi]; the GPD
+    # takes over for x outside that interval.
+    # ------------------------------------------------------------------
+    if use_gpd:
+        F_lo = float(tail_quantile)
+        F_hi = 1.0 - F_lo
+        u_lo = float(np.quantile(samples, F_lo))
+        u_hi = float(np.quantile(samples, F_hi))
+        if u_hi <= u_lo:
+            # Degenerate: data is essentially constant. Fall back to Gaussian.
+            use_gpd = False
+        else:
+            excesses_lo = u_lo - samples[samples < u_lo]
+            excesses_hi = samples[samples > u_hi] - u_hi
+            xi_lo, sigma_lo = _fit_gpd(excesses_lo)
+            xi_hi, sigma_hi = _fit_gpd(excesses_hi)
 
-    # Empirical CDF
-    sorted_chain = _process_array(samples)
-    counts = np.searchsorted(sorted_chain, xg, side='right')
-    cdf_vals = counts / len(sorted_chain)
+            bulk = samples[(samples >= u_lo) & (samples <= u_hi)]
+            num_points_bulk = max(20, min(num_points, len(bulk) // 3))
+            xg = np.asarray(np.quantile(bulk, np.linspace(0, 1, num_points_bulk)))
+            # Anchor endpoints exactly at the thresholds so the spline
+            # joins the GPD at known CDF values.
+            xg[0], xg[-1] = u_lo, u_hi
 
-    # Data bounds (may be extended by prior bounds)
-    data_min, data_max = np.min(samples), np.max(samples)
+            sorted_chain = _process_array(samples)
+            counts = np.searchsorted(sorted_chain, xg, side='right')
+            cdf_vals = counts / len(sorted_chain)
+            cdf_vals[0], cdf_vals[-1] = F_lo, F_hi
+            # data_min / data_max here demark the *spline* domain, not the
+            # full sample range — outside this, the GPD branch is used.
+            data_min, data_max = u_lo, u_hi
+
+    if not use_gpd:
+        # Adaptive grid size: avoid degenerate grids with small N
+        num_points = max(20, min(num_points, len(samples) // 3))
+
+        xg = np.asarray(np.quantile(samples, np.linspace(0, 1, num_points)))
+
+        # Empirical CDF
+        sorted_chain = _process_array(samples)
+        counts = np.searchsorted(sorted_chain, xg, side='right')
+        cdf_vals = counts / len(sorted_chain)
+
+        # Data bounds (may be extended by prior bounds)
+        data_min, data_max = np.min(samples), np.max(samples)
 
     # Extend grid to prior bounds if provided
     if prior_low is not None and prior_low < xg[0]:
@@ -182,9 +397,23 @@ def make_empirical_cdf_spline(samples, num_points=200, min_eps=1e-7, tail_extens
     # Store actual CDF bounds after clipping (may differ from min_eps due to empirical CDF)
     cdf_min, cdf_max = float(np.min(cdf_vals)), float(np.max(cdf_vals))
 
-    # Create monotonic spline for CDF
-    cdf_spline = PchipInterpolator(xg, cdf_vals, extrapolate=False, check=False)
-    inverse_cdf_spline = PchipInterpolator(cdf_vals, xg, extrapolate=False, check=False)
+    # Bulk interpolant. Both families share the empirical-quantile knots above
+    # and the tail / prior-bound closures below; they differ only in how the
+    # bulk CDF is interpolated, inverted and differentiated.
+    if marginal == "rqs":
+        # Single closed-form rational-quadratic spline: forward, inverse and
+        # derivative come from one parameterization (machine-precision inverse).
+        bulk_cdf, bulk_inverse, bulk_deriv = _rqs_bulk(xg, cdf_vals)
+    elif marginal == "pchip":
+        # Two independent PCHIP splines for CDF and inverse-CDF; the derivative
+        # is the analytic (piecewise-cubic) derivative of the CDF spline,
+        # strictly cheaper than running jax.grad through the spline per call.
+        cdf_spline = PchipInterpolator(xg, cdf_vals, extrapolate=False, check=False)
+        bulk_inverse = PchipInterpolator(cdf_vals, xg, extrapolate=False, check=False)
+        bulk_cdf = cdf_spline
+        bulk_deriv = cdf_spline.derivative()
+    else:
+        raise ValueError(f"marginal must be 'pchip' or 'rqs', got {marginal!r}")
 
     # ------------------------------------------------------------------
     # Gaussian tail model: fit a Gaussian to the marginal and use it for
@@ -216,38 +445,50 @@ def make_empirical_cdf_spline(samples, num_points=200, min_eps=1e-7, tail_extens
 
     def cdf_fn(u):
         u = jnp.asarray(u)
-        if tail_extension:
-            # Gaussian tail for left extrapolation
+        u_clipped = jnp.clip(u, data_min, data_max)
+        spline_val = bulk_cdf(u_clipped)
+        if use_gpd:
+            left_tail = F_lo * (1.0 - _gpd_cdf(u_lo - u, xi_lo, sigma_lo))
+            right_tail = F_hi + (1.0 - F_hi) * _gpd_cdf(u - u_hi, xi_hi, sigma_hi)
+            y = jnp.where(
+                u <= u_lo,
+                left_tail,
+                jnp.where(u >= u_hi, right_tail, spline_val),
+            )
+        elif tail_extension:
             gauss_cdf = ndtr((u - mu) / sigma)
             left_tail = lo_scale * gauss_cdf
-            # Gaussian tail for right extrapolation
             right_tail = 1.0 - hi_scale * (1.0 - gauss_cdf)
-
             y = jnp.where(
                 u <= data_min,
                 left_tail,
-                jnp.where(
-                    u >= data_max,
-                    right_tail,
-                    cdf_spline(u)
-                )
+                jnp.where(u >= data_max, right_tail, spline_val),
             )
         else:
             y = jnp.where(
                 u <= data_min,
                 min_eps,
-                jnp.where(
-                    u >= data_max,
-                    1.0 - min_eps,
-                    cdf_spline(u)
-                )
+                jnp.where(u >= data_max, 1.0 - min_eps, spline_val),
             )
         # Final bounds check to ensure we never return exactly 0 or 1
-        y = jnp.clip(y, min_eps, 1.0 - min_eps)
-        return y
+        return jnp.clip(y, min_eps, 1.0 - min_eps)
 
     def quantile_fn(u):
         u = jnp.asarray(u)
+        if use_gpd:
+            # Avoid 1-0 inside GPD quantile when u is at the endpoints.
+            safe_left = jnp.clip(1.0 - u / max(F_lo, min_eps), min_eps, 1.0 - min_eps)
+            safe_right = jnp.clip((u - F_hi) / max(1.0 - F_hi, min_eps),
+                                   min_eps, 1.0 - min_eps)
+            left_x = u_lo - _gpd_quantile(safe_left, xi_lo, sigma_lo)
+            right_x = u_hi + _gpd_quantile(safe_right, xi_hi, sigma_hi)
+            u_bulk = jnp.clip(u, cdf_min, cdf_max)
+            mid_x = bulk_inverse(u_bulk)
+            return jnp.where(
+                u <= F_lo,
+                left_x,
+                jnp.where(u >= F_hi, right_x, mid_x),
+            )
         if tail_extension:
             # For values below or above the empirical CDF range, invert
             # the Gaussian tail model.
@@ -259,7 +500,7 @@ def make_empirical_cdf_spline(samples, num_points=200, min_eps=1e-7, tail_extens
             right_x = mu + sigma * ndtri(jnp.clip(1.0 - (1.0 - u) / hi_scale, min_eps, 1.0 - min_eps))
 
             u_clipped = jnp.clip(u, cdf_min, cdf_max)
-            mid_x = inverse_cdf_spline(u_clipped)
+            mid_x = bulk_inverse(u_clipped)
 
             y = jnp.where(
                 u < cdf_min,
@@ -268,17 +509,55 @@ def make_empirical_cdf_spline(samples, num_points=200, min_eps=1e-7, tail_extens
             )
         else:
             u_clipped = jnp.clip(u, cdf_min, cdf_max)
-            y = inverse_cdf_spline(u_clipped)
+            y = bulk_inverse(u_clipped)
             y = jnp.where(u < cdf_min, data_min, jnp.where(u > cdf_max, data_max, y))
         return y
 
-    _cdf_grad_fn = jax.grad(cdf_fn)
+    _inv_sqrt_2pi = 1.0 / jnp.sqrt(2.0 * jnp.pi)
 
     def pdf_fn(x):
+        """PDF via the analytic derivative of the bulk CDF interpolant.
+
+        Mirrors the branch structure of ``cdf_fn``:
+          * middle (within data range): closed-form derivative of the bulk
+            interpolant (PCHIP or RQS), no jax.grad.
+          * left/right tail with ``tail_extension``: derivative of the
+            Gaussian-tail CDF, i.e. ``scale * φ((x-μ)/σ) / σ``.
+          * no tail extension: PDF is zero outside data range; floored
+            to ``min_eps`` so log(pdf) stays finite.
+
+        Works on scalar or vector input (jax.grad previously forced
+        scalar-only).
+        """
         x = jnp.asarray(x)
-        y = _cdf_grad_fn(x)
-        y = jnp.maximum(y, min_eps)
-        return y
+        x_in = jnp.clip(x, data_min, data_max)
+        mid_pdf = bulk_deriv(x_in)
+
+        if use_gpd:
+            left_pdf = F_lo * _gpd_pdf(u_lo - x, xi_lo, sigma_lo)
+            right_pdf = (1.0 - F_hi) * _gpd_pdf(x - u_hi, xi_hi, sigma_hi)
+            y = jnp.where(
+                x <= u_lo,
+                left_pdf,
+                jnp.where(x >= u_hi, right_pdf, mid_pdf),
+            )
+        elif tail_extension:
+            z = (x - mu) / sigma
+            tail_normal_pdf = _inv_sqrt_2pi * jnp.exp(-0.5 * z * z) / sigma
+            left_pdf = lo_scale * tail_normal_pdf
+            right_pdf = hi_scale * tail_normal_pdf
+            y = jnp.where(
+                x <= data_min,
+                left_pdf,
+                jnp.where(x >= data_max, right_pdf, mid_pdf),
+            )
+        else:
+            y = jnp.where(
+                (x <= data_min) | (x >= data_max),
+                0.0,
+                mid_pdf,
+            )
+        return jnp.maximum(y, min_eps)
 
     return cdf_vals, cdf_fn, quantile_fn, pdf_fn
 
@@ -304,6 +583,10 @@ class EmpiricalMarginalToGaussian(AbstractBijection):
         Empirical PDF function (derivative of CDF).
     min_eps : float, default=1e-7
         Minimum epsilon to avoid CDF values of exactly 0 or 1.
+    marginal : str, default="pchip"
+        Which bulk interpolant family built ``cdf_fn``/``quantile_fn``/``pdf_fn``
+        (``"pchip"`` or ``"rqs"``). Stored as metadata so the transform can be
+        reconstructed identically by :func:`coppuccino.model_io.load_flow`.
 
     Examples
     --------
@@ -332,6 +615,9 @@ class EmpiricalMarginalToGaussian(AbstractBijection):
     tail_extension: bool = False
     prior_low: Optional[float] = None
     prior_high: Optional[float] = None
+    tail_model: str = "gaussian"
+    tail_quantile: float = 0.05
+    marginal: str = "pchip"
     cond_shape: ClassVar[None] = None
     shape: ClassVar[tuple[int, ...]] = ()
 

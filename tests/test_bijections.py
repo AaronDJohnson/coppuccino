@@ -1,5 +1,6 @@
 import pytest
 import numpy as np
+import jax
 import jax.numpy as jnp
 from coppuccino.bijections import (
     _process_array,
@@ -371,3 +372,141 @@ class TestEmpiricalMarginalToGaussian:
         z, log_det = bijection.inverse_and_log_det(x)
         assert jnp.isfinite(z)
         assert jnp.isfinite(log_det)
+
+
+class TestGPDTailModel:
+    """Test the tail_model='gpd' peaks-over-threshold path."""
+
+    def test_gpd_recovers_shape_parameter(self):
+        """_fit_gpd should recover the true ξ on a known GPD sample."""
+        from scipy.stats import genpareto
+        from coppuccino.bijections import _fit_gpd
+        rng = np.random.default_rng(0)
+        excesses = genpareto.rvs(0.3, scale=1.0, size=3000, random_state=rng)
+        xi, sigma = _fit_gpd(excesses)
+        assert abs(xi - 0.3) < 0.05
+        assert abs(sigma - 1.0) < 0.1
+
+    def test_gpd_basic_roundtrip(self):
+        """CDF/quantile/PDF are finite and consistent with tail_model='gpd'."""
+        np.random.seed(42)
+        samples = np.random.standard_t(df=3, size=5000)
+        _, cdf_fn, quantile_fn, pdf_fn = make_empirical_cdf_spline(
+            samples, tail_model="gpd"
+        )
+        # Middle round-trip
+        x = jnp.array(0.5)
+        u = cdf_fn(x)
+        x_back = quantile_fn(u)
+        assert abs(float(x_back) - 0.5) < 0.1
+        # Tails are finite, monotone, positive density
+        for xv in [-50.0, -10.0, 10.0, 50.0]:
+            xj = jnp.array(xv)
+            assert jnp.isfinite(cdf_fn(xj))
+            assert jnp.isfinite(quantile_fn(jnp.array(1e-5)))
+            assert float(pdf_fn(xj)) > 0
+        # CDF is monotone
+        xs = jnp.linspace(-30.0, 30.0, 200)
+        cs = jax.vmap(cdf_fn)(xs)
+        assert bool(jnp.all(jnp.diff(cs) >= -1e-10))
+
+    def test_gpd_nll_close_to_true_on_heavy_tails(self):
+        """GPD tails on Student-t data should produce held-out NLL within
+        a small additive gap of the analytic NLL — confirms the tail model
+        is at least as accurate as the empirical estimate."""
+        from scipy.stats import t as student_t
+        rng = np.random.default_rng(1)
+        train = student_t.rvs(3, size=8000, random_state=rng)
+        test = student_t.rvs(3, size=8000, random_state=rng)
+
+        _, _, _, pdf = make_empirical_cdf_spline(train, tail_model="gpd")
+        nll_gpd = -float(jnp.mean(jnp.log(jax.vmap(pdf)(jnp.asarray(test)))))
+        true_nll = -float(np.mean(student_t.logpdf(test, 3)))
+
+        # Empirical estimator floor is roughly 1/N — give 0.05 headroom.
+        assert nll_gpd - true_nll < 0.05
+
+    def test_gpd_falls_back_on_constant_data(self):
+        """Degenerate samples shouldn't crash the GPD path."""
+        samples = np.zeros(500) + 1e-10 * np.random.randn(500)
+        # Just needs to not raise:
+        make_empirical_cdf_spline(samples, tail_model="gpd")
+
+
+class TestRQSMarginal:
+    """Test the marginal='rqs' (rational-quadratic spline) bulk interpolant."""
+
+    def test_invalid_marginal_raises(self):
+        """An unknown marginal family should raise a clear error."""
+        samples = np.random.randn(500)
+        with pytest.raises(ValueError, match="marginal must be"):
+            make_empirical_cdf_spline(samples, marginal="bogus")
+
+    def test_rqs_roundtrip_machine_precision(self):
+        """RQS forward/inverse come from one parameterization, so the round-trip
+        is exact to ~machine precision — and far tighter than the PCHIP pair."""
+        rng = np.random.default_rng(0)
+        samples = rng.standard_normal(2000)
+        x = jnp.asarray(np.quantile(samples, np.linspace(0.05, 0.95, 60)))
+
+        _, cdf_r, q_r, _ = make_empirical_cdf_spline(samples, marginal="rqs")
+        _, cdf_p, q_p, _ = make_empirical_cdf_spline(samples, marginal="pchip")
+
+        rt_rqs = float(jnp.max(jnp.abs(q_r(cdf_r(x)) - x)))
+        rt_pchip = float(jnp.max(jnp.abs(q_p(cdf_p(x)) - x)))
+
+        assert rt_rqs < 1e-9
+        assert rt_rqs < rt_pchip  # RQS is the self-consistent one
+
+    def test_rqs_cdf_monotone_and_pdf_positive(self):
+        """RQS CDF is monotone increasing and its density is strictly positive."""
+        rng = np.random.default_rng(1)
+        samples = rng.standard_normal(2000)
+        _, cdf_fn, _, pdf_fn = make_empirical_cdf_spline(samples, marginal="rqs")
+
+        xs = jnp.linspace(float(np.min(samples)), float(np.max(samples)), 300)
+        cs = jax.vmap(cdf_fn)(xs)
+        assert bool(jnp.all(jnp.diff(cs) >= -1e-10))
+        assert bool(jnp.all(jax.vmap(pdf_fn)(xs) > 0))
+
+    def test_rqs_cdf_bounds(self):
+        """CDF stays within (min_eps, 1 - min_eps) and clips outside data range."""
+        rng = np.random.default_rng(2)
+        samples = rng.standard_normal(2000)
+        _, cdf_fn, _, _ = make_empirical_cdf_spline(samples, marginal="rqs")
+        assert float(cdf_fn(jnp.array(np.min(samples) - 10.0))) == pytest.approx(1e-7, abs=1e-8)
+        assert float(cdf_fn(jnp.array(np.max(samples) + 10.0))) == pytest.approx(1.0 - 1e-7, abs=1e-8)
+
+    @pytest.mark.parametrize("kwargs", [
+        {"tail_extension": True},
+        {"prior_low": -8.0, "prior_high": 8.0},
+        {"tail_model": "gpd"},
+    ])
+    def test_rqs_feature_parity(self, kwargs):
+        """RQS shares the tail / prior-bound closures, so tail_extension,
+        prior_bounds and GPD tails all work with it (finite, monotone)."""
+        rng = np.random.default_rng(3)
+        samples = rng.standard_normal(3000)
+        _, cdf_fn, quantile_fn, pdf_fn = make_empirical_cdf_spline(
+            samples, marginal="rqs", **kwargs)
+        xs = jnp.linspace(-6.0, 6.0, 300)
+        cs = jax.vmap(cdf_fn)(xs)
+        assert bool(jnp.all(jnp.isfinite(cs)))
+        assert bool(jnp.all(jnp.diff(cs) >= -1e-9))
+        assert jnp.isfinite(quantile_fn(jnp.array(1e-4)))
+        assert jnp.isfinite(quantile_fn(jnp.array(1.0 - 1e-4)))
+        assert float(pdf_fn(jnp.array(0.0))) > 0
+
+    def test_rqs_bijection_inverse_consistency(self):
+        """Through EmpiricalMarginalToGaussian, the RQS marginal round-trips
+        x -> z -> x' essentially exactly (the motivation for adding it)."""
+        rng = np.random.default_rng(4)
+        samples = rng.standard_normal(2000)
+        _, cdf_fn, quantile_fn, pdf_fn = make_empirical_cdf_spline(samples, marginal="rqs")
+        bij = EmpiricalMarginalToGaussian(
+            samples=samples, cdf_fn=cdf_fn, quantile_fn=quantile_fn,
+            pdf_fn=pdf_fn, marginal="rqs")
+        for xv in [-1.0, -0.3, 0.0, 0.4, 1.2]:
+            z, _ = bij.inverse_and_log_det(jnp.array(xv))
+            x_back, _ = bij.transform_and_log_det(z)
+            assert jnp.abs(x_back - xv) < 1e-6

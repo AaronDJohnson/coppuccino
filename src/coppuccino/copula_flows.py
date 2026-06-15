@@ -18,7 +18,10 @@ __all__ = ["normalizing_flows_fit", "sample", "log_prob", "sample_and_log_prob"]
 
 def _create_empirical_transforms(samples: np.ndarray, min_eps: float = 1e-7,
                                   num_points: int = 200, tail_extension: bool = False,
-                                  prior_bounds: np.ndarray = None):
+                                  prior_bounds: np.ndarray = None,
+                                  tail_model: str = "gaussian",
+                                  tail_quantile: float = 0.05,
+                                  marginal: str = "rqs"):
     """
     Create empirical marginal transforms for copula modeling.
 
@@ -43,6 +46,9 @@ def _create_empirical_transforms(samples: np.ndarray, min_eps: float = 1e-7,
         Prior support bounds with shape (n_params, 2), where each row is
         [low, high] for that parameter. When provided, the CDF grid extends
         to the prior edges so the flow can sample the full prior support.
+    marginal : str, optional
+        Bulk interpolant family for every marginal: ``"rqs"`` (default) or
+        ``"pchip"``. See :func:`coppuccino.bijections.make_empirical_cdf_spline`.
 
     Returns
     -------
@@ -75,11 +81,15 @@ def _create_empirical_transforms(samples: np.ndarray, min_eps: float = 1e-7,
             p_high = float(prior_bounds[j, 1]) if prior_bounds is not None else None
             _, cdf_fn, quantile_fn, pdf_fn = make_empirical_cdf_spline(
                 param_samples, num_points=num_points, min_eps=min_eps,
-                tail_extension=tail_extension, prior_low=p_low, prior_high=p_high)
+                tail_extension=tail_extension, prior_low=p_low, prior_high=p_high,
+                tail_model=tail_model, tail_quantile=tail_quantile,
+                marginal=marginal)
             empirical_transforms.append(non_trainable(EmpiricalMarginalToGaussian(
                 param_samples, cdf_fn, quantile_fn, pdf_fn, min_eps=min_eps,
                 num_points=num_points, tail_extension=tail_extension,
-                prior_low=p_low, prior_high=p_high)))
+                prior_low=p_low, prior_high=p_high,
+                tail_model=tail_model, tail_quantile=tail_quantile,
+                marginal=marginal)))
         else:
             raise ValueError("Insufficient samples for empirical transform")
 
@@ -158,7 +168,10 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
                           max_epochs: int = 400, flow_layers: int = 6,
                           num_points: int = 200, tail_extension: bool = False,
                           tanh_max_val: float = 3.0,
-                          prior_bounds: np.ndarray = None) -> Transformed:
+                          prior_bounds: np.ndarray = None,
+                          tail_model: str = "gaussian",
+                          tail_quantile: float = 0.05,
+                          marginal: str = "rqs") -> Transformed:
     """
     Fit a copula normalizing flow to multivariate data.
 
@@ -205,6 +218,16 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
         extends to the prior edges, allowing the flow to sample the full prior
         support rather than being limited to the most extreme training sample.
         Recommended for MCMC chains.
+    marginal : str, optional
+        Bulk interpolant family for the empirical marginal transforms:
+        ``"rqs"`` (default) or ``"pchip"``. Both use the same empirical-quantile
+        knots and tail/prior handling and are statistically equivalent; ``"rqs"``
+        (monotone rational-quadratic spline) has a closed-form, machine-precision
+        inverse and derivative from a single parameterization, whereas ``"pchip"``
+        builds two independent splines for the CDF and its inverse that are only
+        approximate inverses of each other. Prefer ``"rqs"`` (better self-
+        consistency at equal cost and fit quality); ``"pchip"`` is retained for
+        backward compatibility and reproducing older fits.
 
     Returns
     -------
@@ -243,7 +266,9 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
     # Create initial transforms using the helper function
     transform, inverse_log_det = _create_empirical_transforms(
         clean_chain, num_points=num_points, tail_extension=tail_extension,
-        prior_bounds=prior_bounds)
+        prior_bounds=prior_bounds,
+        tail_model=tail_model, tail_quantile=tail_quantile,
+        marginal=marginal)
 
     # Use only triangular spline flow (original behavior)
     flow = triangular_spline_flow(

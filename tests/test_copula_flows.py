@@ -2,6 +2,8 @@ import pytest
 import numpy as np
 import jax.numpy as jnp
 from flowjax.distributions import Transformed
+from paramax import unwrap
+from coppuccino.bijections import EmpiricalMarginalToGaussian
 from coppuccino.copula_flows import (
     _create_empirical_transforms,
     normalizing_flows_fit,
@@ -9,6 +11,55 @@ from coppuccino.copula_flows import (
     log_prob,
     sample_and_log_prob
 )
+
+
+def _marginal_families(flow):
+    """The marginal family recorded on each empirical transform of a flow."""
+    return [str(unwrap(getattr(b, "marginal"))) for b in flow.bijection.bijections]
+
+
+class TestMarginalSelection:
+    """Test the marginal='rqs'|'pchip' choice on normalizing_flows_fit."""
+
+    def test_default_marginal_is_rqs(self):
+        """normalizing_flows_fit defaults to the RQS marginal."""
+        np.random.seed(42)
+        chain = np.random.randn(200, 3)
+        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
+        assert _marginal_families(flow) == ["rqs", "rqs", "rqs"]
+
+    def test_pchip_marginal_is_selectable(self):
+        """Passing marginal='pchip' uses the PCHIP marginal on every dimension."""
+        np.random.seed(42)
+        chain = np.random.randn(200, 3)
+        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2, marginal="pchip")
+        assert isinstance(flow, Transformed)
+        assert _marginal_families(flow) == ["pchip", "pchip", "pchip"]
+
+    def test_both_marginals_fit_and_sample(self):
+        """Both marginal families fit and produce finite samples/log-probs."""
+        np.random.seed(42)
+        chain = np.random.randn(200, 2)
+        for marginal in ("rqs", "pchip"):
+            flow = normalizing_flows_fit(chain, max_epochs=5, patience=2, marginal=marginal)
+            s = sample(flow, n_samples=100, rng_seed=0)
+            lp = log_prob(flow, chain)
+            assert s.shape == (100, 2) and np.all(np.isfinite(s))
+            assert np.all(np.isfinite(lp))
+
+    def test_invalid_marginal_raises(self):
+        """An unknown marginal family raises a clear error."""
+        np.random.seed(42)
+        chain = np.random.randn(200, 2)
+        with pytest.raises(ValueError, match="marginal must be"):
+            normalizing_flows_fit(chain, max_epochs=5, patience=2, marginal="bogus")
+
+    def test_create_empirical_transforms_default_rqs(self):
+        """_create_empirical_transforms defaults to RQS marginals."""
+        np.random.seed(42)
+        samples = np.random.randn(200, 2)
+        transform, _ = _create_empirical_transforms(samples)
+        assert all(str(unwrap(b.marginal)) == "rqs" for b in transform.bijections)
 
 
 class TestCreateEmpiricalTransforms:

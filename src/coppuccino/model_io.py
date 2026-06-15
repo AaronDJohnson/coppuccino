@@ -49,6 +49,9 @@ def _extract_spline_data(flow: Transformed) -> dict:
         'tail_extension': [],
         'prior_low': [],
         'prior_high': [],
+        'tail_model': [],
+        'tail_quantile': [],
+        'marginal': [],
         'num_dims': 0
     }
 
@@ -68,6 +71,19 @@ def _extract_spline_data(flow: Transformed) -> dict:
                 p_high = unwrap(bij.prior_high)
                 spline_data['prior_low'].append(float(p_low) if p_low is not None else None)
                 spline_data['prior_high'].append(float(p_high) if p_high is not None else None)
+                # tail_model / tail_quantile (default values used for older
+                # bijections that predate these attributes)
+                spline_data['tail_model'].append(
+                    str(unwrap(getattr(bij, 'tail_model', 'gaussian')))
+                )
+                spline_data['tail_quantile'].append(
+                    float(unwrap(getattr(bij, 'tail_quantile', 0.05)))
+                )
+                # marginal family (default 'pchip' for bijections that predate
+                # this attribute, which were always PCHIP-based)
+                spline_data['marginal'].append(
+                    str(unwrap(getattr(bij, 'marginal', 'pchip')))
+                )
             else:
                 raise ValueError(f"Unexpected bijection type: {type(bij)}")
     else:
@@ -100,16 +116,25 @@ def _reconstruct_empirical_transforms(spline_data: dict) -> Stack:
         tail_extension = spline_data.get('tail_extension', [False] * spline_data['num_dims'])[i]
         prior_low = spline_data.get('prior_low', [None] * spline_data['num_dims'])[i]
         prior_high = spline_data.get('prior_high', [None] * spline_data['num_dims'])[i]
+        tail_model = spline_data.get('tail_model', ['gaussian'] * spline_data['num_dims'])[i]
+        tail_quantile = spline_data.get('tail_quantile', [0.05] * spline_data['num_dims'])[i]
+        # Default 'pchip' so models saved before the marginal choice existed
+        # reconstruct exactly as they were trained.
+        marginal = spline_data.get('marginal', ['pchip'] * spline_data['num_dims'])[i]
 
         _, cdf_fn, quantile_fn, pdf_fn = make_empirical_cdf_spline(
             samples, num_points=num_points, min_eps=min_eps,
-            tail_extension=tail_extension, prior_low=prior_low, prior_high=prior_high
+            tail_extension=tail_extension, prior_low=prior_low, prior_high=prior_high,
+            tail_model=tail_model, tail_quantile=tail_quantile,
+            marginal=marginal,
         )
 
         transform = non_trainable(EmpiricalMarginalToGaussian(
             samples, cdf_fn, quantile_fn, pdf_fn, min_eps=min_eps,
             num_points=num_points, tail_extension=tail_extension,
-            prior_low=prior_low, prior_high=prior_high
+            prior_low=prior_low, prior_high=prior_high,
+            tail_model=tail_model, tail_quantile=tail_quantile,
+            marginal=marginal,
         ))
         empirical_transforms.append(transform)
 
