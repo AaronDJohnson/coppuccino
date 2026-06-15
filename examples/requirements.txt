@@ -1,0 +1,9 @@
+# Extra packages needed to run the example notebooks in this directory.
+# (These are NOT runtime dependencies of coppuccino itself.)
+#
+#   pip install -r examples/requirements.txt
+#
+matplotlib
+corner
+pandas
+pyarrow   # required by pandas.read_feather in the galactic binary example
