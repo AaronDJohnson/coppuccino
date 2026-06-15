@@ -185,3 +185,4 @@ cython_debug/
 # Project-specific
 diagnostics/
 *.pkl
+src/.DS_Store
