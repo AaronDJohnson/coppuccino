@@ -293,8 +293,10 @@ def make_empirical_cdf_spline(samples, num_points=200, min_eps=1e-7, tail_extens
         single monotone rational-quadratic spline whose forward, inverse and
         derivative are all closed-form and mutually exact (self-consistent to
         machine precision). Both use the same empirical-quantile knots and the
-        same tail / prior-bound handling, so they are statistically equivalent;
-        ``"rqs"`` differs only by having an exact, cheaper inverse. Note the
+        same tail / prior-bound handling, so they produce nearly identical
+        transforms; ``"rqs"`` additionally guarantees an exact, cheaper inverse,
+        whereas the two PCHIP splines are only approximate inverses of each
+        other. Note the
         ``normalizing_flows_fit`` entry point defaults to ``"rqs"``; this
         low-level function keeps ``"pchip"`` as its default for backward
         compatibility.
@@ -375,15 +377,18 @@ def make_empirical_cdf_spline(samples, num_points=200, min_eps=1e-7, tail_extens
         # Data bounds (may be extended by prior bounds)
         data_min, data_max = np.min(samples), np.max(samples)
 
-    # Extend grid to prior bounds if provided
-    if prior_low is not None and prior_low < xg[0]:
-        xg = np.concatenate([[prior_low], xg])
-        cdf_vals = np.concatenate([[0.0], cdf_vals])
-        data_min = prior_low
-    if prior_high is not None and prior_high > xg[-1]:
-        xg = np.concatenate([xg, [prior_high]])
-        cdf_vals = np.concatenate([cdf_vals, [1.0]])
-        data_max = prior_high
+    # Extend grid to prior bounds if provided. Skipped under the GPD tail model,
+    # whose thresholds live inside the data range and supply the out-of-bulk
+    # tails directly (prior bounds would only inject spurious 0/1-clipped knots).
+    if not use_gpd:
+        if prior_low is not None and prior_low < xg[0]:
+            xg = np.concatenate([[prior_low], xg])
+            cdf_vals = np.concatenate([[0.0], cdf_vals])
+            data_min = prior_low
+        if prior_high is not None and prior_high > xg[-1]:
+            xg = np.concatenate([xg, [prior_high]])
+            cdf_vals = np.concatenate([cdf_vals, [1.0]])
+            data_max = prior_high
     # Clip CDF values to avoid 0 and 1, which cause issues with inverse normal CDF
     cdf_vals = np.clip(cdf_vals, min_eps, 1.0 - min_eps)
     # Ensure strict monotonicity for the inverse CDF spline: prior bound
@@ -583,10 +588,25 @@ class EmpiricalMarginalToGaussian(AbstractBijection):
         Empirical PDF function (derivative of CDF).
     min_eps : float, default=1e-7
         Minimum epsilon to avoid CDF values of exactly 0 or 1.
+
+    The remaining attributes are reconstruction metadata: they record the
+    arguments passed to :func:`make_empirical_cdf_spline` so that
+    :func:`coppuccino.model_io.load_flow` can rebuild ``cdf_fn`` /
+    ``quantile_fn`` / ``pdf_fn`` identically from ``samples``.
+
+    num_points : int, default=200
+        Number of grid points used for the CDF spline.
+    tail_extension : bool, default=False
+        Whether a Gaussian tail model was used beyond the data range.
+    prior_low, prior_high : float or None, default=None
+        Prior support bounds the CDF grid was extended to, if any.
+    tail_model : str, default="gaussian"
+        Tail model used (``"gaussian"`` or the experimental ``"gpd"``).
+    tail_quantile : float, default=0.05
+        GPD tail fraction (only meaningful when ``tail_model="gpd"``).
     marginal : str, default="pchip"
         Which bulk interpolant family built ``cdf_fn``/``quantile_fn``/``pdf_fn``
-        (``"pchip"`` or ``"rqs"``). Stored as metadata so the transform can be
-        reconstructed identically by :func:`coppuccino.model_io.load_flow`.
+        (``"pchip"`` or ``"rqs"``).
 
     Examples
     --------

@@ -100,13 +100,16 @@ def compute_injection_hdr(samples: np.ndarray, injection_params: np.ndarray, num
     hdrs : np.ndarray
         HDR credibility values. Shape (1,) for single injection or
         (n_injections,) for multiple injections. Values range from 0 to 1.
+        Any injection lying outside the coordinate-wise support of ``samples``
+        is assigned exactly ``1.0`` without evaluating the flow (see Notes).
     flow : Transformed, optional
         Fitted copula flow (only returned if return_flow=True).
 
     Raises
     ------
     ValueError
-        If injection_params is a scalar (must be at least 1D).
+        If ``samples`` contain NaN or Inf values, or if ``injection_params``
+        is a scalar (it must be at least 1D).
 
     Examples
     --------
@@ -117,9 +120,8 @@ def compute_injection_hdr(samples: np.ndarray, injection_params: np.ndarray, num
     >>> posterior = np.random.randn(1000, 2) + true_params
     >>> # Compute HDR for true parameters
     >>> hdr = compute_injection_hdr(posterior, true_params, num_samples=50000)
-    >>> # For well-calibrated inference, HDR should be ~0.5 on average
-    >>> # (true params are at median of posterior)
-    >>> hdr[0]
+    >>> # hdr[0] is a single value in [0, 1]; for an injection near the
+    >>> # posterior peak it is small (close to 0), approaching 1 in the tails.
 
     >>> # Multiple injections
     >>> injections = np.array([[1.0, 2.0], [1.5, 2.5], [0.5, 1.5]])
@@ -140,6 +142,13 @@ def compute_injection_hdr(samples: np.ndarray, injection_params: np.ndarray, num
 
     For well-calibrated Bayesian inference, HDR values should follow a uniform
     distribution U(0, 1). Deviations indicate miscalibration or model misspecification.
+
+    Injections outside the coordinate-wise min/max support of ``samples`` are a
+    special case: ``check_in_support`` short-circuits them to HDR = 1.0 without
+    fitting or evaluating the flow, since such points fall in the extreme tail /
+    clipped region where the flow density is effectively minimal. When building
+    a calibration (P-P) plot, be aware that these 1.0 values are sentinels rather
+    than density-based results.
 
     The default normalizing flow parameters are tuned for typical inference problems.
     Adjust them based on your data characteristics:

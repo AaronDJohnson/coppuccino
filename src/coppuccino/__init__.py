@@ -1,3 +1,12 @@
+"""coppuccino: fit distributions with copula normalizing flows in JAX.
+
+.. note::
+    Importing this package enables JAX 64-bit (float64) mode globally via
+    ``jax.config.update('jax_enable_x64', True)``. The empirical-CDF transforms
+    and log-determinant computations rely on float64 accuracy, but be aware that
+    this is a process-wide setting: it also affects any other JAX code in the
+    same session.
+"""
 import jax
 jax.config.update('jax_enable_x64', True)
 

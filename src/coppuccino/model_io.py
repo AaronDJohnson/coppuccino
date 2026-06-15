@@ -7,10 +7,10 @@ serialized with standard equinox serialization.
 """
 
 import io
-import pickle
 from pathlib import Path
 from typing import Union
 
+import cloudpickle
 import equinox as eqx
 import numpy as np
 from flowjax.bijections import Stack
@@ -188,22 +188,9 @@ def save_flow(flow: Transformed, path: Union[str, Path]) -> None:
         'inner_flow_like': inner_flow,  # Keep structure for deserialization
     }
 
-    # Use cloudpickle for better compatibility with JAX objects
-    try:
-        import cloudpickle
-        with open(path, 'wb') as f:
-            cloudpickle.dump(save_dict, f)
-    except ImportError:
-        # Fall back to dill if cloudpickle not available
-        try:
-            import dill
-            with open(path, 'wb') as f:
-                dill.dump(save_dict, f)
-        except ImportError:
-            raise ImportError(
-                "Either 'cloudpickle' or 'dill' is required for saving flows. "
-                "Install with: pip install cloudpickle"
-            )
+    # cloudpickle (a hard dependency) serializes the JAX/equinox objects.
+    with open(path, 'wb') as f:
+        cloudpickle.dump(save_dict, f)
 
 
 def load_flow(path: Union[str, Path]) -> Transformed:
@@ -234,19 +221,8 @@ def load_flow(path: Union[str, Path]) -> Transformed:
     """
     path = Path(path)
 
-    # Try cloudpickle first, then dill, then standard pickle
-    try:
-        import cloudpickle
-        with open(path, 'rb') as f:
-            save_dict = cloudpickle.load(f)
-    except ImportError:
-        try:
-            import dill
-            with open(path, 'rb') as f:
-                save_dict = dill.load(f)
-        except ImportError:
-            with open(path, 'rb') as f:
-                save_dict = pickle.load(f)
+    with open(path, 'rb') as f:
+        save_dict = cloudpickle.load(f)
 
     spline_data = save_dict['spline_data']
 

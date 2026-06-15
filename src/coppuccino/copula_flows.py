@@ -1,4 +1,3 @@
-from typing import Callable
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -46,6 +45,12 @@ def _create_empirical_transforms(samples: np.ndarray, min_eps: float = 1e-7,
         Prior support bounds with shape (n_params, 2), where each row is
         [low, high] for that parameter. When provided, the CDF grid extends
         to the prior edges so the flow can sample the full prior support.
+    tail_model : str, optional
+        ``"gaussian"`` (default) or the experimental ``"gpd"`` peaks-over-
+        threshold model.
+    tail_quantile : float, optional
+        GPD tail fraction, only used when ``tail_model="gpd"`` (default 0.05).
+        See :func:`coppuccino.bijections.make_empirical_cdf_spline` for both.
     marginal : str, optional
         Bulk interpolant family for every marginal: ``"rqs"`` (default) or
         ``"pchip"``. See :func:`coppuccino.bijections.make_empirical_cdf_spline`.
@@ -148,8 +153,7 @@ def _fit_chain_entry(input_flow, transform, inverse_log_det, chain_entry: np.nda
     >>> fitted_flow = _fit_chain_entry(flow, transform, inverse_log_det, data)
     """
     key = jr.key(rng_seed)
-    key, subkey_2 = jr.split(key)
-    x_train, __ = inverse_log_det(chain_entry)
+    x_train, _ = inverse_log_det(chain_entry)
 
     kwargs = {
         'max_epochs': max_epochs,
@@ -157,7 +161,7 @@ def _fit_chain_entry(input_flow, transform, inverse_log_det, chain_entry: np.nda
         'learning_rate': learning_rate
     }
 
-    updated_flow, losses = fit_to_data(subkey_2, input_flow, x_train, **kwargs)
+    updated_flow, _losses = fit_to_data(key, input_flow, x_train, **kwargs)
 
     final_flow = Transformed(updated_flow, transform)  # apply empirical marginal transforms
     return final_flow
@@ -218,6 +222,15 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
         extends to the prior edges, allowing the flow to sample the full prior
         support rather than being limited to the most extreme training sample.
         Recommended for MCMC chains.
+    tail_model : str, optional
+        Marginal tail model: ``"gaussian"`` (default) or ``"gpd"``.
+        ``"gpd"`` is **experimental**: it fits a Generalized Pareto Distribution
+        via peaks-over-threshold to each marginal's tails, which is appropriate
+        for heavy-tailed data but ignores ``tail_extension`` and ``prior_bounds``.
+        See :func:`coppuccino.bijections.make_empirical_cdf_spline`.
+    tail_quantile : float, optional
+        Fraction of samples in each GPD tail. Only used when
+        ``tail_model="gpd"``. Default is 0.05 (5%).
     marginal : str, optional
         Bulk interpolant family for the empirical marginal transforms:
         ``"rqs"`` (default) or ``"pchip"``. Both use the same empirical-quantile
@@ -285,7 +298,7 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
     return flow
 
 
-def sample(flow: Callable, n_samples: int, rng_seed: int = 999) -> np.ndarray:
+def sample(flow: Transformed, n_samples: int, rng_seed: int = 999) -> np.ndarray:
     """
     Generate samples from a fitted copula flow.
 
@@ -294,8 +307,8 @@ def sample(flow: Callable, n_samples: int, rng_seed: int = 999) -> np.ndarray:
 
     Parameters
     ----------
-    flow : Callable
-        Fitted flow model (typically a Transformed distribution).
+    flow : Transformed
+        Fitted copula flow model from `normalizing_flows_fit`.
     n_samples : int
         Number of samples to generate.
     rng_seed : int, optional
@@ -362,8 +375,7 @@ def log_prob(flow: Transformed, samples: np.ndarray) -> np.ndarray:
     >>> log_probs = log_prob(flow, test_data)
     >>> log_probs.shape
     (100,)
-    >>> # Higher values indicate higher probability density
-    >>> np.mean(log_probs)
+    >>> # Higher values indicate higher probability density (e.g. log_probs.mean())
     """
     log_probs = filter_jit(flow.log_prob)(samples)
     return np.array(log_probs)
