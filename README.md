@@ -29,14 +29,32 @@ cd coppuccino
 pip install .
 ```
 
+### Development
+
+This project uses [uv](https://docs.astral.sh/uv/). After cloning:
+
+```bash
+uv sync           # create the env and install coppuccino + dev deps
+uv run pytest     # run the test suite
+```
+
 ### Requirements
 
 - Python >=3.11
-- JAX >=0.7.2
-- NumPy >=2.3.3
-- SciPy >=1.11.0
-- Equinox >=0.13.2
-- FlowJAX >=17.2.1
+- JAX / jaxlib >=0.4.38,<0.8
+- NumPy >=1.26,<3
+- SciPy >=1.10
+- Equinox >=0.13.2,<0.14
+- jaxtyping >=0.3.4,<0.3.6
+- interpax >=0.3.11,<0.4
+- FlowJAX >=17.2.1,<18
+- paramax >=0.0.3
+- cloudpickle >=2.2.1,<4 (used by `save_flow` / `load_flow`)
+
+These are floored at the oldest versions that pass the test suite. The exact
+supported ranges live in `pyproject.toml`; installing with `pip` or `uv`
+resolves them automatically. The example notebooks need a few extra packages —
+see `examples/requirements.txt`.
 
 ## Quick Start
 
@@ -69,7 +87,9 @@ posterior_samples = ...  # shape (n_samples, n_params)
 true_params = np.array([1.0, 2.0, 3.0])
 
 hdr = compute_injection_hdr(posterior_samples, true_params)
-# For well-calibrated inference, HDR values should be uniform on [0, 1]
+# `hdr` is an array: hdr[0] for a single injection, or one value per row when
+# passing a 2D batch of injections. For well-calibrated inference, the HDR
+# values should be uniform on [0, 1] across many events.
 ```
 
 ### Prior bounds (recommended for MCMC chains)
@@ -97,3 +117,18 @@ single parameterization and are mutually exact to machine precision, which keeps
 `sample_and_log_prob` importance weights honest; the `"pchip"` path builds the
 CDF and its inverse as two independent splines that are only approximate
 inverses of each other.
+
+### Heavy-tailed marginals (experimental)
+
+For marginals with heavy tails, `tail_model="gpd"` fits a Generalized Pareto
+Distribution to each tail via peaks-over-threshold, which models the extremes
+more faithfully than the default Gaussian tail:
+
+```python
+# EXPERIMENTAL: peaks-over-threshold GPD tails for heavy-tailed marginals
+flow = normalizing_flows_fit(data, tail_model="gpd", tail_quantile=0.05)
+```
+
+`tail_quantile` (default 0.05) sets the fraction of samples in each tail. This
+feature is **experimental** — its API may change in a future release — and it
+ignores `tail_extension` and `prior_bounds`.

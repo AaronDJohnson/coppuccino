@@ -10,22 +10,26 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
+        # "highest" uses the committed uv.lock; "lowest-direct" exercises the
+        # oldest supported dependency versions declared in pyproject.toml.
+        resolution: ["highest", "lowest-direct"]
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
         with:
-          python-version: ${{ matrix.python-version }}
+          enable-cache: true
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install poetry
-          poetry install
+      - name: Verify lockfile is current
+        run: uv lock --check
 
-      - name: Run tests
-        run: poetry run pytest tests/ -x -q
+      - name: Run tests (${{ matrix.resolution }} resolution)
+        run: >
+          uv run --python ${{ matrix.python-version }}
+          --resolution ${{ matrix.resolution }}
+          pytest tests/ -x -q

@@ -1,17 +1,17 @@
 [project]
 name = "coppuccino"
-version = "0.1.0"
+version = "1.0.0"
 description = "Fit distributions with normalizing flows + copulas with JAX"
 authors = [
-    {name = "Aaron D. Johnson",email = "aaron9035@gmail.com"}
+    {name = "Aaron D. Johnson", email = "aaron9035@gmail.com"}
 ]
 readme = "README.md"
-license = {text = "MIT"}
-requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11,<4.0"
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -19,20 +19,30 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Physics",
 ]
 dependencies = [
-    "jax (>=0.7.2,<0.8.0)",
-    "jaxlib (>=0.7.2,<0.8.0)",
-    "numpy (>=2.3.3,<3.0.0)",
-    "scipy (>=1.11.0)",
-    "equinox (>=0.13.2,<0.14.0)",
-    "interpax (>=0.3.11,<0.4.0)",
-    "flowjax (>=17.2.1,<18.0.0)",
-    "cloudpickle (>=3.0.0)"
+    "jax>=0.4.38,<0.8.0",
+    "jaxlib>=0.4.38,<0.8.0",
+    "numpy>=1.26,<3.0.0",
+    "scipy>=1.10",
+    "equinox>=0.13.2,<0.14.0",
+    "interpax>=0.3.11,<0.4.0",
+    "flowjax>=17.2.1,<18.0.0",
+    # flowjax 17.2.1 leaves jaxtyping uncapped, but jaxtyping >=0.3.6 tightened
+    # runtime shape checking in a way that breaks flowjax's dimension contracts.
+    "jaxtyping>=0.3.4,<0.3.6",
+    "paramax>=0.0.3",
+    "cloudpickle>=2.2.1,<4.0.0",
 ]
 
-[tool.poetry]
-packages = [{include = "coppuccino", from = "src"}]
-
+[project.urls]
+Homepage = "https://github.com/AaronDJohnson/coppuccino"
+Repository = "https://github.com/AaronDJohnson/coppuccino"
 
 [build-system]
-requires = ["poetry-core>=2.0.0,<3.0.0"]
-build-backend = "poetry.core.masonry.api"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/coppuccino"]
+
+[dependency-groups]
+dev = ["pytest>=7.0"]
