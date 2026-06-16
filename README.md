@@ -32,7 +32,7 @@ $p(\mathbf{x})$ on $\mathbb{R}^d$ with marginal CDFs $F_i$ and marginal
 densities $p_i$,
 
 $$
-p(\mathbf{x}) \;=\; \underbrace{c\big(F_1(x_1), \dots, F_d(x_d)\big)}_{\text{copula density}} \;\; \prod_{i=1}^{d} \underbrace{p_i(x_i)}_{\text{marginals}} .
+p(\mathbf{x}) = \underbrace{c\big(F_1(x_1), \dots, F_d(x_d)\big)}_{\text{copula density}} \prod_{i=1}^{d} \underbrace{p_i(x_i)}_{\text{marginals}}.
 $$
 
 The copula density $c$ captures *all* of the dependence between dimensions; the
@@ -62,7 +62,7 @@ mapped to a standard normal through the probability integral transform followed
 by the inverse-normal CDF,
 
 $$
-z_i \;=\; \Phi^{-1}\!\big(F_i(x_i)\big), \qquad i = 1, \dots, d,
+z_i = \Phi^{-1}\big(F_i(x_i)\big), \qquad i = 1, \dots, d,
 $$
 
 where $\Phi$ is the standard normal CDF and each $F_i$ is an empirical CDF built
@@ -83,14 +83,14 @@ Putting the stages together, the log-density of a point is available in closed
 form via the change-of-variables formula,
 
 $$
-\log p(\mathbf{x}) \;=\; \log p_Z(\mathbf{z}) \;+\; \sum_{i=1}^{d}\Big( \log p_i(x_i) - \log \phi(z_i) \Big),
+\log p(\mathbf{x}) = \log p_Z(\mathbf{z}) + \sum_{i=1}^{d}\Big( \log p_i(x_i) - \log \phi(z_i) \Big),
 $$
 
 where $\log p_Z$ is supplied by the flow, $\phi$ is the standard normal density,
 and the sum is the log-Jacobian of the marginal Gaussianization. **Sampling**
 runs the pipeline in reverse: draw $\boldsymbol\varepsilon$ from the base,
 push it through the flow to obtain $\mathbf{z}$, then invert the marginal
-transforms with $x_i = F_i^{-1}\!\big(\Phi(z_i)\big)$.
+transforms with $x_i = F_i^{-1}\big(\Phi(z_i)\big)$.
 
 ### Why this design
 
