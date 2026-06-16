@@ -8,10 +8,11 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest]
         python-version: ["3.11", "3.12", "3.13", "3.14"]
         # "highest" uses the committed uv.lock; "lowest-direct" exercises the
         # oldest supported dependency versions declared in pyproject.toml.
@@ -24,6 +25,15 @@ jobs:
             resolution: "lowest-direct"
           - python-version: "3.14"
             resolution: "lowest-direct"
+        include:
+          # Thin macOS slice: confirm runtime on the oldest and newest Python
+          # (full Python x resolution sweep stays on the faster Ubuntu runners).
+          - os: macos-latest
+            python-version: "3.11"
+            resolution: "highest"
+          - os: macos-latest
+            python-version: "3.14"
+            resolution: "highest"
 
     steps:
       - uses: actions/checkout@v4
