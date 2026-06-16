@@ -12,10 +12,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
         # "highest" uses the committed uv.lock; "lowest-direct" exercises the
         # oldest supported dependency versions declared in pyproject.toml.
         resolution: ["highest", "lowest-direct"]
+        exclude:
+          # The oldest pinned numpy/scipy predate cp313/cp314 wheels, so the
+          # lowest-direct floors aren't installable on 3.13+ (a normal install
+          # there resolves newer versions, which the "highest" job covers).
+          - python-version: "3.13"
+            resolution: "lowest-direct"
+          - python-version: "3.14"
+            resolution: "lowest-direct"
 
     steps:
       - uses: actions/checkout@v4

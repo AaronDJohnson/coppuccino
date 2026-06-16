@@ -15,20 +15,28 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering",
     "Topic :: Scientific/Engineering :: Physics",
 ]
 dependencies = [
-    "jax>=0.4.38,<0.8.0",
-    "jaxlib>=0.4.38,<0.8.0",
+    # jaxlib 0.7.x ships cp311-cp314 wheels so a single version spans every
+    # supported Python including 3.14. (jax 0.10 was observed to trip a
+    # BatchTracer error in the flow on Python 3.11.) The 3.12+ `issubclass`
+    # typing failure is handled by the jaxtyping>=0.3.6 floor below.
+    "jax>=0.4.38,<0.8",
+    "jaxlib>=0.4.38,<0.8",
     "numpy>=1.26,<3.0.0",
-    "scipy>=1.10",
+    # scipy only shipped cp312 wheels from 1.11.x, so the oldest installable
+    # version differs by Python (older scipy would build from source on 3.12).
+    "scipy>=1.10; python_version < '3.12'",
+    "scipy>=1.11.3; python_version >= '3.12'",
     "equinox>=0.13.2,<0.14.0",
     "interpax>=0.3.11,<0.4.0",
     "flowjax>=17.2.1,<18.0.0",
-    # flowjax 17.2.1 leaves jaxtyping uncapped, but jaxtyping >=0.3.6 tightened
-    # runtime shape checking in a way that breaks flowjax's dimension contracts.
-    "jaxtyping>=0.3.4,<0.3.6",
+    # jaxtyping >=0.3.6 carries the Python 3.12 `issubclass` typing fix.
+    "jaxtyping>=0.3.6,<0.4.0",
     "paramax>=0.0.3",
     "cloudpickle>=2.2.1,<4.0.0",
 ]

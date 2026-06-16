@@ -62,12 +62,13 @@ requires-dist = [
     { name = "equinox", specifier = ">=0.13.2,<0.14.0" },
     { name = "flowjax", specifier = ">=17.2.1,<18.0.0" },
     { name = "interpax", specifier = ">=0.3.11,<0.4.0" },
-    { name = "jax", specifier = ">=0.4.38,<0.8.0" },
-    { name = "jaxlib", specifier = ">=0.4.38,<0.8.0" },
-    { name = "jaxtyping", specifier = ">=0.3.4,<0.3.6" },
+    { name = "jax", specifier = ">=0.4.38,<0.8" },
+    { name = "jaxlib", specifier = ">=0.4.38,<0.8" },
+    { name = "jaxtyping", specifier = ">=0.3.6,<0.4.0" },
     { name = "numpy", specifier = ">=1.26,<3.0.0" },
     { name = "paramax", specifier = ">=0.0.3" },
-    { name = "scipy", specifier = ">=1.10" },
+    { name = "scipy", marker = "python_full_version < '3.12'", specifier = ">=1.10" },
+    { name = "scipy", marker = "python_full_version >= '3.12'", specifier = ">=1.11.3" },
 ]
 
 [package.metadata.requires-dev]
@@ -182,14 +183,14 @@ wheels = [
 
 [[package]]
 name = "jaxtyping"
-version = "0.3.5"
+version = "0.3.11"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "wadler-lindig" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/43/30/0e29eab664d33127a7a30aebd7a845a95fbfa1887ede692676769820acea/jaxtyping-0.3.5.tar.gz", hash = "sha256:8150ad5b72b62fa63f573d492a79e9e455f070abe3b260f7dc15270b3eb9bba6", size = 45482, upload-time = "2026-01-05T10:51:34.486Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/91/c1/091b8852bd7cbf50bd655543c8506033cf4029300c67f8c176c1286879a9/jaxtyping-0.3.11.tar.gz", hash = "sha256:b09c14acf6686feb9e0df5b0d8c6e7c5b6f8d36bf059ee54cd522a186c2ef050", size = 46489, upload-time = "2026-06-13T18:35:23.167Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/73/19/a29de61c7ada0edf4eacfc19355ab8560091b65ea5d2450bcb984e203259/jaxtyping-0.3.5-py3-none-any.whl", hash = "sha256:862c39fa2e526274e82dc96ee8dbe9369dadb651ab1e05d95bd685acb4e2ef02", size = 55824, upload-time = "2026-01-05T10:51:33.523Z" },
+    { url = "https://files.pythonhosted.org/packages/8b/38/c66bbdc5047f4776c2bd3e47e5295a350e3fa44d5b8942105e71c2a876a0/jaxtyping-0.3.11-py3-none-any.whl", hash = "sha256:8a4bedc4e3f963fa82df41bd13c7ebc2bad925601eb48614c65798f21329d4e3", size = 56593, upload-time = "2026-06-13T18:35:22.01Z" },
 ]
 
 [[package]]

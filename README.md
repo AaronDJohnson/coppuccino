@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/AaronDJohnson/coppuccino/actions/workflows/test.yml"><img src="https://github.com/AaronDJohnson/coppuccino/actions/workflows/test.yml/badge.svg" alt="Tests"></a>
-  <img src="https://img.shields.io/badge/python-3.11%20%7C%203.12-blue.svg" alt="Python 3.11 | 3.12">
+  <img src="https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue.svg" alt="Python 3.11 | 3.12 | 3.13 | 3.14">
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License">
 </p>
 
@@ -242,20 +242,25 @@ may change — and it ignores `tail_extension` and `prior_bounds`.
 
 ## Requirements
 
-- Python >=3.11
+- Python 3.11–3.14
 - JAX / jaxlib >=0.4.38,<0.8
 - NumPy >=1.26,<3
-- SciPy >=1.10
+- SciPy >=1.10 (>=1.11.3 on Python 3.12, the oldest with cp312 wheels)
 - Equinox >=0.13.2,<0.14
-- jaxtyping >=0.3.4,<0.3.6
+- jaxtyping >=0.3.6,<0.4
 - interpax >=0.3.11,<0.4
 - FlowJAX >=17.2.1,<18
 - paramax >=0.0.3
 - cloudpickle >=2.2.1,<4 (used by `save_flow` / `load_flow`)
 
-These are floored at the oldest versions that pass the test suite; the exact
-ranges live in `pyproject.toml` and `pip`/`uv` resolve them automatically. The
-example notebooks need a few extra packages — see
+Python **3.11 through 3.14** are supported and tested. The lower bounds are the
+oldest versions that pass the test suite on 3.11/3.12; on 3.13 and 3.14 a normal
+install resolves newer versions (the oldest floors predate cp313/cp314 wheels),
+which is what the CI "highest" jobs exercise there. The JAX upper bound is set by
+the flowjax 17.2.1 pairing, not by choice — jax 0.7.x is the newest series that
+runs cleanly with it while still shipping cp314 wheels. The exact ranges
+(including per-Python markers) live in `pyproject.toml` and `pip`/`uv` resolve
+them automatically. The example notebooks need a few extra packages — see
 [`examples/requirements.txt`](examples/requirements.txt).
 
 ## Citation
