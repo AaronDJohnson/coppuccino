@@ -1,0 +1,48 @@
+name: Publish to PyPI
+
+# Publishes the package whenever a GitHub Release is published.
+# Uses PyPI Trusted Publishing (OIDC) — no API tokens are stored in the repo.
+on:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    name: Build distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Check package metadata
+        run: uvx twine check dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    # Scopes the trusted-publisher grant; add required reviewers in the repo's
+    # Settings > Environments > pypi for an extra manual approval gate.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/coppuccino
+    permissions:
+      id-token: write  # required for Trusted Publishing (OIDC)
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
