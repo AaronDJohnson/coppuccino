@@ -1,6 +1,6 @@
 [project]
 name = "coppuccino"
-version = "1.0.0"
+version = "1.1.0"
 description = "Fit distributions with normalizing flows + copulas with JAX"
 authors = [
     {name = "Aaron D. Johnson", email = "aaron9035@gmail.com"}
@@ -52,5 +52,62 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/coppuccino"]
 
+[tool.hatch.build.targets.sdist]
+# Keep the sdist to source, tests, examples, and the docs it needs. Without an
+# explicit list hatchling ships every VCS-tracked file, which pulled in local
+# editor config (.claude/), the 1.8 MB logo, and CI internals.
+include = [
+    "/src",
+    "/tests",
+    "/examples",
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
+    "/pyproject.toml",
+]
+# Ship the example notebooks but not the 363 KB posterior data file they load,
+# and keep local editor config / VCS dotfiles out of the release.
+exclude = ["/examples/data", "/tests/.claude", "/.gitignore", "/.gitattributes"]
+
 [dependency-groups]
-dev = ["pytest>=7.0"]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.6",
+    "mypy>=1.10",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+# Example notebooks are illustrative, not part of the package surface.
+extend-exclude = ["examples"]
+
+[tool.ruff.lint]
+# pyflakes (F) + a curated pycodestyle set. E501 (line length) is intentionally
+# off: the docstrings carry long math/prose lines by design.
+select = ["E4", "E7", "E9", "F", "W"]
+
+[tool.ruff.lint.per-file-ignores]
+# __init__.py enables JAX x64 mode before importing submodules, so those imports
+# are deliberately not at the top of the file.
+"src/coppuccino/__init__.py" = ["E402"]
+
+[tool.mypy]
+files = ["src/coppuccino"]
+# The scientific stack (jax, flowjax, equinox, interpax, paramax) ships partial
+# or no type information, so this is a pragmatic smoke check of our own
+# annotations rather than a strict, whole-graph verification.
+ignore_missing_imports = true
+check_untyped_defs = false
+
+# equinox Modules are constructed field-by-field through a metaclass mypy cannot
+# model, and their ClassVar shape/cond_shape fields override instance vars on the
+# AbstractBijection base. Relax only the error codes those idioms trigger, and
+# only in the modules that touch them — the rest is still fully checked.
+[[tool.mypy.overrides]]
+module = "coppuccino.bijections"
+disable_error_code = ["misc"]
+
+[[tool.mypy.overrides]]
+module = ["coppuccino.copula_flows", "coppuccino.model_io"]
+disable_error_code = ["call-arg", "arg-type"]

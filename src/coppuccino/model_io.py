@@ -42,7 +42,7 @@ def _extract_spline_data(flow: Transformed) -> dict:
     # The flow structure is: Transformed(inner_flow, Stack([EmpiricalMarginalToGaussian, ...]))
     transform = flow.bijection
 
-    spline_data = {
+    spline_data: dict = {
         'samples': [],
         'min_eps': [],
         'num_points': [],

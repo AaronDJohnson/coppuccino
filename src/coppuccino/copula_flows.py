@@ -1,3 +1,6 @@
+import warnings
+from typing import Callable, Optional
+
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -14,10 +17,24 @@ from coppuccino.bijections import make_empirical_cdf_spline
 
 __all__ = ["normalizing_flows_fit", "sample", "log_prob", "sample_and_log_prob"]
 
+# Minimum samples per dimension needed to build a usable empirical CDF.
+_MIN_SAMPLES_PER_DIM = 20
+
+
+def _resolve_seed(rng_seed: Optional[int]) -> int:
+    """Return ``rng_seed`` if given, else a fresh seed drawn from system entropy.
+
+    Sampling helpers default ``rng_seed=None`` so that repeated calls draw
+    independent samples. Pass an explicit integer for reproducible output.
+    """
+    if rng_seed is None:
+        return int(np.random.SeedSequence().generate_state(1)[0])
+    return int(rng_seed)
+
 
 def _create_empirical_transforms(samples: np.ndarray, min_eps: float = 1e-7,
                                   num_points: int = 200, tail_extension: bool = False,
-                                  prior_bounds: np.ndarray = None,
+                                  prior_bounds: Optional[np.ndarray] = None,
                                   tail_model: str = "gaussian",
                                   tail_quantile: float = 0.05,
                                   marginal: str = "rqs"):
@@ -81,7 +98,7 @@ def _create_empirical_transforms(samples: np.ndarray, min_eps: float = 1e-7,
 
     for j in range(x.shape[1]):
         param_samples = x[:, j]
-        if len(param_samples) > 20:  # Need sufficient samples for empirical CDF
+        if len(param_samples) > _MIN_SAMPLES_PER_DIM:
             p_low = float(prior_bounds[j, 0]) if prior_bounds is not None else None
             p_high = float(prior_bounds[j, 1]) if prior_bounds is not None else None
             _, cdf_fn, quantile_fn, pdf_fn = make_empirical_cdf_spline(
@@ -96,7 +113,11 @@ def _create_empirical_transforms(samples: np.ndarray, min_eps: float = 1e-7,
                 tail_model=tail_model, tail_quantile=tail_quantile,
                 marginal=marginal)))
         else:
-            raise ValueError("Insufficient samples for empirical transform")
+            raise ValueError(
+                f"Insufficient samples for empirical transform: parameter "
+                f"(column) {j} has {len(param_samples)} non-NaN samples, but at "
+                f"least {_MIN_SAMPLES_PER_DIM + 1} are required."
+            )
 
     transform = Stack(empirical_transforms)
     inverse_log_det = jax.jit(jax.vmap(transform.inverse_and_log_det))
@@ -104,7 +125,16 @@ def _create_empirical_transforms(samples: np.ndarray, min_eps: float = 1e-7,
     return transform, inverse_log_det
 
 
-def _fit_chain_entry(input_flow, transform, inverse_log_det, chain_entry: np.ndarray, patience=20, learning_rate=1e-4, rng_seed: int = 999, max_epochs: int = 200):
+def _fit_chain_entry(
+    input_flow: Transformed,
+    transform: Stack,
+    inverse_log_det: Callable,
+    chain_entry: np.ndarray,
+    patience: int = 20,
+    learning_rate: float = 1e-4,
+    rng_seed: int = 999,
+    max_epochs: int = 200,
+) -> Transformed:
     """
     Fit a normalizing flow to data with empirical marginal transforms.
 
@@ -172,7 +202,7 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
                           max_epochs: int = 400, flow_layers: int = 6,
                           num_points: int = 200, tail_extension: bool = False,
                           tanh_max_val: float = 3.0,
-                          prior_bounds: np.ndarray = None,
+                          prior_bounds: Optional[np.ndarray] = None,
                           tail_model: str = "gaussian",
                           tail_quantile: float = 0.05,
                           marginal: str = "rqs") -> Transformed:
@@ -274,7 +304,15 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
     key = jr.key(rng_seed)
 
     # Filter NaN rows once so both transform creation and training use clean data
-    clean_chain = chain[~np.isnan(chain).any(axis=1)]
+    nan_rows = np.isnan(chain).any(axis=1)
+    n_dropped = int(nan_rows.sum())
+    if n_dropped:
+        warnings.warn(
+            f"normalizing_flows_fit dropped {n_dropped} of {len(chain)} rows "
+            f"containing NaNs; fitting on the remaining {len(chain) - n_dropped}.",
+            stacklevel=2,
+        )
+    clean_chain = chain[~nan_rows]
 
     # Create initial transforms using the helper function
     transform, inverse_log_det = _create_empirical_transforms(
@@ -298,7 +336,7 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
     return flow
 
 
-def sample(flow: Transformed, n_samples: int, rng_seed: int = 999) -> np.ndarray:
+def sample(flow: Transformed, n_samples: int, rng_seed: Optional[int] = None) -> np.ndarray:
     """
     Generate samples from a fitted copula flow.
 
@@ -312,7 +350,9 @@ def sample(flow: Transformed, n_samples: int, rng_seed: int = 999) -> np.ndarray
     n_samples : int
         Number of samples to generate.
     rng_seed : int, optional
-        Random seed for reproducibility. Default is 999.
+        Random seed. If None (the default), a fresh seed is drawn from system
+        entropy on each call, so repeated calls return *independent* draws.
+        Pass an explicit integer for reproducible output.
 
     Returns
     -------
@@ -338,7 +378,7 @@ def sample(flow: Transformed, n_samples: int, rng_seed: int = 999) -> np.ndarray
     will be much faster (~2-5x speedup).
     """
     sample_shape = (n_samples,)
-    key = jr.key(rng_seed)
+    key = jr.key(_resolve_seed(rng_seed))
     # Use filter_jit for improved performance
     samples = filter_jit(flow.sample)(key, sample_shape)
     return np.array(samples)
@@ -381,7 +421,7 @@ def log_prob(flow: Transformed, samples: np.ndarray) -> np.ndarray:
     return np.array(log_probs)
 
 
-def sample_and_log_prob(flow: Transformed, n_samples: int, rng_seed: int = 999) -> tuple[np.ndarray, np.ndarray]:
+def sample_and_log_prob(flow: Transformed, n_samples: int, rng_seed: Optional[int] = None) -> tuple[np.ndarray, np.ndarray]:
     """
     Generate samples and compute their log probabilities simultaneously.
 
@@ -396,7 +436,9 @@ def sample_and_log_prob(flow: Transformed, n_samples: int, rng_seed: int = 999) 
     n_samples : int
         Number of samples to generate.
     rng_seed : int, optional
-        Random seed for reproducibility. Default is 999.
+        Random seed. If None (the default), a fresh seed is drawn from system
+        entropy on each call, so repeated calls return *independent* draws.
+        Pass an explicit integer for reproducible output.
 
     Returns
     -------
@@ -422,6 +464,6 @@ def sample_and_log_prob(flow: Transformed, n_samples: int, rng_seed: int = 999) 
     >>> weights = np.exp(log_probs)
     """
     sample_shape = (n_samples,)
-    key = jr.key(rng_seed)
+    key = jr.key(_resolve_seed(rng_seed))
     samples, log_probs = filter_jit(flow.sample_and_log_prob)(key, sample_shape)
     return np.array(samples), np.array(log_probs)

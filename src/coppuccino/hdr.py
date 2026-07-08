@@ -61,10 +61,10 @@ def check_in_support(samples: np.ndarray, injection_params: np.ndarray) -> bool:
     maxs = np.max(samples, axis=0)
 
     in_support = np.all((injection_params >= mins) & (injection_params <= maxs))
-    return in_support
+    return bool(in_support)
 
 
-def compute_injection_hdr(samples: np.ndarray, injection_params: np.ndarray, num_samples: int = 100_000, return_flow=False, **nf_kwargs):
+def compute_injection_hdr(samples: np.ndarray, injection_params: np.ndarray, num_samples: int = 100_000, rng_seed: int = 999, return_flow: bool = False, **nf_kwargs):
     """
     Compute Highest Density Region (HDR) credibility for injection parameters.
 
@@ -85,6 +85,11 @@ def compute_injection_hdr(samples: np.ndarray, injection_params: np.ndarray, num
     num_samples : int, optional
         Number of samples to draw from fitted flow for HDR computation.
         Default is 100,000.
+    rng_seed : int, optional
+        Seed used for *both* fitting the flow and drawing the ``num_samples``
+        Monte Carlo samples that estimate the HDR. Default is 999. Vary it to
+        assess the Monte Carlo error of the HDR estimate, or to decouple a
+        calibration study from a single fixed seed.
     return_flow : bool, optional
         If True, return the fitted flow along with HDR values. Default is False.
     **nf_kwargs : dict, optional
@@ -168,9 +173,9 @@ def compute_injection_hdr(samples: np.ndarray, injection_params: np.ndarray, num
     if injection_params.ndim == 1:
         injection_params = injection_params[np.newaxis, :]
 
-    flow = normalizing_flows_fit(samples, **nf_kwargs)
+    flow = normalizing_flows_fit(samples, rng_seed=rng_seed, **nf_kwargs)
     # sample from flow and compute log probability of those samples
-    _, gen_log_probs = sample_and_log_prob(flow, n_samples=num_samples)
+    _, gen_log_probs = sample_and_log_prob(flow, n_samples=num_samples, rng_seed=rng_seed)
     hdrs = []
 
     sorted_gen_log_probs = np.sort(gen_log_probs)

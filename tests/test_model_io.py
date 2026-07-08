@@ -450,6 +450,38 @@ class TestSaveLoadWithNonDefaultParams:
         finally:
             os.unlink(path)
 
+    def test_round_trip_with_gpd_tail(self):
+        """The GPD tail model survives fit -> save -> load and the reloaded flow
+        reproduces the original samples. Regression guard: tail_model /
+        tail_quantile must be preserved on reload, otherwise a gpd model would
+        silently reconstruct as a gaussian-tail one."""
+        from paramax import unwrap
+        rng = np.random.default_rng(0)
+        chain = rng.standard_t(df=3, size=(2000, 2))
+        flow = normalizing_flows_fit(
+            chain, max_epochs=5, patience=2, tail_model="gpd", tail_quantile=0.05
+        )
+
+        spline_data = _extract_spline_data(flow)
+        assert spline_data['tail_model'] == ["gpd", "gpd"]
+        assert spline_data['tail_quantile'] == pytest.approx([0.05, 0.05])
+
+        original_samples = sample(flow, n_samples=100, rng_seed=999)
+
+        with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as f:
+            path = f.name
+        try:
+            save_flow(flow, path)
+            loaded_flow = load_flow(path)
+            loaded_tail_models = [
+                str(unwrap(b.tail_model)) for b in loaded_flow.bijection.bijections
+            ]
+            assert loaded_tail_models == ["gpd", "gpd"]
+            loaded_samples = sample(loaded_flow, n_samples=100, rng_seed=999)
+            np.testing.assert_array_almost_equal(original_samples, loaded_samples)
+        finally:
+            os.unlink(path)
+
     def test_old_saved_file_without_marginal_defaults_to_pchip(self):
         """A saved file predating the 'marginal' field reconstructs as PCHIP
         (what such models were always built with), not the new RQS default."""

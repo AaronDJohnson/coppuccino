@@ -174,16 +174,28 @@ class TestTailExtension:
         assert cdf_below_min > 0
 
     def test_no_tail_clips_to_bounds(self):
-        """Test that without tail extension, CDF clips at data bounds."""
+        """Without tail extension the CDF clips *continuously* to the boundary
+        CDF value (no spurious jump to min_eps at the data edges, which used to
+        map each dimension's extreme sample to a z ~= -5.2 outlier)."""
         np.random.seed(42)
         samples = np.random.randn(1000)
 
         _, cdf_fn, _, _ = make_empirical_cdf_spline(samples, tail_extension=False)
 
-        data_min = np.min(samples)
-        # Values well below data range should give min_eps
+        data_min, data_max = np.min(samples), np.max(samples)
+
+        # Below the data range the CDF is flat and equals its value AT data_min.
+        cdf_at_min = float(cdf_fn(jnp.array(data_min)))
         cdf_far_below = float(cdf_fn(jnp.array(data_min - 10.0)))
-        assert cdf_far_below == pytest.approx(1e-7, abs=1e-8)
+        assert cdf_far_below == pytest.approx(cdf_at_min, abs=1e-9)
+        # It is the empirical ~1/N boundary value: small, but well above min_eps.
+        assert 1e-7 < cdf_far_below < 0.05
+
+        # Symmetric behavior at the upper edge.
+        cdf_at_max = float(cdf_fn(jnp.array(data_max)))
+        cdf_far_above = float(cdf_fn(jnp.array(data_max + 10.0)))
+        assert cdf_far_above == pytest.approx(cdf_at_max, abs=1e-9)
+        assert 0.95 < cdf_far_above < 1.0
 
 
 class TestPriorBounds:
@@ -373,6 +385,36 @@ class TestEmpiricalMarginalToGaussian:
         assert jnp.isfinite(z)
         assert jnp.isfinite(log_det)
 
+    def test_log_det_matches_finite_difference(self):
+        """The Jacobian log-det must equal the numerical derivative of the
+        transform. Guards against a sign error or constant offset in the
+        log-det (which directly corrupts log_prob) that the isfinite checks
+        cannot catch."""
+        rng = np.random.default_rng(0)
+        samples = rng.standard_normal(3000)
+        _, cdf_fn, quantile_fn, pdf_fn = make_empirical_cdf_spline(
+            samples, marginal="rqs")
+        bij = EmpiricalMarginalToGaussian(
+            samples=samples, cdf_fn=cdf_fn, quantile_fn=quantile_fn,
+            pdf_fn=pdf_fn, marginal="rqs")
+
+        h = 1e-5
+        # inverse_and_log_det: x -> z, returned log_det == log|dz/dx|.
+        for xv in [-1.2, -0.4, 0.0, 0.5, 1.1]:
+            z_hi, _ = bij.inverse_and_log_det(jnp.array(xv + h))
+            z_lo, _ = bij.inverse_and_log_det(jnp.array(xv - h))
+            fd = float((z_hi - z_lo) / (2 * h))
+            _, log_det = bij.inverse_and_log_det(jnp.array(xv))
+            assert float(log_det) == pytest.approx(float(np.log(abs(fd))), abs=2e-3)
+
+        # transform_and_log_det: z -> x, returned log_det == log|dx/dz|.
+        for zv in [-1.0, -0.3, 0.0, 0.4, 1.0]:
+            x_hi, _ = bij.transform_and_log_det(jnp.array(zv + h))
+            x_lo, _ = bij.transform_and_log_det(jnp.array(zv - h))
+            fd = float((x_hi - x_lo) / (2 * h))
+            _, log_det = bij.transform_and_log_det(jnp.array(zv))
+            assert float(log_det) == pytest.approx(float(np.log(abs(fd))), abs=2e-3)
+
 
 class TestGPDTailModel:
     """Test the tail_model='gpd' peaks-over-threshold path."""
@@ -470,12 +512,18 @@ class TestRQSMarginal:
         assert bool(jnp.all(jax.vmap(pdf_fn)(xs) > 0))
 
     def test_rqs_cdf_bounds(self):
-        """CDF stays within (min_eps, 1 - min_eps) and clips outside data range."""
+        """CDF stays within (min_eps, 1 - min_eps) and clips *continuously* to the
+        boundary CDF value outside the data range."""
         rng = np.random.default_rng(2)
         samples = rng.standard_normal(2000)
         _, cdf_fn, _, _ = make_empirical_cdf_spline(samples, marginal="rqs")
-        assert float(cdf_fn(jnp.array(np.min(samples) - 10.0))) == pytest.approx(1e-7, abs=1e-8)
-        assert float(cdf_fn(jnp.array(np.max(samples) + 10.0))) == pytest.approx(1.0 - 1e-7, abs=1e-8)
+        lo = float(cdf_fn(jnp.array(np.min(samples) - 10.0)))
+        hi = float(cdf_fn(jnp.array(np.max(samples) + 10.0)))
+        # Continuous with the boundary value, and strictly inside (min_eps, 1-min_eps).
+        assert lo == pytest.approx(float(cdf_fn(jnp.array(np.min(samples)))), abs=1e-9)
+        assert hi == pytest.approx(float(cdf_fn(jnp.array(np.max(samples)))), abs=1e-9)
+        assert 1e-7 <= lo < 0.05
+        assert 0.95 < hi <= 1.0 - 1e-7
 
     @pytest.mark.parametrize("kwargs", [
         {"tail_extension": True},

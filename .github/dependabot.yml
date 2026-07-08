@@ -1,0 +1,12 @@
+version: 2
+updates:
+  # Keep GitHub Actions (including the release-privileged publish job) current.
+  # Pair this with SHA-pinning the actions for supply-chain safety.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions:
+        patterns:
+          - "*"

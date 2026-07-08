@@ -1,12 +1,15 @@
-from typing import ClassVar, Callable, Optional
+from typing import Callable, ClassVar, Optional
 import jax.numpy as jnp
 import numpy as np
 from flowjax.bijections import AbstractBijection
 from interpax._ppoly import PchipInterpolator
 from jax.scipy.special import ndtri, ndtr
-import jax
 
 __all__ = ["make_empirical_cdf_spline", "EmpiricalMarginalToGaussian"]
+
+# Numerical floors, named so the intent is explicit at each use site.
+_POS_FLOOR = 1e-30    # keep quantities that sit in denominators strictly positive
+_SCALE_FLOOR = 1e-10  # keep fitted scale (sigma) parameters away from zero
 
 
 def _process_array(arr):
@@ -91,7 +94,7 @@ def _fit_gpd(excesses):
     if len(excesses) < 5:
         # Too few excesses for any sensible fit — exponential fallback.
         sigma = float(np.mean(excesses)) if len(excesses) else 1.0
-        return 0.0, max(sigma, 1e-10)
+        return 0.0, max(sigma, _SCALE_FLOOR)
     try:
         xi, _, sigma = genpareto.fit(excesses, floc=0)
     except Exception:
@@ -99,10 +102,10 @@ def _fit_gpd(excesses):
         m = float(np.mean(excesses))
         v = float(np.var(excesses, ddof=1))
         if v <= 0:
-            return 0.0, max(m, 1e-10)
+            return 0.0, max(m, _SCALE_FLOOR)
         xi = 0.5 * (1.0 - m * m / v)
         sigma = 0.5 * m * (1.0 + m * m / v)
-    return float(xi), float(max(sigma, 1e-10))
+    return float(xi), float(max(sigma, _SCALE_FLOOR))
 
 
 def _gpd_cdf(y, xi, sigma, xi_eps=1e-6):
@@ -110,26 +113,34 @@ def _gpd_cdf(y, xi, sigma, xi_eps=1e-6):
     y = jnp.maximum(y, 0.0)
     z = y / sigma
     # For ξ<0 the support is bounded at y = -σ/ξ; clip to keep argument > 0.
-    safe_arg = jnp.maximum(1.0 + xi * z, 1e-30)
+    base = 1.0 + xi * z
+    safe_arg = jnp.maximum(base, _POS_FLOOR)
     xi_safe = jnp.where(jnp.abs(xi) < xi_eps, 1.0, xi)  # avoid /0 in unused branch
-    return jnp.where(
+    cdf = jnp.where(
         jnp.abs(xi) < xi_eps,
         1.0 - jnp.exp(-z),
         1.0 - jnp.power(safe_arg, -1.0 / xi_safe),
     )
+    # Past the bounded support edge (ξ<0, base≤0) all mass lies below: CDF = 1.
+    return jnp.where(base <= 0.0, 1.0, cdf)
 
 
 def _gpd_pdf(y, xi, sigma, xi_eps=1e-6):
-    """GPD PDF on excesses y ≥ 0."""
+    """GPD PDF on excesses y ≥ 0. Zero beyond the bounded support when ξ<0."""
     y = jnp.maximum(y, 0.0)
     z = y / sigma
-    safe_arg = jnp.maximum(1.0 + xi * z, 1e-30)
+    base = 1.0 + xi * z
+    safe_arg = jnp.maximum(base, _POS_FLOOR)
     xi_safe = jnp.where(jnp.abs(xi) < xi_eps, 1.0, xi)
-    return jnp.where(
+    pdf = jnp.where(
         jnp.abs(xi) < xi_eps,
         jnp.exp(-z) / sigma,
         jnp.power(safe_arg, -1.0 / xi_safe - 1.0) / sigma,
     )
+    # For ξ<-1 the exponent -1/ξ-1 is negative, so the clipped safe_arg would
+    # blow up to ~1e10 past the support edge (y > -σ/ξ, base≤0). The density is
+    # actually zero there — enforce it explicitly.
+    return jnp.where(base <= 0.0, 0.0, pdf)
 
 
 def _gpd_quantile(p, xi, sigma, xi_eps=1e-6):
@@ -180,7 +191,7 @@ def _rqs_bulk(xg, cdf_vals):
     xk, yk = xg[keep], yg[keep]
     # PCHIP slopes at the knots — monotone by construction, strictly positive
     # floor so they can sit in RQS denominators without dividing by zero.
-    dk = np.maximum(_ScipyPchip(xk, yk).derivative()(xk), 1e-30)
+    dk = np.maximum(_ScipyPchip(xk, yk).derivative()(xk), _POS_FLOOR)
 
     xk_j, yk_j, dk_j = jnp.asarray(xk), jnp.asarray(yk), jnp.asarray(dk)
     w = xk_j[1:] - xk_j[:-1]
@@ -228,10 +239,17 @@ def _rqs_bulk(xg, cdf_vals):
     return cdf, inverse, deriv
 
 
-def make_empirical_cdf_spline(samples, num_points=200, min_eps=1e-7, tail_extension=False,
-                              prior_low=None, prior_high=None,
-                              tail_model="gaussian", tail_quantile=0.05,
-                              marginal="pchip"):
+def make_empirical_cdf_spline(
+    samples: np.ndarray,
+    num_points: int = 200,
+    min_eps: float = 1e-7,
+    tail_extension: bool = False,
+    prior_low: Optional[float] = None,
+    prior_high: Optional[float] = None,
+    tail_model: str = "gaussian",
+    tail_quantile: float = 0.05,
+    marginal: str = "pchip",
+) -> tuple[np.ndarray, Callable, Callable, Callable]:
     """
     Create empirical CDF, inverse CDF (quantile), and PDF functions from samples.
 
@@ -318,16 +336,22 @@ def make_empirical_cdf_spline(samples, num_points=200, min_eps=1e-7, tail_extens
     >>> from coppuccino.bijections import make_empirical_cdf_spline
     >>> samples = np.random.normal(0, 1, 1000)
     >>> cdf_vals, cdf_fn, quantile_fn, pdf_fn = make_empirical_cdf_spline(samples)
-    >>> # Evaluate CDF at a point
     >>> import jax.numpy as jnp
-    >>> cdf_fn(jnp.array(0.0))  # Should be approximately 0.5 for standard normal
-    >>> # Get median via quantile function
-    >>> quantile_fn(jnp.array(0.5))  # Should be approximately 0.0
+    >>> median = float(cdf_fn(jnp.array(0.0)))   # ~0.5 for standard normal
+    >>> centre = float(quantile_fn(jnp.array(0.5)))  # ~0.0
     >>> # With prior bounds (recommended for MCMC chains)
     >>> cdf_vals, cdf_fn, quantile_fn, pdf_fn = make_empirical_cdf_spline(
     ...     samples, prior_low=-5.0, prior_high=5.0)
     """
     use_gpd = (tail_model == "gpd")
+
+    # Tail-model parameters below are each bound only inside their guarding
+    # branch (GPD or Gaussian tail_extension). Pre-declare them so the
+    # cdf/quantile/pdf closures — which reference them under the same guards —
+    # can never raise NameError if a future edit shifts a branch boundary.
+    F_lo = F_hi = u_lo = u_hi = None
+    xi_lo = sigma_lo = xi_hi = sigma_hi = None
+    mu = sigma = lo_scale = hi_scale = None
 
     # ------------------------------------------------------------------
     # GPD branch: peaks-over-threshold model with thresholds *inside* the
@@ -427,7 +451,7 @@ def make_empirical_cdf_spline(samples, num_points=200, min_eps=1e-7, tail_extens
     if tail_extension:
         mu = float(np.mean(samples))
         sigma = float(np.std(samples, ddof=1))
-        sigma = max(sigma, 1e-10)  # guard against zero std
+        sigma = max(sigma, _SCALE_FLOOR)  # guard against zero std
 
         # CDF values of the Gaussian at the data boundaries
         from scipy.stats import norm as _norm
@@ -444,8 +468,8 @@ def make_empirical_cdf_spline(samples, num_points=200, min_eps=1e-7, tail_extens
         #   tail_cdf(data_max) = emp_cdf_hi
         # Using:  tail_cdf(x) = emp_cdf_lo * Phi_gauss(x) / Phi_gauss(data_min)   [left]
         #         tail_cdf(x) = 1 - (1 - emp_cdf_hi) * Phi_gauss_sf(x) / Phi_gauss_sf(data_max)  [right]
-        lo_scale = emp_cdf_lo / max(gauss_cdf_lo, 1e-30)
-        hi_scale = (1.0 - emp_cdf_hi) / max(1.0 - gauss_cdf_hi, 1e-30)
+        lo_scale = emp_cdf_lo / max(gauss_cdf_lo, _POS_FLOOR)
+        hi_scale = (1.0 - emp_cdf_hi) / max(1.0 - gauss_cdf_hi, _POS_FLOOR)
     # ------------------------------------------------------------------
 
     def cdf_fn(u):
@@ -470,10 +494,17 @@ def make_empirical_cdf_spline(samples, num_points=200, min_eps=1e-7, tail_extens
                 jnp.where(u >= data_max, right_tail, spline_val),
             )
         else:
+            # No tail model: clip flat to the *boundary* CDF value (cdf_min /
+            # cdf_max), not to min_eps. Using min_eps here created a jump of
+            # ~1/N at data_min/data_max — mapping each dimension's extreme
+            # sample to a spurious z≈±5.2 outlier. cdf_min == bulk_cdf(data_min)
+            # (and cdf_max == bulk_cdf(data_max)), so this join is continuous.
+            # (With prior_bounds, cdf_min/cdf_max already equal min_eps/1-min_eps,
+            # so that recommended path is unchanged.)
             y = jnp.where(
                 u <= data_min,
-                min_eps,
-                jnp.where(u >= data_max, 1.0 - min_eps, spline_val),
+                cdf_min,
+                jnp.where(u >= data_max, cdf_max, spline_val),
             )
         # Final bounds check to ensure we never return exactly 0 or 1
         return jnp.clip(y, min_eps, 1.0 - min_eps)
@@ -528,8 +559,15 @@ def make_empirical_cdf_spline(samples, num_points=200, min_eps=1e-7, tail_extens
             interpolant (PCHIP or RQS), no jax.grad.
           * left/right tail with ``tail_extension``: derivative of the
             Gaussian-tail CDF, i.e. ``scale * φ((x-μ)/σ) / σ``.
-          * no tail extension: PDF is zero outside data range; floored
-            to ``min_eps`` so log(pdf) stays finite.
+          * no tail extension: PDF is zero outside the data range.
+
+        Every branch is floored to ``min_eps`` on return. This is a deliberate
+        numerical guard so ``log(pdf)`` (used by the Jacobian log-det and by
+        ``log_prob``) stays finite everywhere. The consequence, by design: with
+        no tail model the density does not integrate to exactly 1 and a query
+        point outside the observed data range reports a small floor density
+        (``min_eps``) rather than a true 0. Supply ``prior_bounds`` or
+        ``tail_extension``/``tail_model`` to model beyond the data range.
 
         Works on scalar or vector input (jax.grad previously forced
         scalar-only).
@@ -665,7 +703,8 @@ class EmpiricalMarginalToGaussian(AbstractBijection):
         Examples
         --------
         >>> import jax.numpy as jnp
-        >>> z, log_det = bij.inverse_and_log_det(jnp.array([1.0, 2.0, 3.0]))
+        >>> # bij is an EmpiricalMarginalToGaussian (see the class docstring)
+        >>> z, log_det = bij.inverse_and_log_det(jnp.array([1.0, 2.0, 3.0]))  # doctest: +SKIP
         """
         # Get CDF value using smooth interpolation
         u = self.cdf_fn(x)
@@ -705,8 +744,9 @@ class EmpiricalMarginalToGaussian(AbstractBijection):
         Examples
         --------
         >>> import jax.numpy as jnp
+        >>> # bij is an EmpiricalMarginalToGaussian (see the class docstring)
         >>> z = jnp.array([0.0, 1.0, -1.0])
-        >>> x, log_det = bij.transform_and_log_det(z)
+        >>> x, log_det = bij.transform_and_log_det(z)  # doctest: +SKIP
         """
         # Transform to uniform using JAX normal CDF
         u = ndtr(z)  # JAX equivalent of norm.cdf

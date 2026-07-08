@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="image.png" alt="coppuccino" width="320">
+  <img src="https://raw.githubusercontent.com/AaronDJohnson/coppuccino/main/image.png" alt="coppuccino" width="320">
 </p>
 
 <h1 align="center">coppuccino</h1>
@@ -272,7 +272,7 @@ If you use coppuccino in your research, please cite it:
   author  = {Johnson, Aaron D.},
   title   = {coppuccino: copula normalizing flows in JAX},
   year    = {2026},
-  version = {1.0.0},
+  version = {1.1.0},
   url     = {https://github.com/AaronDJohnson/coppuccino}
 }
 ```

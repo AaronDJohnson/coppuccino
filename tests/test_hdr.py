@@ -11,25 +11,25 @@ class TestCheckInSupport:
         """Test that parameters inside support return True."""
         samples = np.array([[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]])
         injection = np.array([1.0, 1.0])
-        assert check_in_support(samples, injection) == True
+        assert check_in_support(samples, injection) is True
 
     def test_outside_support(self):
         """Test that parameters outside support return False."""
         samples = np.array([[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]])
         injection = np.array([5.0, 5.0])
-        assert check_in_support(samples, injection) == False
+        assert check_in_support(samples, injection) is False
 
     def test_at_boundary(self):
         """Test that parameters at boundary return True."""
         samples = np.array([[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]])
         injection = np.array([0.0, 2.0])
-        assert check_in_support(samples, injection) == True
+        assert check_in_support(samples, injection) is True
 
     def test_partially_outside(self):
         """Test that parameters partially outside return False."""
         samples = np.array([[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]])
         injection = np.array([1.0, 5.0])  # 2nd param outside
-        assert check_in_support(samples, injection) == False
+        assert check_in_support(samples, injection) is False
 
     def test_wrong_ndim_raises(self):
         """Test that non-1D injection raises ValueError."""
@@ -165,38 +165,32 @@ class TestComputeInjectionHDR:
         assert hdr.shape == (1,)
         assert 0.0 <= hdr[0] <= 1.0
 
-    def test_injection_at_mean_vs_tail(self):
-        """Test that injection at mean has higher HDR than at tail."""
+    def test_injection_at_mode_has_lower_hdr_than_tail(self):
+        """HDR credibility is the fraction of the fit *more probable* than the
+        point, so a point at the mode scores near 0 and a point out in the tail
+        scores higher. Assert that ordering — the module's core semantic
+        property, which the old ``>= 0.0`` assertions did not test at all."""
         np.random.seed(42)
-        # Create samples centered around [0, 0]
-        samples = np.random.randn(200, 2)
+        # Fit to a 2D standard normal; the mode is [0, 0].
+        samples = np.random.randn(3000, 2)
 
-        # Injection at mean
-        injection_mean = np.array([0.0, 0.0])
+        # A point at the mode and a point well out in the (still in-support) tail.
+        injection_mode = np.array([0.0, 0.0])
+        injection_tail = np.array([2.0, 2.0])
 
-        # Injection at tail (far from mean)
-        injection_tail = np.array([5.0, 5.0])
-
-        hdr_mean = compute_injection_hdr(
-            samples,
-            injection_mean,
-            num_samples=5000,
-            max_epochs=5,
-            patience=2
+        hdr_mode = compute_injection_hdr(
+            samples, injection_mode, num_samples=10000,
+            rng_seed=0, max_epochs=50, patience=15,
         )
-
         hdr_tail = compute_injection_hdr(
-            samples,
-            injection_tail,
-            num_samples=5000,
-            max_epochs=5,
-            patience=2
+            samples, injection_tail, num_samples=10000,
+            rng_seed=0, max_epochs=50, patience=15,
         )
 
-        # HDR at mean should be higher than at tail (typically)
-        # This is a probabilistic test, so we use a relaxed assertion
-        assert hdr_mean[0] >= 0.0
-        assert hdr_tail[0] >= 0.0
+        # Neither is the out-of-support 1.0 sentinel.
+        assert hdr_mode[0] < hdr_tail[0]
+        assert hdr_mode[0] < 0.5   # mode is among the most probable points
+        assert hdr_tail[0] > 0.5   # tail point is among the least probable
 
     def test_1d_parameter_space(self):
         """Test with 1D parameter space."""

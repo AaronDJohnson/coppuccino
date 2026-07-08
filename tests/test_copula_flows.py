@@ -3,7 +3,6 @@ import numpy as np
 import jax.numpy as jnp
 from flowjax.distributions import Transformed
 from paramax import unwrap
-from coppuccino.bijections import EmpiricalMarginalToGaussian
 from coppuccino.copula_flows import (
     _create_empirical_transforms,
     normalizing_flows_fit,
@@ -324,19 +323,23 @@ class TestSampleAndLogProb:
         assert np.all(np.isfinite(log_probs))
 
     def test_consistency_with_separate_calls(self):
-        """Test that sample_and_log_prob is consistent with separate calls."""
+        """sample_and_log_prob and sample must return the *same draws* for a
+        fixed seed.
+
+        Note: the log-probs returned by sample_and_log_prob (the generation
+        path) are the honest densities to use for importance weights; they are
+        not asserted equal to log_prob(flow, samples) here because, with the
+        default clipped empirical marginals, a sample drawn beyond ~ndtri(1/N)
+        sigma is clipped and cannot be re-inverted exactly (supply prior_bounds
+        to push that threshold out to ~5 sigma).
+        """
         np.random.seed(42)
         chain = np.random.randn(200, 2)
         flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
 
-        # Use sample_and_log_prob
-        samples_combined, log_probs_combined = sample_and_log_prob(flow, n_samples=100, rng_seed=42)
-
-        # Use separate calls
+        samples_combined, _ = sample_and_log_prob(flow, n_samples=100, rng_seed=42)
         samples_separate = sample(flow, n_samples=100, rng_seed=42)
-        log_probs_separate = log_prob(flow, samples_separate)
 
-        # Samples should be identical (up to floating-point precision)
         np.testing.assert_array_almost_equal(samples_combined, samples_separate)
 
     def test_reproducibility(self):
@@ -361,3 +364,42 @@ class TestSampleAndLogProb:
             samples, log_probs = sample_and_log_prob(flow, n_samples=n, rng_seed=999)
             assert samples.shape == (n, 2)
             assert log_probs.shape == (n,)
+
+
+class TestLogProbAccuracy:
+    """Validate the public log_prob against a known analytic density."""
+
+    def test_log_prob_tracks_correlated_gaussian(self):
+        """Fit a flow to a correlated 2D Gaussian and check that log_prob tracks
+        the analytic log-density up to an additive normalization constant.
+
+        This is the one end-to-end accuracy check: it catches sign errors,
+        varying offsets and gross miscalibration that shape/isfinite smoke tests
+        cannot.
+        """
+        from scipy.stats import multivariate_normal
+        rng = np.random.default_rng(0)
+        mean = np.array([0.0, 0.0])
+        cov = np.array([[1.0, 0.6], [0.6, 1.0]])
+        data = rng.multivariate_normal(mean, cov, size=8000)
+
+        flow = normalizing_flows_fit(
+            data, rng_seed=0, max_epochs=120, patience=25, flow_layers=6
+        )
+
+        # Evaluate on in-support test points drawn from the same distribution.
+        test = rng.multivariate_normal(mean, cov, size=400)
+        lo, hi = data.min(axis=0), data.max(axis=0)
+        test = test[np.all((test >= lo) & (test <= hi), axis=1)]
+
+        flow_lp = log_prob(flow, test)
+        true_lp = multivariate_normal(mean, cov).logpdf(test)
+
+        assert np.all(np.isfinite(flow_lp))
+        # Shape tracks the truth (a sign error would destroy this correlation).
+        corr = float(np.corrcoef(flow_lp, true_lp)[0, 1])
+        assert corr > 0.9
+        # After removing the (near-constant) normalization offset, the residual
+        # spread is small — the density is right, not merely monotone-related.
+        resid = np.asarray(flow_lp) - true_lp
+        assert float(np.std(resid)) < 0.5
