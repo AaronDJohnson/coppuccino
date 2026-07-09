@@ -17,7 +17,11 @@ from flowjax.bijections import Stack
 from flowjax.distributions import Transformed
 from paramax import non_trainable, unwrap
 
-from coppuccino.bijections import EmpiricalMarginalToGaussian, make_empirical_cdf_spline
+from coppuccino.bijections import (
+    EmpiricalMarginalToGaussian,
+    EmpiricalMarginalToUniform,
+    make_empirical_cdf_spline,
+)
 
 __all__ = ["save_flow", "load_flow"]
 
@@ -52,13 +56,18 @@ def _extract_spline_data(flow: Transformed) -> dict:
         'tail_model': [],
         'tail_quantile': [],
         'marginal': [],
+        'space': [],
         'num_dims': 0
     }
 
     if isinstance(transform, Stack):
         spline_data['num_dims'] = len(transform.bijections)
         for bij in transform.bijections:
-            if isinstance(bij, EmpiricalMarginalToGaussian):
+            if isinstance(bij, (EmpiricalMarginalToGaussian, EmpiricalMarginalToUniform)):
+                spline_data['space'].append(
+                    'uniform' if isinstance(bij, EmpiricalMarginalToUniform)
+                    else 'gaussian'
+                )
                 # Unwrap the NonTrainable wrapper to get the actual numpy array
                 samples = unwrap(bij.samples)
                 spline_data['samples'].append(np.array(samples))
@@ -121,15 +130,20 @@ def _reconstruct_empirical_transforms(spline_data: dict) -> Stack:
         # Default 'pchip' so models saved before the marginal choice existed
         # reconstruct exactly as they were trained.
         marginal = spline_data.get('marginal', ['pchip'] * spline_data['num_dims'])[i]
+        # Default 'gaussian' so models saved before the uniform-copula mode
+        # existed reconstruct exactly as they were trained.
+        space = spline_data.get('space', ['gaussian'] * spline_data['num_dims'])[i]
 
         _, cdf_fn, quantile_fn, pdf_fn = make_empirical_cdf_spline(
             samples, num_points=num_points, min_eps=min_eps,
             tail_extension=tail_extension, prior_low=prior_low, prior_high=prior_high,
             tail_model=tail_model, tail_quantile=tail_quantile,
-            marginal=marginal,
+            marginal=marginal, unit_range=(space == 'uniform'),
         )
 
-        transform = non_trainable(EmpiricalMarginalToGaussian(
+        marginal_cls = (EmpiricalMarginalToUniform if space == 'uniform'
+                        else EmpiricalMarginalToGaussian)
+        transform = non_trainable(marginal_cls(
             samples, cdf_fn, quantile_fn, pdf_fn, min_eps=min_eps,
             num_points=num_points, tail_extension=tail_extension,
             prior_low=prior_low, prior_high=prior_high,
@@ -185,8 +199,17 @@ def save_flow(flow: Transformed, path: Union[str, Path]) -> None:
     save_dict = {
         'spline_data': spline_data,
         'inner_flow_bytes': inner_flow_bytes,
-        'inner_flow_like': inner_flow,  # Keep structure for deserialization
     }
+
+    arch = getattr(flow, 'arch', None)
+    if arch is not None:
+        # Uniform-copula mode: store the architecture spec and rebuild the
+        # skeleton at load time. The coupling layers hold dynamically generated
+        # constructor closures that do not survive a structure pickle, so the
+        # 'inner_flow_like' path is not usable here.
+        save_dict['inner_arch'] = arch
+    else:
+        save_dict['inner_flow_like'] = inner_flow  # Keep structure for deserialization
 
     # cloudpickle (a hard dependency) serializes the JAX/equinox objects.
     with open(path, 'wb') as f:
@@ -228,7 +251,14 @@ def load_flow(path: Union[str, Path]) -> Transformed:
 
     # Deserialize the inner flow
     inner_flow_bytes = save_dict['inner_flow_bytes']
-    inner_flow_like = save_dict['inner_flow_like']
+    arch = save_dict.get('inner_arch')
+    if arch is not None:
+        # Uniform-copula mode: rebuild an identical (untrained) skeleton from
+        # the architecture spec, then fill in the trained arrays.
+        from coppuccino.copula_flows import CopulaFlow, _build_uniform_inner
+        inner_flow_like = _build_uniform_inner(arch)
+    else:
+        inner_flow_like = save_dict['inner_flow_like']
 
     inner_flow_buffer = io.BytesIO(inner_flow_bytes)
     inner_flow = eqx.tree_deserialise_leaves(inner_flow_buffer, inner_flow_like)
@@ -237,6 +267,9 @@ def load_flow(path: Union[str, Path]) -> Transformed:
     transform = _reconstruct_empirical_transforms(spline_data)
 
     # Reconstruct the full flow
-    loaded_flow = Transformed(inner_flow, transform)
+    if arch is not None:
+        loaded_flow = CopulaFlow(inner_flow, transform, arch=arch)
+    else:
+        loaded_flow = Transformed(inner_flow, transform)
 
     return loaded_flow

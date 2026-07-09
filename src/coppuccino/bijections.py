@@ -5,7 +5,11 @@ from flowjax.bijections import AbstractBijection
 from interpax._ppoly import PchipInterpolator
 from jax.scipy.special import ndtri, ndtr
 
-__all__ = ["make_empirical_cdf_spline", "EmpiricalMarginalToGaussian"]
+__all__ = [
+    "make_empirical_cdf_spline",
+    "EmpiricalMarginalToGaussian",
+    "EmpiricalMarginalToUniform",
+]
 
 # Numerical floors, named so the intent is explicit at each use site.
 _POS_FLOOR = 1e-30    # keep quantities that sit in denominators strictly positive
@@ -249,6 +253,7 @@ def make_empirical_cdf_spline(
     tail_model: str = "gaussian",
     tail_quantile: float = 0.05,
     marginal: str = "pchip",
+    unit_range: bool = False,
 ) -> tuple[np.ndarray, Callable, Callable, Callable]:
     """
     Create empirical CDF, inverse CDF (quantile), and PDF functions from samples.
@@ -318,6 +323,17 @@ def make_empirical_cdf_spline(
         ``normalizing_flows_fit`` entry point defaults to ``"rqs"``; this
         low-level function keeps ``"pchip"`` as its default for backward
         compatibility.
+    unit_range : bool, optional
+        If True, build the marginal as an *exact bijection onto* ``[0, 1]``:
+        the grid endpoints (the prior bounds when given, else the data bounds)
+        map to CDF values of exactly 0 and 1, with a strictly positive density
+        all the way to the boundary (no ``min_eps`` clipping and no zeroed wall
+        density). This is required by the uniform-copula mode
+        (``copula_space="uniform"``), where no inverse-normal transform follows
+        and so CDF values of exactly 0/1 are valid. It models *bounded*
+        support: requires ``marginal="rqs"`` (self-consistent inverse) and is
+        incompatible with ``tail_extension`` and ``tail_model="gpd"``.
+        Default is False (original behavior, for the Gaussianized pipeline).
 
     Returns
     -------
@@ -344,6 +360,22 @@ def make_empirical_cdf_spline(
     ...     samples, prior_low=-5.0, prior_high=5.0)
     """
     use_gpd = (tail_model == "gpd")
+
+    if unit_range:
+        # Bounded-support mode: the marginal is an exact [x_lo, x_hi] <-> [0, 1]
+        # bijection. Tail models (which extend beyond the bounds) do not apply,
+        # and the PCHIP pair's approximate inverse would break the sample/density
+        # self-consistency this mode exists to guarantee.
+        if marginal != "rqs":
+            raise ValueError(
+                "unit_range=True requires marginal='rqs' (single self-consistent "
+                f"spline); got marginal={marginal!r}."
+            )
+        if tail_extension or use_gpd:
+            raise ValueError(
+                "unit_range=True models bounded support and is incompatible with "
+                "tail_extension=True or tail_model='gpd'."
+            )
 
     # Tail-model parameters below are each bound only inside their guarding
     # branch (GPD or Gaussian tail_extension). Pre-declare them so the
@@ -396,7 +428,17 @@ def make_empirical_cdf_spline(
         # Empirical CDF
         sorted_chain = _process_array(samples)
         counts = np.searchsorted(sorted_chain, xg, side='right')
-        cdf_vals = counts / len(sorted_chain)
+        if unit_range:
+            # Plotting-position (Hazen) convention: symmetric treatment of the
+            # two ends. Plain counts/n hits exactly 1.0 at the top data point,
+            # which the min_eps clip then crushes onto the boundary knot --
+            # leaving the final segment with ~1e-7 of mass and a near-zero
+            # density (a wall cliff). (counts - 1/2)/n keeps every data knot
+            # strictly inside (0, 1) with ~1/(2n) of mass beyond the extreme
+            # data point on each side.
+            cdf_vals = (counts - 0.5) / len(sorted_chain)
+        else:
+            cdf_vals = counts / len(sorted_chain)
 
         # Data bounds (may be extended by prior bounds)
         data_min, data_max = np.min(samples), np.max(samples)
@@ -423,6 +465,15 @@ def make_empirical_cdf_spline(
     for i in range(1, len(cdf_vals)):
         if cdf_vals[i] <= cdf_vals[i - 1]:
             cdf_vals[i] = cdf_vals[i - 1] + eps_bump
+    if unit_range:
+        # Exact bijection onto [0, 1]: the grid endpoints (prior bounds if given,
+        # else data bounds) carry CDF values of exactly 0 and 1. The interior
+        # knots remain in [min_eps, 1 - min_eps] from the clip above, so strict
+        # monotonicity is preserved. Without a following inverse-normal
+        # transform, exact 0/1 endpoint values are well-defined -- this is what
+        # removes the boundary atom (no quantile clamping) and the wall density
+        # cliff (no zeroed/floored endpoint pdf).
+        cdf_vals[0], cdf_vals[-1] = 0.0, 1.0
     # Store actual CDF bounds after clipping (may differ from min_eps due to empirical CDF)
     cdf_min, cdf_max = float(np.min(cdf_vals)), float(np.max(cdf_vals))
 
@@ -506,6 +557,9 @@ def make_empirical_cdf_spline(
                 cdf_min,
                 jnp.where(u >= data_max, cdf_max, spline_val),
             )
+        if unit_range:
+            # Exact-0/1 endpoints are valid here (no inverse-normal follows).
+            return jnp.clip(y, 0.0, 1.0)
         # Final bounds check to ensure we never return exactly 0 or 1
         return jnp.clip(y, min_eps, 1.0 - min_eps)
 
@@ -594,12 +648,20 @@ def make_empirical_cdf_spline(
                 left_pdf,
                 jnp.where(x >= data_max, right_pdf, mid_pdf),
             )
+        elif unit_range:
+            # Honest wall density: the endpoint value of the (strictly positive)
+            # RQS derivative, extended flat for out-of-support queries. Zeroing
+            # or flooring the wall here is exactly what created the boundary
+            # density cliff in the Gaussianized pipeline.
+            y = mid_pdf
         else:
             y = jnp.where(
                 (x <= data_min) | (x >= data_max),
                 0.0,
                 mid_pdf,
             )
+        if unit_range:
+            return jnp.maximum(y, _POS_FLOOR)
         return jnp.maximum(y, min_eps)
 
     return cdf_vals, cdf_fn, quantile_fn, pdf_fn
@@ -761,4 +823,68 @@ class EmpiricalMarginalToGaussian(AbstractBijection):
         pdf_z = jnp.exp(-0.5 * z**2) / jnp.sqrt(2 * jnp.pi)
         log_det = jnp.log(1.0 / pdf_x) + jnp.log(pdf_z)
 
+        return x, jnp.sum(log_det)
+
+
+class EmpiricalMarginalToUniform(AbstractBijection):
+    """
+    Bijection between an empirical marginal and the uniform distribution on [0, 1].
+
+    This is the probability integral transform (PIT) on its own: ``u = F(x)``
+    with no inverse-normal step. It is the marginal stage of the uniform-copula
+    pipeline (``normalizing_flows_fit(..., copula_space="uniform")``), where the
+    copula is modeled directly on the unit cube by a bounded spline flow over a
+    uniform base.
+
+    Built with ``make_empirical_cdf_spline(..., unit_range=True)`` so the
+    transform is an *exact* bijection ``[x_lo, x_hi] <-> [0, 1]``: the support
+    bounds map to u = 0 and u = 1 exactly, with a strictly positive density all
+    the way to the walls. Compared to :class:`EmpiricalMarginalToGaussian` this
+    removes the boundary pathologies that the inverse-normal transform forces
+    (quantile clamping producing an atom of samples exactly at the bound, and a
+    zeroed/floored wall density producing a log-density cliff there), so the
+    flow's sampling and reported density agree at the boundaries.
+
+    Attributes mirror :class:`EmpiricalMarginalToGaussian`; the trailing ones are
+    reconstruction metadata used by :mod:`coppuccino.model_io`.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> import jax.numpy as jnp
+    >>> from coppuccino.bijections import EmpiricalMarginalToUniform, make_empirical_cdf_spline
+    >>> samples = np.random.uniform(-1.0, 1.0, 1000)
+    >>> _, cdf_fn, quantile_fn, pdf_fn = make_empirical_cdf_spline(
+    ...     samples, prior_low=-1.0, prior_high=1.0, marginal="rqs", unit_range=True)
+    >>> bij = EmpiricalMarginalToUniform(
+    ...     samples=samples, cdf_fn=cdf_fn, quantile_fn=quantile_fn, pdf_fn=pdf_fn
+    ... )
+    >>> u, log_det = bij.inverse_and_log_det(jnp.array(0.3))
+    >>> x, log_det_fwd = bij.transform_and_log_det(u)
+    """
+    samples: np.ndarray
+    cdf_fn: Callable
+    quantile_fn: Callable
+    pdf_fn: Callable
+    min_eps: float = 1e-7
+    num_points: int = 200
+    tail_extension: bool = False
+    prior_low: Optional[float] = None
+    prior_high: Optional[float] = None
+    tail_model: str = "gaussian"
+    tail_quantile: float = 0.05
+    marginal: str = "rqs"
+    cond_shape: ClassVar[None] = None
+    shape: ClassVar[tuple[int, ...]] = ()
+
+    def inverse_and_log_det(self, x, condition=None):
+        """Original space -> unit interval: ``u = F(x)``, ``log|du/dx| = log f(x)``."""
+        u = self.cdf_fn(x)
+        log_det = jnp.log(self.pdf_fn(x))
+        return u, jnp.sum(log_det)
+
+    def transform_and_log_det(self, u, condition=None):
+        """Unit interval -> original space: ``x = F^{-1}(u)``, ``log|dx/du| = -log f(x)``."""
+        x = self.quantile_fn(u)
+        log_det = -jnp.log(self.pdf_fn(x))
         return x, jnp.sum(log_det)

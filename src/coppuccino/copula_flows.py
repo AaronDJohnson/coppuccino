@@ -5,17 +5,65 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-from flowjax.bijections import Stack
-from flowjax.flows import triangular_spline_flow
+from flowjax.bijections import RationalQuadraticSpline, Stack
+from flowjax.flows import coupling_flow, triangular_spline_flow
 from flowjax.train import fit_to_data
-from flowjax.distributions import Normal, Transformed
+from flowjax.distributions import Normal, Transformed, Uniform
 from paramax import non_trainable
+import equinox as eqx
 from equinox import filter_jit
 
 from coppuccino.bijections import EmpiricalMarginalToGaussian
+from coppuccino.bijections import EmpiricalMarginalToUniform
 from coppuccino.bijections import make_empirical_cdf_spline
 
-__all__ = ["normalizing_flows_fit", "sample", "log_prob", "sample_and_log_prob"]
+__all__ = [
+    "normalizing_flows_fit", "normalizing_flows_fit_auto",
+    "sample", "log_prob", "sample_and_log_prob",
+    "CopulaFlow",
+]
+
+
+class CopulaFlow(Transformed):
+    """A fitted copula flow carrying its architecture spec as static metadata.
+
+    Behaves exactly like ``flowjax.distributions.Transformed`` (it is one).
+    The extra ``arch`` tuple records how the *inner* (trained) flow was
+    constructed, so :func:`coppuccino.model_io.load_flow` can rebuild an
+    identical skeleton and deserialize the trained arrays into it. This avoids
+    pickling flow *structure*: the coupling layers used by the uniform-copula
+    mode hold dynamically generated constructor closures that do not survive
+    a pickle round-trip.
+
+    ``arch`` layout: ``("uniform", n_params, knots, flow_layers)``.
+    """
+
+    arch: Optional[tuple] = eqx.field(static=True, default=None)
+
+    def __init__(self, base_dist, bijection, arch=None):
+        super().__init__(base_dist, bijection)
+        self.arch = arch
+
+
+def _build_uniform_inner(arch: tuple, rng_seed: int = 0):
+    """Build the (untrained) unit-cube coupling flow described by ``arch``.
+
+    Used both by :func:`normalizing_flows_fit` (uniform mode) and by
+    :func:`coppuccino.model_io.load_flow`, which deserializes trained arrays
+    into this skeleton — construction must therefore stay deterministic in
+    structure (the ``rng_seed`` only sets initial parameter values, which are
+    overwritten on load).
+    """
+    mode, n_params, knots, flow_layers = arch
+    if mode != "uniform":
+        raise ValueError(f"Unknown copula flow architecture: {arch!r}")
+    return coupling_flow(
+        jr.key(rng_seed),
+        base_dist=Uniform(jnp.zeros(n_params), jnp.ones(n_params)),
+        transformer=RationalQuadraticSpline(knots=knots, interval=(0, 1)),
+        flow_layers=flow_layers,
+        invert=True,
+    )
 
 # Minimum samples per dimension needed to build a usable empirical CDF.
 _MIN_SAMPLES_PER_DIM = 20
@@ -37,7 +85,8 @@ def _create_empirical_transforms(samples: np.ndarray, min_eps: float = 1e-7,
                                   prior_bounds: Optional[np.ndarray] = None,
                                   tail_model: str = "gaussian",
                                   tail_quantile: float = 0.05,
-                                  marginal: str = "rqs"):
+                                  marginal: str = "rqs",
+                                  copula_space: str = "gaussian"):
     """
     Create empirical marginal transforms for copula modeling.
 
@@ -71,6 +120,12 @@ def _create_empirical_transforms(samples: np.ndarray, min_eps: float = 1e-7,
     marginal : str, optional
         Bulk interpolant family for every marginal: ``"rqs"`` (default) or
         ``"pchip"``. See :func:`coppuccino.bijections.make_empirical_cdf_spline`.
+    copula_space : str, optional
+        ``"gaussian"`` (default): marginals map to standard normal
+        (:class:`EmpiricalMarginalToGaussian`). ``"uniform"``: marginals map to
+        the unit interval as exact bijections
+        (:class:`EmpiricalMarginalToUniform`, built with ``unit_range=True``);
+        used by the uniform-copula pipeline.
 
     Returns
     -------
@@ -93,6 +148,13 @@ def _create_empirical_transforms(samples: np.ndarray, min_eps: float = 1e-7,
     >>> # Transform samples to Gaussian space
     >>> x_gaussian, log_det = inverse_log_det(samples)
     """
+    if copula_space not in ("gaussian", "uniform"):
+        raise ValueError(
+            f"copula_space must be 'gaussian' or 'uniform', got {copula_space!r}."
+        )
+    unit_range = copula_space == "uniform"
+    marginal_cls = EmpiricalMarginalToUniform if unit_range else EmpiricalMarginalToGaussian
+
     x = samples[~np.isnan(samples).any(axis=1)]
     empirical_transforms = []
 
@@ -105,8 +167,8 @@ def _create_empirical_transforms(samples: np.ndarray, min_eps: float = 1e-7,
                 param_samples, num_points=num_points, min_eps=min_eps,
                 tail_extension=tail_extension, prior_low=p_low, prior_high=p_high,
                 tail_model=tail_model, tail_quantile=tail_quantile,
-                marginal=marginal)
-            empirical_transforms.append(non_trainable(EmpiricalMarginalToGaussian(
+                marginal=marginal, unit_range=unit_range)
+            empirical_transforms.append(non_trainable(marginal_cls(
                 param_samples, cdf_fn, quantile_fn, pdf_fn, min_eps=min_eps,
                 num_points=num_points, tail_extension=tail_extension,
                 prior_low=p_low, prior_high=p_high,
@@ -134,6 +196,7 @@ def _fit_chain_entry(
     learning_rate: float = 1e-4,
     rng_seed: int = 999,
     max_epochs: int = 200,
+    arch: Optional[tuple] = None,
 ) -> Transformed:
     """
     Fit a normalizing flow to data with empirical marginal transforms.
@@ -193,8 +256,11 @@ def _fit_chain_entry(
 
     updated_flow, _losses = fit_to_data(key, input_flow, x_train, **kwargs)
 
-    final_flow = Transformed(updated_flow, transform)  # apply empirical marginal transforms
-    return final_flow
+    # apply empirical marginal transforms; carry the architecture spec when
+    # given (uniform mode) so save/load can rebuild the inner flow skeleton
+    if arch is not None:
+        return CopulaFlow(updated_flow, transform, arch=arch)
+    return Transformed(updated_flow, transform)
 
 
 def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
@@ -205,13 +271,30 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
                           prior_bounds: Optional[np.ndarray] = None,
                           tail_model: str = "gaussian",
                           tail_quantile: float = 0.05,
-                          marginal: str = "rqs") -> Transformed:
+                          marginal: str = "rqs",
+                          copula_space: str = "gaussian") -> Transformed:
     """
     Fit a copula normalizing flow to multivariate data.
 
     This function implements a copula-based normalizing flow by:
-    1. Transforming each marginal to Gaussian via empirical CDF
-    2. Modeling the Gaussian copula dependencies with a triangular spline flow
+    1. Transforming each marginal via its empirical CDF
+    2. Modeling the remaining dependence structure (the copula) with a flow
+
+    Two pipelines are available via ``copula_space``:
+
+    * ``"gaussian"`` (default): marginals are Gaussianized (``z = ndtri(F(x))``)
+      and the copula is a triangular spline flow over a normal base on
+      unbounded space, with tanh clipping (``tanh_max_val``).
+    * ``"uniform"``: marginals stop at the probability integral transform
+      (``u = F(x)``, an exact bijection onto ``[0, 1]``) and the copula is a
+      rational-quadratic-spline coupling flow over a *uniform base on the unit
+      cube* -- no Gaussianization and no tanh clipping. Because sampling and
+      density evaluation share one closed-form bijection with strictly positive
+      derivative everywhere (including the walls), the flow's sample stream and
+      its ``log_prob`` agree at hard support boundaries: no boundary sample
+      atoms and no wall density cliffs. Recommended for bounded (prior-box)
+      problems, e.g. MCMC proposal flows with ``prior_bounds``. Requires
+      ``marginal="rqs"`` and no tail model (bounded support).
 
     The approach combines flexibility in modeling marginals (via empirical CDFs)
     with powerful dependency modeling (via normalizing flows).
@@ -245,7 +328,8 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
     tanh_max_val : float, optional
         Maximum value for the tanh clipping in the spline flow base space.
         Default is 3.0. Increase (e.g. 4.0–5.0) for heavy-tailed data where
-        tail dependencies matter.
+        tail dependencies matter. Only used when ``copula_space="gaussian"``;
+        the uniform-copula pipeline has no clipping.
     prior_bounds : np.ndarray, optional
         Prior support bounds with shape (n_params, 2), where each row is
         [low, high] for that parameter. When provided, the empirical CDF grid
@@ -271,6 +355,11 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
         approximate inverses of each other. Prefer ``"rqs"`` (better self-
         consistency at equal cost and fit quality); ``"pchip"`` is retained for
         backward compatibility and reproducing older fits.
+    copula_space : str, optional
+        ``"gaussian"`` (default) or ``"uniform"`` -- see the summary above.
+        ``"uniform"`` requires ``marginal="rqs"``, ``tail_extension=False`` and
+        ``tail_model="gaussian"`` (bounded support; no tail models), and is the
+        recommended mode for prior-bounded MCMC chains (pass ``prior_bounds``).
 
     Returns
     -------
@@ -319,21 +408,171 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
         clean_chain, num_points=num_points, tail_extension=tail_extension,
         prior_bounds=prior_bounds,
         tail_model=tail_model, tail_quantile=tail_quantile,
-        marginal=marginal)
+        marginal=marginal, copula_space=copula_space)
 
-    # Use only triangular spline flow (original behavior)
-    flow = triangular_spline_flow(
-        key,
-        base_dist=Normal(jnp.zeros(clean_chain.shape[1])),
-        knots=knots,
-        flow_layers=flow_layers,
-        tanh_max_val=tanh_max_val,
-        invert=True
-    )
+    n_params = clean_chain.shape[1]
+    arch = None
+    if copula_space == "uniform":
+        # Copula modeled natively on the unit cube: uniform base + RQS coupling
+        # layers that map [0, 1]^d to itself with strictly positive derivative
+        # everywhere (flowjax RQS enforces min_derivative > 0), so support is
+        # exactly the cube and no clipping of any kind is involved.
+        arch = ("uniform", n_params, knots, flow_layers)
+        flow = _build_uniform_inner(arch, rng_seed=rng_seed)
+    else:
+        # Gaussianized copula: triangular spline flow on unbounded space
+        # (original behavior).
+        flow = triangular_spline_flow(
+            key,
+            base_dist=Normal(jnp.zeros(n_params)),
+            knots=knots,
+            flow_layers=flow_layers,
+            tanh_max_val=tanh_max_val,
+            invert=True
+        )
     flow = _fit_chain_entry(flow, transform, inverse_log_det, clean_chain, rng_seed=rng_seed,
-                            patience=patience, learning_rate=learning_rate, max_epochs=max_epochs)
+                            patience=patience, learning_rate=learning_rate, max_epochs=max_epochs,
+                            arch=arch)
 
     return flow
+
+
+def normalizing_flows_fit_auto(chain: np.ndarray,
+                               candidates: Optional[list] = None,
+                               val_frac: float = 0.15,
+                               refit_best: bool = True,
+                               rng_seed: int = 999,
+                               verbose: bool = False,
+                               return_table: bool = False,
+                               **shared_kwargs):
+    """
+    Fit a copula flow with automatic hyperparameter selection.
+
+    Splits the chain into a fit part and a held-out validation part, fits one
+    flow per candidate configuration, scores each candidate by its mean
+    log-density on the held-out samples, and returns the winning configuration
+    (by default refit on the full chain).
+
+    The held-out mean log-density estimates ``-H(pi, q)``; maximizing it over
+    candidates minimizes ``KL(pi || q)`` up to the (candidate-independent)
+    entropy of the target — and ``KL(pi || q)`` is precisely the divergence
+    that governs the acceptance rate of an independence MCMC proposal. In
+    other words, this selects the flow that will accept best, and it
+    automatically penalizes over-parameterized configurations that fit
+    sampling noise (which raise train likelihood but lower held-out
+    likelihood *and* MCMC acceptance).
+
+    Because every candidate is scored on the same held-out samples in the
+    *original* parameter space (marginal transforms included), candidates may
+    differ in any ``normalizing_flows_fit`` argument — ``knots``,
+    ``flow_layers``, ``learning_rate``, ``num_points``, and even
+    ``copula_space`` — and remain directly comparable.
+
+    .. note::
+        Held-out likelihood measures proposal *efficiency* only. The
+        boundary-safety advantage of ``copula_space="uniform"`` (no sampling
+        atoms / density cliffs at hard prior bounds) lives in a
+        measure-near-zero region that validation samples essentially never
+        probe, so this criterion cannot reward it. For prior-bounded MCMC,
+        treat safety as a constraint and efficiency as the objective: fix
+        ``copula_space="uniform"`` in ``shared_kwargs`` and let the
+        candidates tune the rest.
+
+    Parameters
+    ----------
+    chain : np.ndarray
+        Training samples with shape (n_samples, n_params). NaN rows are
+        dropped before splitting.
+    candidates : list of dict, optional
+        Candidate keyword overrides for :func:`normalizing_flows_fit`. Each
+        dict is merged over ``**shared_kwargs``. Default is a small grid::
+
+            [{"knots": 4, "flow_layers": 4}, {"knots": 4, "flow_layers": 6},
+             {"knots": 8, "flow_layers": 4}, {"knots": 8, "flow_layers": 6}]
+
+    val_frac : float, optional
+        Fraction of the (clean) chain held out for scoring. Default 0.15.
+    refit_best : bool, optional
+        If True (default), refit the winning configuration on the full chain
+        before returning it, so no samples are wasted. The reported scores
+        always refer to the split fits.
+    rng_seed : int, optional
+        Seed for the split and for every candidate fit (all candidates see
+        the identical split, so the comparison is paired). Default 999.
+    verbose : bool, optional
+        Print one line per candidate. Default False.
+    return_table : bool, optional
+        If True, return ``(flow, table)`` where ``table`` is a list of dicts
+        with keys ``config``, ``val_logp``, ``sem``, ``selected``.
+    **shared_kwargs
+        Arguments passed to every candidate fit (e.g. ``prior_bounds``,
+        ``copula_space``, ``max_epochs``).
+
+    Returns
+    -------
+    Transformed  (or  (Transformed, list) when ``return_table=True``)
+        The selected fitted flow.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from coppuccino import normalizing_flows_fit_auto
+    >>> data = np.random.randn(2000, 2)
+    >>> flow = normalizing_flows_fit_auto(data, max_epochs=100)   # doctest: +SKIP
+    >>> # selecting across copula spaces as well:
+    >>> flow = normalizing_flows_fit_auto(                        # doctest: +SKIP
+    ...     data, prior_bounds=np.array([[-5, 5], [-5, 5]]),
+    ...     candidates=[{"copula_space": "uniform", "knots": 4},
+    ...                 {"copula_space": "uniform", "knots": 8},
+    ...                 {"copula_space": "gaussian", "knots": 4}])
+    """
+    chain = np.asarray(chain)
+    clean = chain[~np.isnan(chain).any(axis=1)]
+    if len(clean) < 2 * (_MIN_SAMPLES_PER_DIM + 1):
+        raise ValueError(
+            f"normalizing_flows_fit_auto needs at least "
+            f"{2 * (_MIN_SAMPLES_PER_DIM + 1)} non-NaN samples to split; "
+            f"got {len(clean)}."
+        )
+    rng = np.random.default_rng(rng_seed)
+    perm = rng.permutation(len(clean))
+    n_val = max(1, int(round(len(clean) * val_frac)))
+    val, fit_part = clean[perm[:n_val]], clean[perm[n_val:]]
+
+    if candidates is None:
+        candidates = [{"knots": 4, "flow_layers": 4},
+                      {"knots": 4, "flow_layers": 6},
+                      {"knots": 8, "flow_layers": 4},
+                      {"knots": 8, "flow_layers": 6}]
+
+    table = []
+    best_idx, best_score, best_flow = -1, -np.inf, None
+    for i, cand in enumerate(candidates):
+        kw = {"rng_seed": rng_seed, **shared_kwargs, **cand}
+        fl = normalizing_flows_fit(fit_part, **kw)
+        lp = log_prob(fl, val)
+        score = float(np.mean(lp))
+        sem = float(np.std(lp) / np.sqrt(len(lp)))
+        table.append({"config": dict(cand), "val_logp": score, "sem": sem,
+                      "selected": False})
+        if verbose:
+            print(f"[fit_auto] {i + 1}/{len(candidates)} {cand}: "
+                  f"held-out logp {score:.3f} +- {sem:.3f}")
+        if score > best_score:
+            best_idx, best_score, best_flow = i, score, fl
+    table[best_idx]["selected"] = True
+
+    if refit_best:
+        kw = {"rng_seed": rng_seed, **shared_kwargs, **candidates[best_idx]}
+        best_flow = normalizing_flows_fit(clean, **kw)
+    if verbose:
+        print(f"[fit_auto] selected {candidates[best_idx]} "
+              f"(held-out logp {best_score:.3f}"
+              f"{', refit on full chain' if refit_best else ''})")
+
+    if return_table:
+        return best_flow, table
+    return best_flow
 
 
 def sample(flow: Transformed, n_samples: int, rng_seed: Optional[int] = None) -> np.ndarray:
