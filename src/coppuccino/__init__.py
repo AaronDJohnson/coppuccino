@@ -20,14 +20,17 @@ from coppuccino.copula_flows import (
 )
 from coppuccino.model_io import save_flow, load_flow
 from coppuccino.hdr import compute_injection_hdr, check_in_support
+from coppuccino.fleet import normalizing_flows_fit_fleet, FleetFlow
 
 __all__ = [
     "normalizing_flows_fit",
     "normalizing_flows_fit_auto",
+    "normalizing_flows_fit_fleet",
     "sample",
     "log_prob",
     "sample_and_log_prob",
     "CopulaFlow",
+    "FleetFlow",
     "save_flow",
     "load_flow",
     "compute_injection_hdr",
