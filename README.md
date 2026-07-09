@@ -51,61 +51,79 @@ Fitting proceeds in two stages.
 ```mermaid
 flowchart LR
   X["data x in R^d<br/>(e.g. MCMC samples)"]
-  Z["Gaussianized z<br/>standard-normal marginals,<br/>dependency retained"]
-  E["base distribution<br/>N(0, I)"]
-  X -->|"empirical CDF F_i, then inverse-normal Phi^-1<br/>(per dimension, frozen)"| Z
-  Z -->|"triangular spline flow<br/>(learns the copula)"| E
+  U["unit cube u in [0,1]^d<br/>uniform marginals,<br/>dependency retained"]
+  E["base distribution<br/>Uniform([0,1]^d)"]
+  X -->|"empirical CDF u_i = F_i(x_i)<br/>(per dimension, frozen)"| U
+  U -->|"RQS coupling flow on the cube<br/>(learns the copula)"| E
 ```
 
-**1. Empirical marginal transforms (Gaussianization).** Each dimension is
-mapped to a standard normal through the probability integral transform followed
-by the inverse-normal CDF,
+**1. Empirical marginal transforms (probability integral transform).** Each
+dimension is mapped onto the unit interval through its empirical CDF,
 
 $$
-z_i = \Phi^{-1}\big(F_i(x_i)\big), \qquad i = 1, \dots, d,
+u_i = F_i(x_i), \qquad i = 1, \dots, d,
 $$
 
-where $\Phi$ is the standard normal CDF and each $F_i$ is an empirical CDF built
-from the data quantiles as a **monotone spline** (a rational-quadratic spline by
-default; see [Marginal transforms](#marginal-transforms)). After this step the
-transformed variable $\mathbf{z}$ has exactly standard-normal marginals while
-retaining the full dependency structure — so the copula is all that remains to
-be modeled. These transforms are estimated once and then frozen.
+where each $F_i$ is built from the data quantiles as a **monotone
+rational-quadratic spline** — an exact bijection onto $[0,1]$ whose forward
+map, inverse, and derivative share a single parameterization (see
+[Marginal transforms](#marginal-transforms)). After this step $\mathbf{u}$ has
+exactly uniform marginals while retaining the full dependency structure — by
+Sklar's theorem, the density of $\mathbf{u}$ *is* the copula. These transforms
+are estimated once and then frozen.
 
-**2. The copula flow.** A [triangular spline flow](https://github.com/danielward27/flowjax)
-$T$ models the joint density of $\mathbf{z}$ against a standard-normal base
-$\boldsymbol{\varepsilon} \sim \mathcal{N}(\mathbf{0}, \mathbf{I})$. If the
-dependence were exactly Gaussian, $T$ would only need to learn a correlation —
-the classical Gaussian copula; the flow generalizes this to arbitrary
-dependence. Only this stage is trained.
+**2. The copula flow.** A rational-quadratic-spline coupling flow
+([flowjax](https://github.com/danielward27/flowjax)) models the density of
+$\mathbf{u}$ against a uniform base on the unit cube. Every layer maps the
+cube to itself with a strictly positive derivative, so the model's support is
+*exactly* the cube — no clipping anywhere in the pipeline. Only this stage is
+trained.
 
-Putting the stages together, the log-density of a point is available in closed
-form via the change-of-variables formula,
+The log-density of a point is available in closed form,
 
 $$
-\log p(\mathbf{x}) = \log p_Z(\mathbf{z}) + \sum_{i=1}^{d}\Big( \log p_i(x_i) - \log \phi(z_i) \Big),
+\log p(\mathbf{x}) = \log c(\mathbf{u}) + \sum_{i=1}^{d} \log p_i(x_i),
 $$
 
-where $\log p_Z$ is supplied by the flow, $\phi$ is the standard normal density,
-and the sum is the log-Jacobian of the marginal Gaussianization. **Sampling**
-runs the pipeline in reverse: draw $\boldsymbol\varepsilon$ from the base,
-push it through the flow to obtain $\mathbf{z}$, then invert the marginal
-transforms with $x_i = F_i^{-1}\big(\Phi(z_i)\big)$.
+where $\log c$ is supplied by the flow and $p_i = F_i'$ are the marginal
+densities. **Sampling** runs the pipeline in reverse: draw $\mathbf{u}$ from
+the copula flow and invert the marginals with $x_i = F_i^{-1}(u_i)$.
+
+### The Gaussianized variant (`copula_space="gaussian"`)
+
+The original pipeline inserts an inverse-normal step,
+$z_i = \Phi^{-1}(F_i(x_i))$, and models the copula with a triangular spline
+flow over a standard-normal base on unbounded space. It remains available —
+and is required — for the **tail models** (`tail_extension=True`,
+`tail_model="gpd"`), i.e. for extrapolating beyond the observed data range on
+unbounded parameters.
+
+Its trade-off is at hard support boundaries: the $\Phi^{-1}$ endpoint handling
+can leave the sample stream and the reported density inconsistent in thin
+slivers at the walls (sample atoms sitting on a density cliff). That matters
+whenever boundary behavior matters — most acutely when the fitted flow is used
+as an independence MCMC proposal, where a proposal drawing from true density
+$s$ but reporting density $q$ has stationary law $\pi\, s/q$, so boundary
+mismatches become exponentially amplified biases.
+
+> **Changed in v2.0:** `copula_space="uniform"` (the cube-native pipeline) is
+> now the default. Pass `copula_space="gaussian"` for the legacy pipeline.
 
 ### Why this design
 
 - **Separation of concerns.** The flow spends all of its capacity on
-  dependency, because the marginals are already standardized. The empirical
+  dependency, because the marginals are already uniformized. The empirical
   CDFs, in turn, reproduce difficult marginal shapes (bounded, spiky,
   heavy-tailed, multimodal) that flows struggle to fit on their own.
-- **Honest density and importance weights.** With the default
-  rational-quadratic marginals, the forward transform, its inverse, and its
-  derivative all come from a *single* parameterization and are mutually exact to
-  machine precision, so `sample_and_log_prob` returns self-consistent
-  densities.
-- **Built for bounded posteriors.** By default the marginals clip to the
-  observed data range; `prior_bounds` extends them cleanly to a known prior
-  support, which is the common situation for MCMC chains.
+- **Honest density and importance weights.** The marginal transforms and the
+  cube flow are closed-form bijections whose forward map, inverse, and
+  derivative are mutually exact to machine precision, so `sample` and
+  `log_prob` are self-consistent everywhere — including at support
+  boundaries. `sample_and_log_prob` weights are honest by construction.
+- **Built for bounded posteriors.** The fitted support is exactly the
+  observed data range, or the full prior box when `prior_bounds` is given —
+  the common situation for MCMC chains — with a strictly positive density all
+  the way to the walls.
 
 ## Installation
 
@@ -169,10 +187,13 @@ the original chain, plus an HDR calibration walkthrough in
 | `compute_injection_hdr(samples, injection_params, ...)` | HDR credibility of injected/true parameters (calibration). |
 | `check_in_support(samples, injection_params)` | Whether a point lies within the sample support. |
 
-Key options to `normalizing_flows_fit` include `flow_layers` and `knots` (flow
-capacity), `max_epochs`, `learning_rate`, `patience` (training), `prior_bounds`,
-`tail_model`, and `marginal` (the marginal model, below). See the docstrings for
-the full list.
+Key options to `normalizing_flows_fit` include `copula_space` (the pipeline:
+`"uniform"` default / `"gaussian"` legacy, above), `flow_layers` and `knots`
+(flow capacity), `max_epochs`, `learning_rate`, `patience` (training),
+`prior_bounds`, `tail_model`, and `marginal` (the marginal model, below). See
+the docstrings for the full list. `normalizing_flows_fit_auto` fits a small
+ladder of capacities concurrently and returns the smallest model whose
+held-out fit is statistically comparable to the best.
 
 ### HDR credibility (inference validation)
 
@@ -203,7 +224,8 @@ how they behave at and beyond the edges of the data.
 
 ```python
 flow = normalizing_flows_fit(data)                   # marginal="rqs" (default)
-flow = normalizing_flows_fit(data, marginal="pchip") # original PCHIP interpolant
+flow = normalizing_flows_fit(data, marginal="pchip",
+                             copula_space="gaussian")  # original PCHIP interpolant
 ```
 
 Both families use the same empirical-quantile knots and the same tail and
@@ -212,7 +234,8 @@ rational-quadratic spline) is preferred because its forward map, inverse, and
 derivative share a single parameterization and are mutually exact to machine
 precision, which keeps `sample_and_log_prob` weights honest. The `"pchip"` path
 builds the CDF and its inverse as two independent splines that are only
-approximate inverses of each other; it is retained for reproducing older fits.
+approximate inverses of each other; it is retained for reproducing older fits
+and requires the Gaussianized pipeline (`copula_space="gaussian"`).
 
 ### Prior bounds (recommended for MCMC chains)
 

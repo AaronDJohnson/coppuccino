@@ -86,7 +86,7 @@ def _create_empirical_transforms(samples: np.ndarray, min_eps: float = 1e-7,
                                   tail_model: str = "gaussian",
                                   tail_quantile: float = 0.05,
                                   marginal: str = "rqs",
-                                  copula_space: str = "gaussian"):
+                                  copula_space: str = "uniform"):
     """
     Create empirical marginal transforms for copula modeling.
 
@@ -283,7 +283,7 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
                           tail_model: str = "gaussian",
                           tail_quantile: float = 0.05,
                           marginal: str = "rqs",
-                          copula_space: str = "gaussian",
+                          copula_space: str = "uniform",
                           weight_decay: float = 0.0,
                           show_progress: bool = True) -> Transformed:
     """
@@ -295,19 +295,27 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
 
     Two pipelines are available via ``copula_space``:
 
-    * ``"gaussian"`` (default): marginals are Gaussianized (``z = ndtri(F(x))``)
+    * ``"uniform"`` (default): marginals stop at the probability integral
+      transform (``u = F(x)``, an exact bijection onto ``[0, 1]``) and the
+      copula is a rational-quadratic-spline coupling flow over a *uniform base
+      on the unit cube* -- no Gaussianization and no tanh clipping. Because
+      sampling and density evaluation share one closed-form bijection with
+      strictly positive derivative everywhere (including the walls), the
+      flow's sample stream and its ``log_prob`` agree at hard support
+      boundaries: no boundary sample atoms and no wall density cliffs. This is
+      the safe choice for bounded (prior-box) problems, e.g. MCMC proposal
+      flows with ``prior_bounds``. Requires ``marginal="rqs"`` and no tail
+      model (bounded support: the fitted flow's support is the prior box when
+      ``prior_bounds`` is given, else the observed data range).
+    * ``"gaussian"`` (legacy): marginals are Gaussianized (``z = ndtri(F(x))``)
       and the copula is a triangular spline flow over a normal base on
-      unbounded space, with tanh clipping (``tanh_max_val``).
-    * ``"uniform"``: marginals stop at the probability integral transform
-      (``u = F(x)``, an exact bijection onto ``[0, 1]``) and the copula is a
-      rational-quadratic-spline coupling flow over a *uniform base on the unit
-      cube* -- no Gaussianization and no tanh clipping. Because sampling and
-      density evaluation share one closed-form bijection with strictly positive
-      derivative everywhere (including the walls), the flow's sample stream and
-      its ``log_prob`` agree at hard support boundaries: no boundary sample
-      atoms and no wall density cliffs. Recommended for bounded (prior-box)
-      problems, e.g. MCMC proposal flows with ``prior_bounds``. Requires
-      ``marginal="rqs"`` and no tail model (bounded support).
+      unbounded space, with tanh clipping (``tanh_max_val``). Required for the
+      tail models (``tail_extension=True`` / ``tail_model="gpd"``), i.e. for
+      modeling beyond the observed data range on unbounded parameters. Its
+      sample stream and reported density can disagree in slivers at hard
+      support boundaries (boundary sample atoms over a wall density cliff),
+      which biases boundary-adjacent estimates and can absorb independence-MCMC
+      walkers -- prefer the default for bounded problems.
 
     The approach combines flexibility in modeling marginals (via empirical CDFs)
     with powerful dependency modeling (via normalizing flows).
@@ -369,10 +377,17 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
         consistency at equal cost and fit quality); ``"pchip"`` is retained for
         backward compatibility and reproducing older fits.
     copula_space : str, optional
-        ``"gaussian"`` (default) or ``"uniform"`` -- see the summary above.
+        ``"uniform"`` (default) or ``"gaussian"`` -- see the summary above.
         ``"uniform"`` requires ``marginal="rqs"``, ``tail_extension=False`` and
-        ``tail_model="gaussian"`` (bounded support; no tail models), and is the
-        recommended mode for prior-bounded MCMC chains (pass ``prior_bounds``).
+        ``tail_model="gaussian"`` (bounded support; no tail models); pass
+        ``prior_bounds`` so the flow covers the full prior box. Set
+        ``copula_space="gaussian"`` for unbounded problems that need the tail
+        models.
+
+        .. versionchanged:: 2.0
+            The default changed from ``"gaussian"`` to ``"uniform"``: the
+            Gaussianized pipeline is not boundary-safe (see the summary), so
+            the safe pipeline is now opt-out rather than opt-in.
     weight_decay : float, optional
         AdamW weight decay on the trainable flow parameters. Default 0.0
         (plain Adam; original behavior). In the coupling layers the spline
@@ -416,6 +431,26 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
     The triangular spline flow uses autoregressive transformations that are
     particularly efficient for capturing dependencies in high-dimensional data.
     """
+    if copula_space == "uniform":
+        # Friendly guards: the low-level spline construction would also raise,
+        # but these name the actionable fix at the API the user called.
+        if tail_extension or tail_model == "gpd":
+            raise ValueError(
+                "Tail models (tail_extension=True / tail_model='gpd') describe "
+                "unbounded support and require the Gaussianized pipeline: pass "
+                "copula_space='gaussian'. The default 'uniform' pipeline models "
+                "bounded support exactly (boundary-safe) and has no tails."
+            )
+        if marginal not in ("pchip", "rqs"):
+            raise ValueError(f"marginal must be 'pchip' or 'rqs', got {marginal!r}")
+        if marginal == "pchip":
+            raise ValueError(
+                "copula_space='uniform' requires marginal='rqs' (a single "
+                "self-consistent spline). Use marginal='rqs' (default), or pass "
+                "copula_space='gaussian' to keep the legacy pipeline with "
+                "marginal='pchip'."
+            )
+
     key = jr.key(rng_seed)
 
     # Filter NaN rows once so both transform creation and training use clean data
@@ -524,13 +559,14 @@ def normalizing_flows_fit_auto(chain: np.ndarray,
 
     .. note::
         Held-out likelihood measures proposal *efficiency* only. The
-        boundary-safety advantage of ``copula_space="uniform"`` (no sampling
-        atoms / density cliffs at hard prior bounds) lives in a
-        measure-near-zero region that validation samples essentially never
-        probe, so this criterion cannot reward it. For prior-bounded MCMC,
-        treat safety as a constraint and efficiency as the objective: fix
-        ``copula_space="uniform"`` in ``shared_kwargs`` and let the
-        candidates tune the rest.
+        boundary-safety advantage of the (default) ``copula_space="uniform"``
+        pipeline -- no sampling atoms / density cliffs at hard prior bounds --
+        lives in a measure-near-zero region that validation samples
+        essentially never probe, so this criterion cannot reward it. Treat
+        safety as a constraint and efficiency as the objective: keep the
+        default pipeline and let the candidates tune capacity. Only include
+        ``{"copula_space": "gaussian"}`` candidates when the problem is
+        genuinely unbounded.
 
     Parameters
     ----------
@@ -539,10 +575,14 @@ def normalizing_flows_fit_auto(chain: np.ndarray,
         dropped before splitting.
     candidates : list of dict, optional
         Candidate keyword overrides for :func:`normalizing_flows_fit`. Each
-        dict is merged over ``**shared_kwargs``. Default is a small grid::
+        dict is merged over ``**shared_kwargs``. The default is a small
+        capacity ladder (validated on MCMC posteriors: the small rung wins on
+        mild copulas, the larger rungs only when the dependence structure
+        genuinely needs them)::
 
-            [{"knots": 4, "flow_layers": 4}, {"knots": 4, "flow_layers": 6},
-             {"knots": 8, "flow_layers": 4}, {"knots": 8, "flow_layers": 6}]
+            [{"knots": 2, "flow_layers": 4},
+             {"knots": 4, "flow_layers": 6},
+             {"knots": 8, "flow_layers": 8}]
 
     val_frac : float, optional
         Fraction of the (clean) chain held out for scoring. Default 0.15.
@@ -615,10 +655,9 @@ def normalizing_flows_fit_auto(chain: np.ndarray,
     val, fit_part = clean[perm[:n_val]], clean[perm[n_val:]]
 
     if candidates is None:
-        candidates = [{"knots": 4, "flow_layers": 4},
+        candidates = [{"knots": 2, "flow_layers": 4},
                       {"knots": 4, "flow_layers": 6},
-                      {"knots": 8, "flow_layers": 4},
-                      {"knots": 8, "flow_layers": 6}]
+                      {"knots": 8, "flow_layers": 8}]
 
     if selection not in ("smallest_comparable", "best"):
         raise ValueError(

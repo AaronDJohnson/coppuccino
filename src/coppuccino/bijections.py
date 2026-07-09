@@ -366,10 +366,12 @@ def make_empirical_cdf_spline(
         # bijection. Tail models (which extend beyond the bounds) do not apply,
         # and the PCHIP pair's approximate inverse would break the sample/density
         # self-consistency this mode exists to guarantee.
-        if marginal != "rqs":
+        if marginal == "pchip":
+            # (an unknown family falls through to the canonical validation at
+            # the bulk-interpolant dispatch below)
             raise ValueError(
                 "unit_range=True requires marginal='rqs' (single self-consistent "
-                f"spline); got marginal={marginal!r}."
+                "spline); got marginal='pchip'."
             )
         if tail_extension or use_gpd:
             raise ValueError(

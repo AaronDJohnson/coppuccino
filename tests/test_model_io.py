@@ -399,7 +399,8 @@ class TestSaveLoadWithNonDefaultParams:
         """Test that tail_extension is preserved through save/load."""
         np.random.seed(42)
         chain = np.random.randn(200, 2)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2, tail_extension=True)
+        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2, tail_extension=True,
+                                     copula_space="gaussian")
 
         original_samples = sample(flow, n_samples=100, rng_seed=999)
 
@@ -432,6 +433,8 @@ class TestSaveLoadWithNonDefaultParams:
         np.random.seed(42)
         chain = np.random.randn(200, 2)
         kwargs = {} if marginal is None else {"marginal": marginal}
+        if marginal == "pchip":
+            kwargs["copula_space"] = "gaussian"   # pchip is a gaussian-pipeline feature
         flow = normalizing_flows_fit(chain, max_epochs=5, patience=2, **kwargs)
 
         spline_data = _extract_spline_data(flow)
@@ -459,7 +462,8 @@ class TestSaveLoadWithNonDefaultParams:
         rng = np.random.default_rng(0)
         chain = rng.standard_t(df=3, size=(2000, 2))
         flow = normalizing_flows_fit(
-            chain, max_epochs=5, patience=2, tail_model="gpd", tail_quantile=0.05
+            chain, max_epochs=5, patience=2, tail_model="gpd", tail_quantile=0.05,
+            copula_space="gaussian"
         )
 
         spline_data = _extract_spline_data(flow)
@@ -487,7 +491,8 @@ class TestSaveLoadWithNonDefaultParams:
         (what such models were always built with), not the new RQS default."""
         np.random.seed(42)
         chain = np.random.randn(200, 2)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2, marginal="pchip")
+        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2, marginal="pchip",
+                                     copula_space="gaussian")
         spline_data = _extract_spline_data(flow)
         # Simulate an older save that never stored the marginal key.
         del spline_data['marginal']

@@ -31,7 +31,8 @@ class TestMarginalSelection:
         """Passing marginal='pchip' uses the PCHIP marginal on every dimension."""
         np.random.seed(42)
         chain = np.random.randn(200, 3)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2, marginal="pchip")
+        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2, marginal="pchip",
+                                     copula_space="gaussian")
         assert isinstance(flow, Transformed)
         assert _marginal_families(flow) == ["pchip", "pchip", "pchip"]
 
@@ -40,7 +41,8 @@ class TestMarginalSelection:
         np.random.seed(42)
         chain = np.random.randn(200, 2)
         for marginal in ("rqs", "pchip"):
-            flow = normalizing_flows_fit(chain, max_epochs=5, patience=2, marginal=marginal)
+            flow = normalizing_flows_fit(chain, max_epochs=5, patience=2, marginal=marginal,
+                                         copula_space="gaussian")
             s = sample(flow, n_samples=100, rng_seed=0)
             lp = log_prob(flow, chain)
             assert s.shape == (100, 2) and np.all(np.isfinite(s))
