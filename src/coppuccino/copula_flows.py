@@ -197,6 +197,8 @@ def _fit_chain_entry(
     rng_seed: int = 999,
     max_epochs: int = 200,
     arch: Optional[tuple] = None,
+    weight_decay: float = 0.0,
+    show_progress: bool = True,
 ) -> Transformed:
     """
     Fit a normalizing flow to data with empirical marginal transforms.
@@ -251,8 +253,17 @@ def _fit_chain_entry(
     kwargs = {
         'max_epochs': max_epochs,
         'max_patience': patience,
-        'learning_rate': learning_rate
+        'learning_rate': learning_rate,
+        'show_progress': show_progress,
     }
+    if weight_decay and weight_decay > 0.0:
+        # Continuous capacity control: AdamW decays the trainable (conditioner)
+        # weights toward zero. In the coupling layers the spline parameters are
+        # (conditioner output + identity initialization), so the decay pulls
+        # every layer toward the identity map -- a generous architecture then
+        # self-limits its effective capacity instead of fitting sampling noise.
+        import optax
+        kwargs['optimizer'] = optax.adamw(learning_rate, weight_decay=weight_decay)
 
     updated_flow, _losses = fit_to_data(key, input_flow, x_train, **kwargs)
 
@@ -272,7 +283,9 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
                           tail_model: str = "gaussian",
                           tail_quantile: float = 0.05,
                           marginal: str = "rqs",
-                          copula_space: str = "gaussian") -> Transformed:
+                          copula_space: str = "gaussian",
+                          weight_decay: float = 0.0,
+                          show_progress: bool = True) -> Transformed:
     """
     Fit a copula normalizing flow to multivariate data.
 
@@ -360,6 +373,19 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
         ``"uniform"`` requires ``marginal="rqs"``, ``tail_extension=False`` and
         ``tail_model="gaussian"`` (bounded support; no tail models), and is the
         recommended mode for prior-bounded MCMC chains (pass ``prior_bounds``).
+    weight_decay : float, optional
+        AdamW weight decay on the trainable flow parameters. Default 0.0
+        (plain Adam; original behavior). In the coupling layers the spline
+        parameters are (conditioner output + identity initialization), so the
+        decay pulls layers toward the identity map. Note: measured on a
+        typical MCMC posterior, this is a *weak* regularizer -- it does not
+        make an over-parameterized architecture match a well-chosen small one
+        (choosing few ``knots`` imposes smoothness structurally and works
+        better; decay >= ~10 over-regularizes). Treat it as a supplementary
+        knob, not a substitute for architecture choice.
+    show_progress : bool, optional
+        Show the training progress bar. Default True. Set False for quiet
+        fits (e.g. candidate fits inside ``normalizing_flows_fit_auto``).
 
     Returns
     -------
@@ -432,9 +458,22 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
         )
     flow = _fit_chain_entry(flow, transform, inverse_log_det, clean_chain, rng_seed=rng_seed,
                             patience=patience, learning_rate=learning_rate, max_epochs=max_epochs,
-                            arch=arch)
+                            arch=arch, weight_decay=weight_decay, show_progress=show_progress)
 
     return flow
+
+
+def _n_trainable_params(flow: Transformed) -> int:
+    """Total scalar parameter count of the trained (inner) flow.
+
+    The frozen marginal transforms are excluded (identical role across
+    candidates); this is the model-size measure used by the
+    ``"smallest_comparable"`` selection rule.
+    """
+    leaves = jax.tree_util.tree_leaves(
+        eqx.filter(flow.base_dist, eqx.is_inexact_array)
+    )
+    return int(sum(leaf.size for leaf in leaves))
 
 
 def normalizing_flows_fit_auto(chain: np.ndarray,
@@ -442,6 +481,10 @@ def normalizing_flows_fit_auto(chain: np.ndarray,
                                val_frac: float = 0.15,
                                refit_best: bool = True,
                                rng_seed: int = 999,
+                               n_workers: Optional[int] = None,
+                               selection: str = "smallest_comparable",
+                               comparable_sems: float = 1.0,
+                               comparable_nats: float = 0.0,
                                verbose: bool = False,
                                return_table: bool = False,
                                **shared_kwargs):
@@ -452,6 +495,17 @@ def normalizing_flows_fit_auto(chain: np.ndarray,
     flow per candidate configuration, scores each candidate by its mean
     log-density on the held-out samples, and returns the winning configuration
     (by default refit on the full chain).
+
+    **Selection rule.** With the default ``selection="smallest_comparable"``,
+    the winner is the *smallest* model (by trainable parameter count) whose
+    held-out score is statistically comparable to the best score: candidate
+    ``c`` is comparable when ``mean(lp_best - lp_c) <= comparable_sems *
+    sem(lp_best - lp_c) + comparable_nats``, a *paired* test on the shared
+    validation points (much sharper than comparing the individual score
+    error bars). With a clear winner nothing changes; statistical ties are
+    resolved toward parsimony -- fewer parameters, faster fits, less
+    overfitting risk on refits. ``selection="best"`` restores the plain
+    argmax.
 
     The held-out mean log-density estimates ``-H(pi, q)``; maximizing it over
     candidates minimizes ``KL(pi || q)`` up to the (candidate-independent)
@@ -499,11 +553,32 @@ def normalizing_flows_fit_auto(chain: np.ndarray,
     rng_seed : int, optional
         Seed for the split and for every candidate fit (all candidates see
         the identical split, so the comparison is paired). Default 999.
+    n_workers : int, optional
+        Number of candidate fits to run concurrently (in threads; JAX
+        releases the GIL during compiled compute, and these small fits
+        individually underuse the machine). ``None`` (default) uses
+        ``min(len(candidates), os.cpu_count())``; set ``1`` for sequential
+        fitting. Results are identical either way: every candidate's seed
+        and data split are fixed, so execution order cannot change the
+        selection.
+    selection : str, optional
+        ``"smallest_comparable"`` (default): smallest model whose held-out
+        score is within tolerance of the best (see summary above).
+        ``"best"``: plain argmax of the held-out score.
+    comparable_sems : float, optional
+        Tolerance in units of the *paired* standard error of the score
+        difference against the best candidate. Default 1.0 (the classic
+        one-standard-error rule).
+    comparable_nats : float, optional
+        Additional absolute tolerance in nats added to the comparability
+        threshold. Default 0.0. A value like 0.05 declares models within
+        0.05 nats of KL comparable regardless of statistical resolution.
     verbose : bool, optional
         Print one line per candidate. Default False.
     return_table : bool, optional
         If True, return ``(flow, table)`` where ``table`` is a list of dicts
-        with keys ``config``, ``val_logp``, ``sem``, ``selected``.
+        with keys ``config``, ``val_logp``, ``sem``, ``n_params``,
+        ``comparable``, ``selected``.
     **shared_kwargs
         Arguments passed to every candidate fit (e.g. ``prior_bounds``,
         ``copula_space``, ``max_epochs``).
@@ -545,29 +620,75 @@ def normalizing_flows_fit_auto(chain: np.ndarray,
                       {"knots": 8, "flow_layers": 4},
                       {"knots": 8, "flow_layers": 6}]
 
-    table = []
-    best_idx, best_score, best_flow = -1, -np.inf, None
-    for i, cand in enumerate(candidates):
-        kw = {"rng_seed": rng_seed, **shared_kwargs, **cand}
+    if selection not in ("smallest_comparable", "best"):
+        raise ValueError(
+            f"selection must be 'smallest_comparable' or 'best', got {selection!r}."
+        )
+
+    def _fit_and_score(cand):
+        # candidate fits are quiet by default (parallel progress bars garble);
+        # an explicit show_progress in shared_kwargs/candidate still wins.
+        kw = {"rng_seed": rng_seed, "show_progress": False,
+              **shared_kwargs, **cand}
         fl = normalizing_flows_fit(fit_part, **kw)
-        lp = log_prob(fl, val)
-        score = float(np.mean(lp))
-        sem = float(np.std(lp) / np.sqrt(len(lp)))
-        table.append({"config": dict(cand), "val_logp": score, "sem": sem,
-                      "selected": False})
+        lp = np.asarray(log_prob(fl, val))
+        return fl, lp
+
+    if n_workers is None:
+        import os
+        n_workers = max(1, min(len(candidates), os.cpu_count() or 1))
+    if n_workers > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            results = list(ex.map(_fit_and_score, candidates))
+    else:
+        results = [_fit_and_score(c) for c in candidates]
+
+    flows = [fl for fl, _ in results]
+    lps = [lp for _, lp in results]
+    scores = np.array([float(np.mean(lp)) for lp in lps])
+    sems = np.array([float(np.std(lp) / np.sqrt(len(lp))) for lp in lps])
+    sizes = np.array([_n_trainable_params(fl) for fl in flows])
+    best_idx = int(np.argmax(scores))
+
+    # Comparability against the best, as a PAIRED test on the shared
+    # validation points: the per-point score differences are highly
+    # correlated across candidates, so this is far sharper than comparing
+    # the individual +-sem error bars.
+    comparable = np.zeros(len(candidates), dtype=bool)
+    for i, lp in enumerate(lps):
+        diff = lps[best_idx] - lp
+        sem_diff = float(np.std(diff) / np.sqrt(len(diff)))
+        comparable[i] = float(np.mean(diff)) <= (
+            comparable_sems * sem_diff + comparable_nats
+        )
+
+    if selection == "smallest_comparable":
+        pool = np.flatnonzero(comparable)
+        # smallest parameter count; break size ties by score
+        sel_idx = int(pool[np.lexsort((-scores[pool], sizes[pool]))[0]])
+    else:
+        sel_idx = best_idx
+
+    table = []
+    for i, cand in enumerate(candidates):
+        table.append({"config": dict(cand), "val_logp": float(scores[i]),
+                      "sem": float(sems[i]), "n_params": int(sizes[i]),
+                      "comparable": bool(comparable[i]),
+                      "selected": i == sel_idx})
         if verbose:
             print(f"[fit_auto] {i + 1}/{len(candidates)} {cand}: "
-                  f"held-out logp {score:.3f} +- {sem:.3f}")
-        if score > best_score:
-            best_idx, best_score, best_flow = i, score, fl
-    table[best_idx]["selected"] = True
+                  f"held-out logp {scores[i]:.3f} +- {sems[i]:.3f}  "
+                  f"params {sizes[i]}  comparable {bool(comparable[i])}")
 
+    best_flow = flows[sel_idx]
     if refit_best:
-        kw = {"rng_seed": rng_seed, **shared_kwargs, **candidates[best_idx]}
+        kw = {"rng_seed": rng_seed, "show_progress": False,
+              **shared_kwargs, **candidates[sel_idx]}
         best_flow = normalizing_flows_fit(clean, **kw)
     if verbose:
-        print(f"[fit_auto] selected {candidates[best_idx]} "
-              f"(held-out logp {best_score:.3f}"
+        print(f"[fit_auto] selected {candidates[sel_idx]} "
+              f"(held-out logp {scores[sel_idx]:.3f}, {sizes[sel_idx]} params"
               f"{', refit on full chain' if refit_best else ''})")
 
     if return_table:
