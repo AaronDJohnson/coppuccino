@@ -20,7 +20,9 @@ from paramax import non_trainable, unwrap
 from coppuccino.bijections import (
     EmpiricalMarginalToGaussian,
     EmpiricalMarginalToUniform,
+    SmoothMarginalToGaussian,
     make_empirical_cdf_spline,
+    make_smooth_marginal,
 )
 
 __all__ = ["save_flow", "load_flow"]
@@ -57,13 +59,32 @@ def _extract_spline_data(flow: Transformed) -> dict:
         'tail_quantile': [],
         'marginal': [],
         'space': [],
+        'tail_alpha': [],
         'num_dims': 0
     }
 
     if isinstance(transform, Stack):
         spline_data['num_dims'] = len(transform.bijections)
         for bij in transform.bijections:
-            if isinstance(bij, (EmpiricalMarginalToGaussian, EmpiricalMarginalToUniform)):
+            if isinstance(bij, SmoothMarginalToGaussian):
+                # Clip-free smooth-tail marginal: fully determined by
+                # (samples, num_points, prior bounds, tail_alpha).
+                spline_data['space'].append('gaussian')
+                spline_data['marginal'].append('smooth')
+                spline_data['samples'].append(np.array(unwrap(bij.samples)))
+                spline_data['num_points'].append(int(unwrap(bij.num_points)))
+                p_low = unwrap(bij.prior_low)
+                p_high = unwrap(bij.prior_high)
+                spline_data['prior_low'].append(float(p_low) if p_low is not None else None)
+                spline_data['prior_high'].append(float(p_high) if p_high is not None else None)
+                spline_data['tail_alpha'].append(float(unwrap(bij.tail_alpha)))
+                # Unused by this marginal -- inert values keep the parallel
+                # per-dimension lists aligned.
+                spline_data['min_eps'].append(0.0)
+                spline_data['tail_extension'].append(False)
+                spline_data['tail_model'].append('gaussian')
+                spline_data['tail_quantile'].append(0.05)
+            elif isinstance(bij, (EmpiricalMarginalToGaussian, EmpiricalMarginalToUniform)):
                 spline_data['space'].append(
                     'uniform' if isinstance(bij, EmpiricalMarginalToUniform)
                     else 'gaussian'
@@ -93,6 +114,7 @@ def _extract_spline_data(flow: Transformed) -> dict:
                 spline_data['marginal'].append(
                     str(unwrap(getattr(bij, 'marginal', 'pchip')))
                 )
+                spline_data['tail_alpha'].append(0.0)
             else:
                 raise ValueError(f"Unexpected bijection type: {type(bij)}")
     else:
@@ -133,6 +155,22 @@ def _reconstruct_empirical_transforms(spline_data: dict) -> Stack:
         # Default 'gaussian' so models saved before the uniform-copula mode
         # existed reconstruct exactly as they were trained.
         space = spline_data.get('space', ['gaussian'] * spline_data['num_dims'])[i]
+        tail_alpha = spline_data.get('tail_alpha', [0.0] * spline_data['num_dims'])[i]
+
+        if marginal == 'smooth':
+            theta_of_z, z_of_theta, log_dtheta_dz, x_clamps = make_smooth_marginal(
+                samples, num_points=num_points,
+                prior_low=prior_low, prior_high=prior_high,
+                tail_alpha=tail_alpha,
+            )
+            empirical_transforms.append(non_trainable(SmoothMarginalToGaussian(
+                samples, theta_of_z, z_of_theta, log_dtheta_dz,
+                num_points=num_points,
+                prior_low=prior_low, prior_high=prior_high,
+                tail_alpha=tail_alpha,
+                x_clamp_lo=x_clamps[0], x_clamp_hi=x_clamps[1],
+            )))
+            continue
 
         _, cdf_fn, quantile_fn, pdf_fn = make_empirical_cdf_spline(
             samples, num_points=num_points, min_eps=min_eps,

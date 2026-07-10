@@ -15,7 +15,9 @@ from equinox import filter_jit
 
 from coppuccino.bijections import EmpiricalMarginalToGaussian
 from coppuccino.bijections import EmpiricalMarginalToUniform
+from coppuccino.bijections import SmoothMarginalToGaussian
 from coppuccino.bijections import make_empirical_cdf_spline
+from coppuccino.bijections import make_smooth_marginal
 
 __all__ = [
     "normalizing_flows_fit", "normalizing_flows_fit_auto",
@@ -86,7 +88,8 @@ def _create_empirical_transforms(samples: np.ndarray, min_eps: float = 1e-7,
                                   tail_model: str = "gaussian",
                                   tail_quantile: float = 0.05,
                                   marginal: str = "rqs",
-                                  copula_space: str = "uniform"):
+                                  copula_space: str = "uniform",
+                                  tail_alpha: float = 0.0):
     """
     Create empirical marginal transforms for copula modeling.
 
@@ -163,6 +166,26 @@ def _create_empirical_transforms(samples: np.ndarray, min_eps: float = 1e-7,
         if len(param_samples) > _MIN_SAMPLES_PER_DIM:
             p_low = float(prior_bounds[j, 0]) if prior_bounds is not None else None
             p_high = float(prior_bounds[j, 1]) if prior_bounds is not None else None
+            if marginal == "smooth":
+                # clip-free diffeomorphism z in R <-> theta in (lo, hi):
+                # no CDF clip, no quantile clamp (no boundary sample atoms),
+                # no floored wall density (no cliffs); honest analytic tails.
+                # A non-finite bound means unbounded on that side.
+                if p_low is not None and not np.isfinite(p_low):
+                    p_low = None
+                if p_high is not None and not np.isfinite(p_high):
+                    p_high = None
+                theta_of_z, z_of_theta, log_dtheta_dz, x_clamps = \
+                    make_smooth_marginal(
+                        param_samples, num_points=num_points,
+                        prior_low=p_low, prior_high=p_high,
+                        tail_alpha=tail_alpha)
+                empirical_transforms.append(non_trainable(SmoothMarginalToGaussian(
+                    param_samples, theta_of_z, z_of_theta, log_dtheta_dz,
+                    num_points=num_points, prior_low=p_low, prior_high=p_high,
+                    tail_alpha=tail_alpha,
+                    x_clamp_lo=x_clamps[0], x_clamp_hi=x_clamps[1])))
+                continue
             _, cdf_fn, quantile_fn, pdf_fn = make_empirical_cdf_spline(
                 param_samples, num_points=num_points, min_eps=min_eps,
                 tail_extension=tail_extension, prior_low=p_low, prior_high=p_high,
@@ -282,8 +305,9 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
                           prior_bounds: Optional[np.ndarray] = None,
                           tail_model: str = "gaussian",
                           tail_quantile: float = 0.05,
-                          marginal: str = "rqs",
+                          marginal: Optional[str] = None,
                           copula_space: str = "uniform",
+                          tail_alpha: float = 0.0,
                           weight_decay: float = 0.0,
                           show_progress: bool = True) -> Transformed:
     """
@@ -307,15 +331,19 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
       flows with ``prior_bounds``. Requires ``marginal="rqs"`` and no tail
       model (bounded support: the fitted flow's support is the prior box when
       ``prior_bounds`` is given, else the observed data range).
-    * ``"gaussian"`` (legacy): marginals are Gaussianized (``z = ndtri(F(x))``)
-      and the copula is a triangular spline flow over a normal base on
-      unbounded space, with tanh clipping (``tanh_max_val``). Required for the
-      tail models (``tail_extension=True`` / ``tail_model="gpd"``), i.e. for
-      modeling beyond the observed data range on unbounded parameters. Its
-      sample stream and reported density can disagree in slivers at hard
-      support boundaries (boundary sample atoms over a wall density cliff),
-      which biases boundary-adjacent estimates and can absorb independence-MCMC
-      walkers -- prefer the default for bounded problems.
+    * ``"gaussian"``: marginals map to Gaussian space and the copula is a
+      triangular spline flow over a normal base -- the strongest choice for
+      heavily correlated posteriors (the affine layer captures near-linear
+      dependence). With the default ``marginal="smooth"`` the marginal map is
+      a clip-free diffeomorphism of all of R onto the support (RQS bulk +
+      analytic tails): no boundary sample atoms, no wall density cliffs, and
+      honest smoothly-decaying densities for outliers / beyond-data queries
+      (``tail_alpha`` sets Gaussian vs heavier tails on unbounded sides). The
+      legacy clipped marginals remain available as ``marginal="rqs"`` /
+      ``"pchip"`` (required for ``tail_extension`` / ``tail_model="gpd"``);
+      they can disagree between sample stream and reported density in slivers
+      at hard support boundaries, which can absorb independence-MCMC
+      walkers.
 
     The approach combines flexibility in modeling marginals (via empirical CDFs)
     with powerful dependency modeling (via normalizing flows).
@@ -376,6 +404,17 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
         approximate inverses of each other. Prefer ``"rqs"`` (better self-
         consistency at equal cost and fit quality); ``"pchip"`` is retained for
         backward compatibility and reproducing older fits.
+
+        Default ``None`` resolves per pipeline: ``"rqs"`` (exact unit-range
+        spline) for ``copula_space="uniform"``, ``"smooth"`` (clip-free
+        smooth-tail diffeomorphism; see
+        :func:`coppuccino.bijections.make_smooth_marginal`) for
+        ``copula_space="gaussian"``.
+    tail_alpha : float, optional
+        Tail heaviness for ``marginal="smooth"`` on *unbounded* sides (no
+        prior bound given): 0.0 (default) gives Gaussian tails; larger values
+        give progressively heavier tails. Bounded sides always use the
+        exponential wall-approach tails. Ignored by other marginals.
     copula_space : str, optional
         ``"uniform"`` (default) or ``"gaussian"`` -- see the summary above.
         ``"uniform"`` requires ``marginal="rqs"``, ``tail_extension=False`` and
@@ -431,6 +470,19 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
     The triangular spline flow uses autoregressive transformations that are
     particularly efficient for capturing dependencies in high-dimensional data.
     """
+    if marginal is None:
+        # per-pipeline default: the uniform mode's exact unit-range spline, or
+        # the gaussian mode's clip-free smooth-tail marginal. The legacy tail
+        # models pre-date the smooth marginal and still need the legacy spline
+        # family, so requesting them resolves to it (old code keeps working).
+        if copula_space == "uniform" or tail_extension or tail_model == "gpd":
+            marginal = "rqs"
+        else:
+            marginal = "smooth"
+    if marginal not in ("pchip", "rqs", "smooth"):
+        raise ValueError(
+            f"marginal must be 'pchip', 'rqs' or 'smooth', got {marginal!r}")
+
     if copula_space == "uniform":
         # Friendly guards: the low-level spline construction would also raise,
         # but these name the actionable fix at the API the user called.
@@ -441,14 +493,18 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
                 "copula_space='gaussian'. The default 'uniform' pipeline models "
                 "bounded support exactly (boundary-safe) and has no tails."
             )
-        if marginal not in ("pchip", "rqs"):
-            raise ValueError(f"marginal must be 'pchip' or 'rqs', got {marginal!r}")
-        if marginal == "pchip":
+        if marginal != "rqs":
             raise ValueError(
                 "copula_space='uniform' requires marginal='rqs' (a single "
-                "self-consistent spline). Use marginal='rqs' (default), or pass "
-                "copula_space='gaussian' to keep the legacy pipeline with "
-                "marginal='pchip'."
+                "self-consistent unit-range spline). 'smooth' and 'pchip' are "
+                "gaussian-space marginals: pass copula_space='gaussian'."
+            )
+    else:
+        if marginal == "smooth" and (tail_extension or tail_model == "gpd"):
+            raise ValueError(
+                "marginal='smooth' models tails natively (see tail_alpha) and "
+                "is incompatible with tail_extension=True / tail_model='gpd'. "
+                "Use the legacy marginal='rqs' or 'pchip' for those code paths."
             )
 
     key = jr.key(rng_seed)
@@ -469,7 +525,7 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
         clean_chain, num_points=num_points, tail_extension=tail_extension,
         prior_bounds=prior_bounds,
         tail_model=tail_model, tail_quantile=tail_quantile,
-        marginal=marginal, copula_space=copula_space)
+        marginal=marginal, copula_space=copula_space, tail_alpha=tail_alpha)
 
     n_params = clean_chain.shape[1]
     arch = None
@@ -735,12 +791,52 @@ def normalizing_flows_fit_auto(chain: np.ndarray,
     return best_flow
 
 
+def _smooth_clamp_limits(flow) -> Optional[tuple[np.ndarray, np.ndarray]]:
+    """Per-dimension tail-clamp x limits of a smooth-marginal flow.
+
+    Returns ``(los, his)`` arrays (``-inf``/``+inf`` where not applicable),
+    or None when the flow has no smooth marginals (no rejection needed).
+    """
+    bijection = getattr(flow, "bijection", None)
+    if not isinstance(bijection, Stack):
+        return None
+    from paramax import unwrap
+    los, his, found = [], [], False
+    for b in bijection.bijections:
+        m = unwrap(b)
+        if isinstance(m, SmoothMarginalToGaussian):
+            found = True
+            los.append(m.x_clamp_lo if m.x_clamp_lo is not None else -np.inf)
+            his.append(m.x_clamp_hi if m.x_clamp_hi is not None else np.inf)
+        else:
+            los.append(-np.inf)
+            his.append(np.inf)
+    if not found:
+        return None
+    return np.asarray(los), np.asarray(his)
+
+
+def _clamped_rows(samples: np.ndarray, limits) -> np.ndarray:
+    los, his = limits
+    return np.any((samples <= los[None, :]) | (samples >= his[None, :]), axis=1)
+
+
+_MAX_REDRAW_ROUNDS = 50
+
+
 def sample(flow: Transformed, n_samples: int, rng_seed: Optional[int] = None) -> np.ndarray:
     """
     Generate samples from a fitted copula flow.
 
     Draws random samples from the learned distribution by sampling from the
     base Gaussian distribution and transforming through the trained flow.
+
+    For smooth-marginal flows (``copula_space="gaussian"``, the default
+    ``marginal="smooth"``), rows whose bounded tails saturated at the float64
+    wall-resolution limit are redrawn (typically well under 1% of draws).
+    The emitted stream is then the reported density truncated to the
+    clamp-free region and renormalized -- a constant that cancels in MH
+    ratios -- so there are no near-boundary sample lumps.
 
     Parameters
     ----------
@@ -776,11 +872,28 @@ def sample(flow: Transformed, n_samples: int, rng_seed: Optional[int] = None) ->
     will be slower due to compilation overhead (~0.5s), but subsequent calls
     will be much faster (~2-5x speedup).
     """
-    sample_shape = (n_samples,)
     key = jr.key(_resolve_seed(rng_seed))
     # Use filter_jit for improved performance
-    samples = filter_jit(flow.sample)(key, sample_shape)
-    return np.array(samples)
+    samples = np.array(filter_jit(flow.sample)(key, (n_samples,)))
+    limits = _smooth_clamp_limits(flow)
+    if limits is not None:
+        for _ in range(_MAX_REDRAW_ROUNDS):
+            bad = _clamped_rows(samples, limits)
+            if not bad.any():
+                break
+            m = int(bad.sum())
+            # draw in power-of-two blocks to bound JIT recompilations
+            block = min(1 << (m - 1).bit_length(), n_samples)
+            key, sub = jr.split(key)
+            samples[bad] = np.array(
+                filter_jit(flow.sample)(sub, (block,)))[:m]
+        else:
+            warnings.warn(
+                "sample(): tail-clamped rows persisted after "
+                f"{_MAX_REDRAW_ROUNDS} redraw rounds; returning the last "
+                "draw. The flow's z-tails are extremely heavy relative to "
+                "the bounded support.")
+    return samples
 
 
 def log_prob(flow: Transformed, samples: np.ndarray) -> np.ndarray:
@@ -862,7 +975,27 @@ def sample_and_log_prob(flow: Transformed, n_samples: int, rng_seed: Optional[in
     >>> # Use for importance sampling weights
     >>> weights = np.exp(log_probs)
     """
-    sample_shape = (n_samples,)
     key = jr.key(_resolve_seed(rng_seed))
-    samples, log_probs = filter_jit(flow.sample_and_log_prob)(key, sample_shape)
-    return np.array(samples), np.array(log_probs)
+    samples, log_probs = filter_jit(flow.sample_and_log_prob)(key, (n_samples,))
+    samples, log_probs = np.array(samples), np.array(log_probs)
+    limits = _smooth_clamp_limits(flow)
+    if limits is not None:
+        # redraw tail-clamped rows (see `sample`); the returned density is
+        # then exactly log_prob(samples) for every emitted row
+        for _ in range(_MAX_REDRAW_ROUNDS):
+            bad = _clamped_rows(samples, limits)
+            if not bad.any():
+                break
+            m = int(bad.sum())
+            block = min(1 << (m - 1).bit_length(), n_samples)
+            key, sub = jr.split(key)
+            s_new, lp_new = filter_jit(flow.sample_and_log_prob)(sub, (block,))
+            samples[bad] = np.array(s_new)[:m]
+            log_probs[bad] = np.array(lp_new)[:m]
+        else:
+            warnings.warn(
+                "sample_and_log_prob(): tail-clamped rows persisted after "
+                f"{_MAX_REDRAW_ROUNDS} redraw rounds; returning the last "
+                "draw. The flow's z-tails are extremely heavy relative to "
+                "the bounded support.")
+    return samples, log_probs

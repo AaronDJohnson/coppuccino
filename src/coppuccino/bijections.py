@@ -7,8 +7,10 @@ from jax.scipy.special import ndtri, ndtr
 
 __all__ = [
     "make_empirical_cdf_spline",
+    "make_smooth_marginal",
     "EmpiricalMarginalToGaussian",
     "EmpiricalMarginalToUniform",
+    "SmoothMarginalToGaussian",
 ]
 
 # Numerical floors, named so the intent is explicit at each use site.
@@ -158,7 +160,7 @@ def _gpd_quantile(p, xi, sigma, xi_eps=1e-6):
     )
 
 
-def _rqs_bulk(xg, cdf_vals):
+def _rqs_bulk(xg, cdf_vals, edge_slope_floor=0.0):
     """Build closed-form monotone rational-quadratic spline (RQS) callables.
 
     Returns ``(cdf, inverse, deriv)`` callables over the bulk knots, matching the
@@ -179,6 +181,14 @@ def _rqs_bulk(xg, cdf_vals):
         Strictly sorted bulk knot locations (CDF domain).
     cdf_vals : array_like
         Strictly increasing CDF values at ``xg``.
+    edge_slope_floor : float, optional
+        If positive, floor the two *endpoint* knot derivatives at this
+        fraction of their end-bin secant slope. PCHIP's endpoint rule can
+        return exactly 0 there (one-sided estimate clamped on sign change),
+        which is fatal for callers that extend tails from the boundary slope
+        (:func:`make_smooth_marginal`): the C^1-matched tail rate collapses
+        to the generic ``_POS_FLOOR`` and the tail map degenerates. The
+        default 0.0 preserves the legacy behavior exactly.
 
     Returns
     -------
@@ -196,6 +206,12 @@ def _rqs_bulk(xg, cdf_vals):
     # PCHIP slopes at the knots — monotone by construction, strictly positive
     # floor so they can sit in RQS denominators without dividing by zero.
     dk = np.maximum(_ScipyPchip(xk, yk).derivative()(xk), _POS_FLOOR)
+    if edge_slope_floor > 0.0:
+        # rescue PCHIP's zeroed endpoint derivatives (see docstring); the RQS
+        # stays monotone for any positive knot derivatives
+        sec = np.diff(yk) / np.diff(xk)
+        dk[0] = max(dk[0], edge_slope_floor * sec[0])
+        dk[-1] = max(dk[-1], edge_slope_floor * sec[-1])
 
     xk_j, yk_j, dk_j = jnp.asarray(xk), jnp.asarray(yk), jnp.asarray(dk)
     w = xk_j[1:] - xk_j[:-1]
@@ -890,3 +906,281 @@ class EmpiricalMarginalToUniform(AbstractBijection):
         x = self.quantile_fn(u)
         log_det = -jnp.log(self.pdf_fn(x))
         return x, jnp.sum(log_det)
+
+
+# ----------------------------------------------------------------------
+# Smooth-tail marginals: a true diffeomorphism z in R  <->  theta in (lo, hi)
+# ----------------------------------------------------------------------
+
+def make_smooth_marginal(samples: np.ndarray,
+                         num_points: int = 200,
+                         prior_low: Optional[float] = None,
+                         prior_high: Optional[float] = None,
+                         tail_alpha: float = 0.0):
+    """Build a clip-free marginal map ``theta(z)``: all of R onto the support.
+
+    The map is a single monotone C^1 object evaluated consistently in both
+    directions (forward, inverse and log-derivative share one
+    parameterization), so the flow's sample stream and its reported density
+    agree everywhere -- including arbitrarily deep in the tails. This removes
+    the legacy Gaussianized pipeline's boundary pathologies at their root:
+    there is no CDF clip, no quantile clamp (hence no boundary sample atom)
+    and no floored wall density (hence no density cliff).
+
+    Construction:
+
+    * **Bulk**: knots at the data quantiles ``theta_j`` paired with
+      ``z_j = ndtri(p_j)`` at Hazen plotting positions -- all finite -- joined
+      by the closed-form monotone rational-quadratic spline (PCHIP slopes).
+    * **Tails** beyond the outermost knots:
+        - *bounded side* (prior bound given): exponential approach to the
+          wall, ``theta = lo + (theta_1 - lo) exp(c (z - z_1))`` with the
+          slope matched at the join (C^1); the wall is reached only as
+          ``z -> -inf``, so every finite flow output lands strictly inside
+          the prior.
+        - *unbounded side*: ``dtheta/dz = m exp(alpha |z - z_edge|)`` --
+          ``tail_alpha = 0`` gives a linear map (Gaussian tails in theta);
+          ``tail_alpha > 0`` gives progressively heavier tails. Density
+          queries and samples beyond the observed data range are therefore
+          honest and smooth (outlier handling), replacing the legacy
+          ``tail_extension``/GPD branches.
+
+    Returns
+    -------
+    theta_of_z, z_of_theta, log_dtheta_dz : callables (jnp-vectorized)
+    x_clamps : tuple of (float or None, float or None)
+        Saturation x values of the bounded tails at the float64 resolution
+        limit (None on unbounded sides). ``theta_of_z`` returns exactly these
+        floats for z at/beyond the corresponding clamp; the sampling layer
+        redraws such rows (see ``coppuccino.copula_flows.sample``) so the
+        emitted stream matches the reported density everywhere.
+    """
+    from scipy.interpolate import PchipInterpolator as _Pchip  # noqa: F401
+    from scipy.special import ndtri as _ndtri
+
+    x = np.asarray(samples, dtype=float)
+    x = x[~np.isnan(x)]
+    n = len(x)
+    num_points = max(20, min(num_points, n // 3))
+    if tail_alpha < 0:
+        raise ValueError(f"tail_alpha must be >= 0, got {tail_alpha}.")
+    # a non-finite bound means "unbounded on that side"
+    if prior_low is not None and not np.isfinite(prior_low):
+        prior_low = None
+    if prior_high is not None and not np.isfinite(prior_high):
+        prior_high = None
+
+    # scale for the strictly-inside boundary clip
+    lo_ref = prior_low if prior_low is not None else float(np.min(x))
+    hi_ref = prior_high if prior_high is not None else float(np.max(x))
+    span = max(hi_ref - lo_ref, _POS_FLOOR)
+    # Boundary-atom-aware inset. Samples sitting exactly at (or within the
+    # clip margin of) a bound -- e.g. reflection/in-bounds artifacts of a
+    # bounded MCMC run -- are placed at half the gap to the first distinct
+    # interior value rather than at the raw clip margin. The atom's mass
+    # then becomes a *resolvable* smooth shoulder: the first knot offset is
+    # comparable to the first bin width, so the tail rate c = m/offset stays
+    # O(1/dz) instead of exploding and clamping away the whole tail region.
+    eps0 = 1e-9 * span
+    if prior_low is not None:
+        at_lo = x <= prior_low + eps0
+        if at_lo.any() and (~at_lo).any():
+            gap = float(np.min(x[~at_lo])) - prior_low
+            x[at_lo] = prior_low + float(np.clip(0.5 * gap, eps0, 0.01 * span))
+        else:
+            x = np.maximum(x, prior_low + eps0)
+    if prior_high is not None:
+        at_hi = x >= prior_high - eps0
+        if at_hi.any() and (~at_hi).any():
+            gap = prior_high - float(np.max(x[~at_hi]))
+            x[at_hi] = prior_high - float(np.clip(0.5 * gap, eps0, 0.01 * span))
+        else:
+            x = np.minimum(x, prior_high - eps0)
+    xs = np.sort(x)
+
+    # theta knots at *distinct* data quantiles. Tied values (MCMC-rejection
+    # duplicates, boundary reflection atoms, ...) must NOT become multiple
+    # knots separated by artificial bumps: that makes theta(z) effectively
+    # constant across the tie block's whole z-span -- a non-invertible
+    # plateau where the sampled point can no longer report its own density.
+    # One knot per distinct value, carrying the full Hazen mass of its ties,
+    # keeps the map a true diffeomorphism: a data atom becomes a steep but
+    # smooth (and exactly invertible) segment over the real gap to its
+    # neighbors, and a boundary tie block's mass flows into the analytic
+    # tail -- the closest absolutely-continuous statement of an atom.
+    thq = np.quantile(xs, np.linspace(0.0, 1.0, num_points))
+    # one knot per distinct Hazen count: drops both tied-value knots and
+    # interpolated knots that fall between the same adjacent data values
+    counts, keep = np.unique(np.searchsorted(xs, thq, side="right"),
+                             return_index=True)
+    thq = thq[keep]
+    if len(thq) < 2:
+        raise ValueError(
+            "make_smooth_marginal needs at least two distinct sample values.")
+    p = np.clip((counts - 0.5) / n, 0.5 / n, 1.0 - 0.5 / n)
+    zq = _ndtri(p)
+
+    # bulk: closed-form monotone RQS on (z, theta) knots -- one
+    # parameterization supplies forward, inverse and derivative. The edge
+    # slope floor keeps the join slopes m1/mK (and hence the tail rates)
+    # non-degenerate when PCHIP's endpoint rule returns 0.
+    bulk_theta, bulk_z, bulk_deriv = _rqs_bulk(zq, thq, edge_slope_floor=0.05)
+
+    z1, zK = float(zq[0]), float(zq[-1])
+    th1, thK = float(thq[0]), float(thq[-1])
+    m1 = float(np.maximum(np.asarray(bulk_deriv(jnp.asarray(z1))), _POS_FLOOR))
+    mK = float(np.maximum(np.asarray(bulk_deriv(jnp.asarray(zK))), _POS_FLOOR))
+
+    # tail rate constants (build-time Python branching: these are static)
+    cL = m1 / (th1 - prior_low) if prior_low is not None else None
+    cR = mK / (prior_high - thK) if prior_high is not None else None
+    aL = aR = float(tail_alpha)
+    _EXP_MAX = 700.0  # exp overflow guard for values that get where()-selected away
+    # Smallest wall offset the tails may produce/resolve, per side. Below
+    # ~ULP(|bound|) the float addition ``bound + tiny`` absorbs to the bound
+    # exactly -- an exact-wall sample atom. Clamping the forward tail there
+    # (with the inverse's ratio floor and the log-derivative clip sharing the
+    # same constant, so all three directions agree at the clamp point)
+    # relocates that unrepresentable mass to a strictly-interior point whose
+    # reported density is high, so walkers there escape rather than absorb.
+    # rf_log_* is the log of the clamped tail ratio (theta offset / knot
+    # offset); the -_EXP_MAX cap doubles as the exp overflow guard.
+    def _rf_log(bound, knot_offset):
+        eps = min(4.0 * float(np.spacing(abs(bound))) + 1e-30 * span,
+                  1e-10 * span)
+        return max(float(np.log(eps / knot_offset)), -_EXP_MAX)
+
+    rf_log_L = _rf_log(prior_low, th1 - prior_low) if cL is not None else None
+    rf_log_R = _rf_log(prior_high, prior_high - thK) if cR is not None else None
+
+    def theta_of_z(z):
+        z = jnp.asarray(z)
+        bulk = bulk_theta(jnp.clip(z, z1, zK))
+        dzl = jnp.minimum(z - z1, 0.0)
+        if cL is not None:
+            # exponent floor at rf_log_L: even astronomically negative z
+            # lands strictly inside the support (no exact-wall atom, ever)
+            left = prior_low + (th1 - prior_low) * jnp.exp(
+                jnp.maximum(cL * dzl, rf_log_L))
+        elif aL > 0:
+            left = th1 + (m1 / aL) * (1.0 - jnp.exp(jnp.minimum(-aL * dzl, _EXP_MAX)))
+        else:
+            left = th1 + m1 * dzl
+        dzr = jnp.maximum(z - zK, 0.0)
+        if cR is not None:
+            right = prior_high - (prior_high - thK) * jnp.exp(
+                jnp.maximum(-cR * dzr, rf_log_R))
+        elif aR > 0:
+            right = thK + (mK / aR) * (jnp.exp(jnp.minimum(aR * dzr, _EXP_MAX)) - 1.0)
+        else:
+            right = thK + mK * dzr
+        return jnp.where(z < z1, left, jnp.where(z > zK, right, bulk))
+
+    # z beyond these build-time constants maps onto the tail clamp, so the
+    # claimed log-derivative is evaluated at the clamp (a function of the
+    # *output point*, matching what z_of_theta reconstructs there)
+    z_clamp_lo = z1 + rf_log_L / cL if cL is not None else -np.inf
+    z_clamp_hi = zK - rf_log_R / cR if cR is not None else np.inf
+
+    def log_dtheta_dz(z):
+        z = jnp.clip(jnp.asarray(z), z_clamp_lo, z_clamp_hi)
+        bulk = jnp.log(jnp.maximum(bulk_deriv(jnp.clip(z, z1, zK)), _POS_FLOOR))
+        dzl = jnp.minimum(z - z1, 0.0)
+        left = (jnp.log(m1) + cL * dzl) if cL is not None else (jnp.log(m1) - aL * dzl)
+        dzr = jnp.maximum(z - zK, 0.0)
+        right = (jnp.log(mK) - cR * dzr) if cR is not None else (jnp.log(mK) + aR * dzr)
+        return jnp.where(z < z1, left, jnp.where(z > zK, right, bulk))
+
+    def z_of_theta(theta):
+        theta = jnp.asarray(theta)
+        bulk = bulk_z(jnp.clip(theta, th1, thK))
+        if cL is not None:
+            # ratio floor matches the forward clamp: inverse(theta_of_z(z))
+            # is exact down to the clamp, and wall-or-deeper queries report
+            # the clamp point's (high) density rather than exploding
+            ratio = jnp.maximum((theta - prior_low) / (th1 - prior_low),
+                                np.exp(rf_log_L))
+            left = z1 + jnp.log(ratio) / cL
+        elif aL > 0:
+            arg = jnp.maximum(1.0 + aL * (th1 - theta) / m1, 1e-300)
+            left = z1 - jnp.log(arg) / aL
+        else:
+            left = z1 + (theta - th1) / m1
+        if cR is not None:
+            ratio = jnp.maximum((prior_high - theta) / (prior_high - thK),
+                                np.exp(rf_log_R))
+            right = zK - jnp.log(ratio) / cR
+        elif aR > 0:
+            arg = jnp.maximum(1.0 + aR * (theta - thK) / mK, 1e-300)
+            right = zK + jnp.log(arg) / aR
+        else:
+            right = zK + (theta - thK) / mK
+        return jnp.where(theta < th1, left, jnp.where(theta > thK, right, bulk))
+
+    # x values the clamped tails saturate at (metadata for the sampling-layer
+    # rejection): the forward map returns exactly these floats for z at or
+    # beyond the clamp, so `x <= x_clamp_lo` / `x >= x_clamp_hi` identifies
+    # clamped draws by comparison alone.
+    x_clamp_lo = (float(prior_low + (th1 - prior_low) * np.exp(rf_log_L))
+                  if cL is not None else None)
+    x_clamp_hi = (float(prior_high - (prior_high - thK) * np.exp(rf_log_R))
+                  if cR is not None else None)
+
+    return theta_of_z, z_of_theta, log_dtheta_dz, (x_clamp_lo, x_clamp_hi)
+
+
+class SmoothMarginalToGaussian(AbstractBijection):
+    """Clip-free marginal bijection between data space and Gaussian space.
+
+    Wraps the closures from :func:`make_smooth_marginal`. Unlike
+    :class:`EmpiricalMarginalToGaussian` there is no probability-integral /
+    inverse-normal composition with clipped endpoints: the map ``theta(z)``
+    is one analytic monotone object (RQS bulk + analytic tails), so the
+    sampling direction and the density direction agree to machine precision
+    everywhere. Consequences:
+
+    * no boundary sample atoms (every finite ``z`` maps strictly inside the
+      support) and no wall density cliffs -- the density decays *smoothly*
+      toward a prior bound at exactly the rate the sampler rarifies;
+    * honest densities for outliers / out-of-data-range queries, with
+      Gaussian (``tail_alpha = 0``) or heavier (``tail_alpha > 0``) tails on
+      unbounded sides.
+
+    One caveat at the float64 resolution limit: wall offsets below a few ULP
+    of a nonzero bound are not representable, so the forward tail saturates
+    at ``x_clamp_lo`` / ``x_clamp_hi``. The trained copula flow's linear
+    extrapolation tails can reach such z with non-negligible probability, so
+    the sampling entry points (:func:`coppuccino.copula_flows.sample` and
+    ``sample_and_log_prob``) redraw any row that lands on a clamp value.
+    The emitted stream is then the reported density truncated to the
+    clamp-free region and renormalized -- a constant factor that cancels in
+    Metropolis-Hastings ratios, leaving no boundary lumps and no absorbing
+    states. MCMC code should evaluate proposal densities via ``log_prob``
+    for both old and new points -- Eryn's ``FlowMove`` does.
+
+    Trailing attributes are reconstruction metadata for
+    :mod:`coppuccino.model_io`.
+    """
+    samples: np.ndarray
+    theta_of_z: Callable
+    z_of_theta: Callable
+    log_dtheta_dz_fn: Callable
+    num_points: int = 200
+    prior_low: Optional[float] = None
+    prior_high: Optional[float] = None
+    tail_alpha: float = 0.0
+    x_clamp_lo: Optional[float] = None
+    x_clamp_hi: Optional[float] = None
+    marginal: str = "smooth"
+    cond_shape: ClassVar[None] = None
+    shape: ClassVar[tuple[int, ...]] = ()
+
+    def transform_and_log_det(self, z, condition=None):
+        """Gaussian space -> data space (sampling direction)."""
+        x = self.theta_of_z(z)
+        return x, jnp.sum(self.log_dtheta_dz_fn(z))
+
+    def inverse_and_log_det(self, x, condition=None):
+        """Data space -> Gaussian space (training/density direction)."""
+        z = self.z_of_theta(x)
+        return z, -jnp.sum(self.log_dtheta_dz_fn(z))
