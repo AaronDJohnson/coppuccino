@@ -21,6 +21,7 @@ from coppuccino.copula_flows import (
 from coppuccino.model_io import save_flow, load_flow
 from coppuccino.hdr import compute_injection_hdr, check_in_support
 from coppuccino.fleet import normalizing_flows_fit_fleet, FleetFlow
+from coppuccino.calibration import calibrate_edge_bins
 
 __all__ = [
     "normalizing_flows_fit",
@@ -31,6 +32,7 @@ __all__ = [
     "sample_and_log_prob",
     "CopulaFlow",
     "FleetFlow",
+    "calibrate_edge_bins",
     "save_flow",
     "load_flow",
     "compute_injection_hdr",

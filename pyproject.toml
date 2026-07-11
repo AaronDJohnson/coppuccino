@@ -105,7 +105,7 @@ check_untyped_defs = false
 # AbstractBijection base. Relax only the error codes those idioms trigger, and
 # only in the modules that touch them — the rest is still fully checked.
 [[tool.mypy.overrides]]
-module = "coppuccino.bijections"
+module = ["coppuccino.bijections", "coppuccino.calibration"]
 disable_error_code = ["misc"]
 
 [[tool.mypy.overrides]]

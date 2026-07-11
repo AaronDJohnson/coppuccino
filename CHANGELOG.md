@@ -4,6 +4,18 @@ All notable changes to **coppuccino** are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Experimental `calibrate_edge_bins()` post-fit calibration for smooth
+  Gaussian-space flows. It corrects selected marginal edge-bin CDF boundaries
+  with compact monotone splines while leaving a central region and the fitted
+  rank copula unchanged. A Wilson/ESS-aware minimum-change gate leaves compatible
+  tails untouched and rejects under-resolved calibration unless explicitly
+  forced. Calibrated models retain consistent sampling, `log_prob`, and save/load
+  behavior.
+
 ## [1.1.0] — 2026-07-05
 
 ### Changed
