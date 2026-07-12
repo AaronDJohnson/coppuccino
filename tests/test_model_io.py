@@ -299,10 +299,11 @@ class TestExtractSplineData:
             assert len(samples.shape) == 1  # 1D array per dimension
 
     def test_min_eps_is_float(self):
-        """Test that min_eps values are floats."""
+        """min_eps metadata of the legacy (non-smooth) marginals are floats."""
         np.random.seed(42)
         chain = np.random.randn(200, 2)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
+        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2,
+                                     copula_space="uniform")
 
         spline_data = _extract_spline_data(flow)
 
@@ -422,7 +423,7 @@ class TestSaveLoadWithNonDefaultParams:
             os.unlink(path)
 
     @pytest.mark.parametrize("marginal,expected", [
-        (None, "rqs"),       # default
+        (None, "smooth"),    # default (gaussian pipeline, v3.0)
         ("rqs", "rqs"),
         ("pchip", "pchip"),
     ])

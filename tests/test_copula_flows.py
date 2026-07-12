@@ -20,11 +20,19 @@ def _marginal_families(flow):
 class TestMarginalSelection:
     """Test the marginal='rqs'|'pchip' choice on normalizing_flows_fit."""
 
-    def test_default_marginal_is_rqs(self):
-        """normalizing_flows_fit defaults to the RQS marginal."""
+    def test_default_marginal_is_smooth(self):
+        """normalizing_flows_fit defaults to the gaussian pipeline's smooth marginal."""
         np.random.seed(42)
         chain = np.random.randn(200, 3)
         flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
+        assert _marginal_families(flow) == ["smooth", "smooth", "smooth"]
+
+    def test_uniform_pipeline_marginal_is_rqs(self):
+        """The uniform pipeline resolves the default marginal to RQS."""
+        np.random.seed(42)
+        chain = np.random.randn(200, 3)
+        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2,
+                                     copula_space="uniform")
         assert _marginal_families(flow) == ["rqs", "rqs", "rqs"]
 
     def test_pchip_marginal_is_selectable(self):

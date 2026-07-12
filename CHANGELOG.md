@@ -4,6 +4,38 @@ All notable changes to **coppuccino** are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] — 2026-07-11
+
+### Changed
+
+- **BREAKING: the Gaussian pipeline's default marginal is the new smooth-tail
+  diffeomorphism (`marginal="smooth"`)**, replacing the clipped PCHIP/RQS
+  spline pair. Each marginal is a single clip-free monotone map of all of R
+  onto the support (spline bulk at data quantiles + analytic tails), so the
+  fitted flow produces no exact-bound sample atoms, no wall density cliffs,
+  and sample/`log_prob` agreement to float precision — the properties that
+  make it safe as an independence-MCMC proposal at hard prior bounds. Bounded
+  sides approach walls exponentially (C1-matched to the bulk); unbounded
+  sides expose `tail_alpha` (0 = Gaussian tails, larger = heavier) for
+  outlier tolerance. Draws that would saturate the float64 wall-resolution
+  limit are redrawn by `sample`/`sample_and_log_prob` (a constant that
+  cancels in Metropolis-Hastings ratios). The legacy marginals remain
+  available as `marginal="rqs"`/`"pchip"` and are auto-selected when the
+  legacy tail models (`tail_extension`, `tail_model="gpd"`) are requested.
+
+### Added
+
+- `copula_space="uniform"`: cube-native pipeline — exact unit-range PIT
+  marginals plus an RQS coupling flow over a uniform base on the unit box;
+  boundary-exact by construction and the natural choice when
+  weakly-constrained, flat-to-the-wall marginals dominate.
+- `normalizing_flows_fit_auto`: held-out-likelihood model selection with
+  parallel candidate fits and smallest-comparable selection.
+- `normalizing_flows_fit_fleet` / `FleetFlow`: vmapped simultaneous
+  per-source fits for large catalogs.
+- `weight_decay` and `show_progress` fit options; save/load support for all
+  new model types.
+
 ## [1.1.0] — 2026-07-05
 
 ### Changed

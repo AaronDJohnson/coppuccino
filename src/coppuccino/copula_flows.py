@@ -88,7 +88,7 @@ def _create_empirical_transforms(samples: np.ndarray, min_eps: float = 1e-7,
                                   tail_model: str = "gaussian",
                                   tail_quantile: float = 0.05,
                                   marginal: str = "rqs",
-                                  copula_space: str = "uniform",
+                                  copula_space: str = "gaussian",
                                   tail_alpha: float = 0.0):
     """
     Create empirical marginal transforms for copula modeling.
@@ -306,7 +306,7 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
                           tail_model: str = "gaussian",
                           tail_quantile: float = 0.05,
                           marginal: Optional[str] = None,
-                          copula_space: str = "uniform",
+                          copula_space: str = "gaussian",
                           tail_alpha: float = 0.0,
                           weight_decay: float = 0.0,
                           show_progress: bool = True) -> Transformed:
@@ -319,21 +319,9 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
 
     Two pipelines are available via ``copula_space``:
 
-    * ``"uniform"`` (default): marginals stop at the probability integral
-      transform (``u = F(x)``, an exact bijection onto ``[0, 1]``) and the
-      copula is a rational-quadratic-spline coupling flow over a *uniform base
-      on the unit cube* -- no Gaussianization and no tanh clipping. Because
-      sampling and density evaluation share one closed-form bijection with
-      strictly positive derivative everywhere (including the walls), the
-      flow's sample stream and its ``log_prob`` agree at hard support
-      boundaries: no boundary sample atoms and no wall density cliffs. This is
-      the safe choice for bounded (prior-box) problems, e.g. MCMC proposal
-      flows with ``prior_bounds``. Requires ``marginal="rqs"`` and no tail
-      model (bounded support: the fitted flow's support is the prior box when
-      ``prior_bounds`` is given, else the observed data range).
-    * ``"gaussian"``: marginals map to Gaussian space and the copula is a
-      triangular spline flow over a normal base -- the strongest choice for
-      heavily correlated posteriors (the affine layer captures near-linear
+    * ``"gaussian"`` (default): marginals map to Gaussian space and the copula
+      is a triangular spline flow over a normal base -- the strongest choice
+      for heavily correlated posteriors (the affine layer captures near-linear
       dependence). With the default ``marginal="smooth"`` the marginal map is
       a clip-free diffeomorphism of all of R onto the support (RQS bulk +
       analytic tails): no boundary sample atoms, no wall density cliffs, and
@@ -344,6 +332,18 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
       they can disagree between sample stream and reported density in slivers
       at hard support boundaries, which can absorb independence-MCMC
       walkers.
+    * ``"uniform"``: marginals stop at the probability integral
+      transform (``u = F(x)``, an exact bijection onto ``[0, 1]``) and the
+      copula is a rational-quadratic-spline coupling flow over a *uniform base
+      on the unit cube* -- no Gaussianization and no tanh clipping. Because
+      sampling and density evaluation share one closed-form bijection with
+      strictly positive derivative everywhere (including the walls), the
+      flow's sample stream and its ``log_prob`` agree at hard support
+      boundaries by construction. The natural choice when weakly-constrained,
+      flat-to-the-wall marginals dominate (its box-native tails model those
+      shapes best). Requires ``marginal="rqs"`` and no tail model (bounded
+      support: the fitted flow's support is the prior box when
+      ``prior_bounds`` is given, else the observed data range).
 
     The approach combines flexibility in modeling marginals (via empirical CDFs)
     with powerful dependency modeling (via normalizing flows).
@@ -416,17 +416,18 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
         give progressively heavier tails. Bounded sides always use the
         exponential wall-approach tails. Ignored by other marginals.
     copula_space : str, optional
-        ``"uniform"`` (default) or ``"gaussian"`` -- see the summary above.
+        ``"gaussian"`` (default) or ``"uniform"`` -- see the summary above.
         ``"uniform"`` requires ``marginal="rqs"``, ``tail_extension=False`` and
         ``tail_model="gaussian"`` (bounded support; no tail models); pass
-        ``prior_bounds`` so the flow covers the full prior box. Set
-        ``copula_space="gaussian"`` for unbounded problems that need the tail
-        models.
+        ``prior_bounds`` so the flow covers the full prior box.
 
         .. versionchanged:: 2.0
-            The default changed from ``"gaussian"`` to ``"uniform"``: the
-            Gaussianized pipeline is not boundary-safe (see the summary), so
-            the safe pipeline is now opt-out rather than opt-in.
+            The Gaussian pipeline's default marginal became the clip-free
+            smooth-tail diffeomorphism (``marginal="smooth"``): boundary-safe
+            by construction (no exact-bound sample atoms, no wall density
+            cliffs, sampler-consistent densities) with honest outlier tails.
+            The cube-native ``"uniform"`` pipeline was added as the box-native
+            alternative.
     weight_decay : float, optional
         AdamW weight decay on the trainable flow parameters. Default 0.0
         (plain Adam; original behavior). In the coupling layers the spline
@@ -490,8 +491,8 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
             raise ValueError(
                 "Tail models (tail_extension=True / tail_model='gpd') describe "
                 "unbounded support and require the Gaussianized pipeline: pass "
-                "copula_space='gaussian'. The default 'uniform' pipeline models "
-                "bounded support exactly (boundary-safe) and has no tails."
+                "copula_space='gaussian'. The 'uniform' pipeline models "
+                "bounded support exactly and has no tails."
             )
         if marginal != "rqs":
             raise ValueError(
@@ -614,15 +615,15 @@ def normalizing_flows_fit_auto(chain: np.ndarray,
     ``copula_space`` — and remain directly comparable.
 
     .. note::
-        Held-out likelihood measures proposal *efficiency* only. The
-        boundary-safety advantage of the (default) ``copula_space="uniform"``
-        pipeline -- no sampling atoms / density cliffs at hard prior bounds --
+        Held-out likelihood measures proposal *efficiency* only. Boundary
+        behavior -- no sampling atoms / density cliffs at hard prior bounds --
         lives in a measure-near-zero region that validation samples
-        essentially never probe, so this criterion cannot reward it. Treat
-        safety as a constraint and efficiency as the objective: keep the
-        default pipeline and let the candidates tune capacity. Only include
-        ``{"copula_space": "gaussian"}`` candidates when the problem is
-        genuinely unbounded.
+        essentially never probe, so this criterion cannot reward it. Both
+        pipelines are boundary-safe as of v2.0 (the default gaussian pipeline
+        via its smooth-tail marginals, the uniform pipeline by construction),
+        so let the candidates tune capacity; mixing ``copula_space``
+        candidates is meaningful when comparing correlation-heavy versus
+        flat-to-the-wall regimes.
 
     Parameters
     ----------

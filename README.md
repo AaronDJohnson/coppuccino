@@ -98,16 +98,24 @@ and is required — for the **tail models** (`tail_extension=True`,
 `tail_model="gpd"`), i.e. for extrapolating beyond the observed data range on
 unbounded parameters.
 
-Its trade-off is at hard support boundaries: the $\Phi^{-1}$ endpoint handling
-can leave the sample stream and the reported density inconsistent in thin
-slivers at the walls (sample atoms sitting on a density cliff). That matters
-whenever boundary behavior matters — most acutely when the fitted flow is used
-as an independence MCMC proposal, where a proposal drawing from true density
-$s$ but reporting density $q$ has stationary law $\pi\, s/q$, so boundary
-mismatches become exponentially amplified biases.
+The historical trade-off was at hard support boundaries: the legacy
+$\Phi^{-1}$ endpoint handling could leave the sample stream and the reported
+density inconsistent in thin slivers at the walls (sample atoms sitting on a
+density cliff). That matters whenever boundary behavior matters — most acutely
+when the fitted flow is used as an independence MCMC proposal, where a
+proposal drawing from true density $s$ but reporting density $q$ has
+stationary law $\pi\, s/q$, so boundary mismatches become exponentially
+amplified biases. As of v2.0 the Gaussian-space pipeline's default
+`marginal="smooth"` removes this at the root: each marginal is a single
+clip-free monotone map of all of $\mathbb{R}$ onto the support (spline bulk +
+analytic tails), so samples land strictly inside the prior, densities decay
+smoothly to the walls, and out-of-data queries get honest tail values
+(`tail_alpha` selects Gaussian or heavier tails for outlier tolerance).
 
-> **Changed in v2.0:** `copula_space="uniform"` (the cube-native pipeline) is
-> now the default. Pass `copula_space="gaussian"` for the legacy pipeline.
+> **Changed in v2.0:** the Gaussian pipeline's default marginals are the new
+> clip-free smooth-tail maps, and the cube-native `copula_space="uniform"`
+> pipeline is available as the box-native alternative — the natural choice
+> when flat-to-the-wall marginals dominate.
 
 ### Why this design
 
@@ -188,7 +196,8 @@ the original chain, plus an HDR calibration walkthrough in
 | `check_in_support(samples, injection_params)` | Whether a point lies within the sample support. |
 
 Key options to `normalizing_flows_fit` include `copula_space` (the pipeline:
-`"uniform"` default / `"gaussian"` legacy, above), `flow_layers` and `knots`
+`"gaussian"` default with smooth-tail marginals / `"uniform"` cube-native,
+above), `flow_layers` and `knots`
 (flow capacity), `max_epochs`, `learning_rate`, `patience` (training),
 `prior_bounds`, `tail_model`, and `marginal` (the marginal model, below). See
 the docstrings for the full list. `normalizing_flows_fit_auto` fits a small
