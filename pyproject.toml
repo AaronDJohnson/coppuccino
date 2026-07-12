@@ -38,6 +38,9 @@ dependencies = [
     # jaxtyping >=0.3.6 carries the Python 3.12 `issubclass` typing fix.
     "jaxtyping>=0.3.6,<0.4.0",
     "paramax>=0.0.3",
+    # imported directly by coppuccino.fleet (flowjax also depends on it,
+    # but a direct import deserves a direct declaration)
+    "optax>=0.2.2",
     "cloudpickle>=2.2.1,<4.0.0",
 ]
 
@@ -102,12 +105,15 @@ check_untyped_defs = false
 
 # equinox Modules are constructed field-by-field through a metaclass mypy cannot
 # model, and their ClassVar shape/cond_shape fields override instance vars on the
-# AbstractBijection base. Relax only the error codes those idioms trigger, and
-# only in the modules that touch them — the rest is still fully checked.
+# AbstractBijection base. The smooth-tail marginal additionally narrows its
+# Optional tail constants via companion flags (cL is None <=> rf_log_L is None),
+# a cross-variable invariant mypy cannot track ("operator"/"arg-type" noise).
+# Relax only the error codes those idioms trigger, and only in the modules that
+# touch them — the rest is still fully checked.
 [[tool.mypy.overrides]]
 module = "coppuccino.bijections"
-disable_error_code = ["misc"]
+disable_error_code = ["misc", "operator", "arg-type"]
 
 [[tool.mypy.overrides]]
 module = ["coppuccino.copula_flows", "coppuccino.model_io"]
-disable_error_code = ["call-arg", "arg-type"]
+disable_error_code = ["call-arg", "arg-type", "assignment", "return-value"]

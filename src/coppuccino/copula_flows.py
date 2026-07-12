@@ -166,15 +166,17 @@ def _create_empirical_transforms(samples: np.ndarray, min_eps: float = 1e-7,
         if len(param_samples) > _MIN_SAMPLES_PER_DIM:
             p_low = float(prior_bounds[j, 0]) if prior_bounds is not None else None
             p_high = float(prior_bounds[j, 1]) if prior_bounds is not None else None
+            # A non-finite bound means unbounded on that side (the legacy
+            # spline builders would otherwise fail inside scipy with an
+            # unrelated-looking error)
+            if p_low is not None and not np.isfinite(p_low):
+                p_low = None
+            if p_high is not None and not np.isfinite(p_high):
+                p_high = None
             if marginal == "smooth":
                 # clip-free diffeomorphism z in R <-> theta in (lo, hi):
                 # no CDF clip, no quantile clamp (no boundary sample atoms),
                 # no floored wall density (no cliffs); honest analytic tails.
-                # A non-finite bound means unbounded on that side.
-                if p_low is not None and not np.isfinite(p_low):
-                    p_low = None
-                if p_high is not None and not np.isfinite(p_high):
-                    p_high = None
                 theta_of_z, z_of_theta, log_dtheta_dz, x_clamps = \
                     make_smooth_marginal(
                         param_samples, num_points=num_points,
@@ -395,14 +397,14 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
         Fraction of samples in each GPD tail. Only used when
         ``tail_model="gpd"``. Default is 0.05 (5%).
     marginal : str, optional
-        Bulk interpolant family for the empirical marginal transforms:
-        ``"rqs"`` (default) or ``"pchip"``. Both use the same empirical-quantile
-        knots and tail/prior handling and are statistically equivalent; ``"rqs"``
-        (monotone rational-quadratic spline) has a closed-form, machine-precision
-        inverse and derivative from a single parameterization, whereas ``"pchip"``
-        builds two independent splines for the CDF and its inverse that are only
-        approximate inverses of each other. Prefer ``"rqs"`` (better self-
-        consistency at equal cost and fit quality); ``"pchip"`` is retained for
+        Marginal transform family: ``"smooth"``, ``"rqs"``, or ``"pchip"``.
+        ``"smooth"`` (the gaussian pipeline's default) is a single clip-free
+        monotone map of R onto the support with analytic tails. ``"rqs"``
+        (the uniform pipeline's required family, also the legacy gaussian
+        bulk) is a monotone rational-quadratic spline with a closed-form,
+        machine-precision inverse from a single parameterization.
+        ``"pchip"`` builds the CDF and its inverse as two independent splines
+        that are only approximate inverses of each other; it is retained for
         backward compatibility and reproducing older fits.
 
         Default ``None`` resolves per pipeline: ``"rqs"`` (exact unit-range
@@ -471,6 +473,9 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
     The triangular spline flow uses autoregressive transformations that are
     particularly efficient for capturing dependencies in high-dimensional data.
     """
+    if tail_model not in ("gaussian", "gpd"):
+        raise ValueError(
+            f"tail_model must be 'gaussian' or 'gpd', got {tail_model!r}")
     if marginal is None:
         # per-pipeline default: the uniform mode's exact unit-range spline, or
         # the gaussian mode's clip-free smooth-tail marginal. The legacy tail
@@ -761,6 +766,18 @@ def normalizing_flows_fit_auto(chain: np.ndarray,
 
     if selection == "smallest_comparable":
         pool = np.flatnonzero(comparable)
+        if len(pool) == 0:
+            # Degenerate paired test: NaN/-inf scores make even the best
+            # candidate incomparable to itself. Surface diverged fits
+            # loudly instead of an opaque IndexError.
+            if not np.isfinite(scores).any():
+                raise RuntimeError(
+                    "normalizing_flows_fit_auto: every candidate produced a "
+                    f"non-finite held-out score ({scores.tolist()}); the fits "
+                    "likely diverged. Try a smaller learning_rate or more "
+                    "training samples."
+                )
+            pool = np.array([best_idx])
         # smallest parameter count; break size ties by score
         sel_idx = int(pool[np.lexsort((-scores[pool], sizes[pool]))[0]])
     else:
@@ -830,7 +847,9 @@ def sample(flow: Transformed, n_samples: int, rng_seed: Optional[int] = None) ->
     Generate samples from a fitted copula flow.
 
     Draws random samples from the learned distribution by sampling from the
-    base Gaussian distribution and transforming through the trained flow.
+    base distribution (standard normal for the gaussian pipeline, uniform on
+    the unit cube for the uniform pipeline) and transforming through the
+    trained flow.
 
     For smooth-marginal flows (``copula_space="gaussian"``, the default
     ``marginal="smooth"``), rows whose bounded tails saturated at the float64
@@ -973,16 +992,17 @@ def sample_and_log_prob(flow: Transformed, n_samples: int, rng_seed: Optional[in
     (100, 2)
     >>> log_probs.shape
     (100,)
-    >>> # Use for importance sampling weights
-    >>> weights = np.exp(log_probs)
+    >>> # np.exp(log_probs) is the proposal density q(x); importance
+    >>> # weights against a target require it in the denominator:
+    >>> # weights = target_pdf(samples) / np.exp(log_probs)
+    >>> proposal_density = np.exp(log_probs)
     """
     key = jr.key(_resolve_seed(rng_seed))
     samples, log_probs = filter_jit(flow.sample_and_log_prob)(key, (n_samples,))
     samples, log_probs = np.array(samples), np.array(log_probs)
     limits = _smooth_clamp_limits(flow)
     if limits is not None:
-        # redraw tail-clamped rows (see `sample`); the returned density is
-        # then exactly log_prob(samples) for every emitted row
+        # redraw tail-clamped rows (see `sample`)
         for _ in range(_MAX_REDRAW_ROUNDS):
             bad = _clamped_rows(samples, limits)
             if not bad.any():
@@ -999,4 +1019,20 @@ def sample_and_log_prob(flow: Transformed, n_samples: int, rng_seed: Optional[in
                 f"{_MAX_REDRAW_ROUNDS} redraw rounds; returning the last "
                 "draw. The flow's z-tails are extremely heavy relative to "
                 "the bounded support.")
+        # The forward pass computes the log-det at the generated z, while
+        # log_prob reconstructs z from the float-truncated x. Near a hard
+        # bound the inverse is steep enough that the ULP-level truncation of
+        # x costs nat-scale differences. Recompute those few rows via
+        # log_prob so the returned densities are bitwise consistent with any
+        # later log_prob evaluation (MH ratios, importance weights).
+        los, his = limits
+        tol_lo = 1e6 * np.spacing(np.abs(np.where(np.isfinite(los), los, 1.0)))
+        tol_hi = 1e6 * np.spacing(np.abs(np.where(np.isfinite(his), his, 1.0)))
+        near = np.any(
+            (np.isfinite(los)[None, :] & (samples - los[None, :] <= tol_lo[None, :]))
+            | (np.isfinite(his)[None, :] & (his[None, :] - samples <= tol_hi[None, :])),
+            axis=1,
+        )
+        if near.any():
+            log_probs[near] = np.array(filter_jit(flow.log_prob)(samples[near]))
     return samples, log_probs

@@ -423,7 +423,7 @@ class TestSaveLoadWithNonDefaultParams:
             os.unlink(path)
 
     @pytest.mark.parametrize("marginal,expected", [
-        (None, "smooth"),    # default (gaussian pipeline, v3.0)
+        (None, "smooth"),    # default (gaussian pipeline, v2.0)
         ("rqs", "rqs"),
         ("pchip", "pchip"),
     ])

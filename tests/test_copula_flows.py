@@ -333,24 +333,22 @@ class TestSampleAndLogProb:
         assert np.all(np.isfinite(log_probs))
 
     def test_consistency_with_separate_calls(self):
-        """sample_and_log_prob and sample must return the *same draws* for a
-        fixed seed.
-
-        Note: the log-probs returned by sample_and_log_prob (the generation
-        path) are the honest densities to use for importance weights; they are
-        not asserted equal to log_prob(flow, samples) here because, with the
-        default clipped empirical marginals, a sample drawn beyond ~ndtri(1/N)
-        sigma is clipped and cannot be re-inverted exactly (supply prior_bounds
-        to push that threshold out to ~5 sigma).
-        """
+        """sample_and_log_prob and sample return the *same draws* for a fixed
+        seed, and (v2.0 smooth marginals) the returned log-probs agree with
+        log_prob(flow, samples): one map is evaluated both ways, and any
+        near-wall float-truncation rows are recomputed via log_prob inside
+        sample_and_log_prob."""
         np.random.seed(42)
         chain = np.random.randn(200, 2)
         flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
 
-        samples_combined, _ = sample_and_log_prob(flow, n_samples=100, rng_seed=42)
+        samples_combined, lp_combined = sample_and_log_prob(
+            flow, n_samples=100, rng_seed=42)
         samples_separate = sample(flow, n_samples=100, rng_seed=42)
 
         np.testing.assert_array_almost_equal(samples_combined, samples_separate)
+        np.testing.assert_allclose(
+            lp_combined, log_prob(flow, samples_combined), rtol=0, atol=1e-8)
 
     def test_reproducibility(self):
         """Test reproducibility with same seed."""

@@ -97,5 +97,6 @@ Initial public release.
 - Optional `prior_bounds` extension, Gaussian `tail_extension`, and an
   experimental peaks-over-threshold Generalized Pareto tail (`tail_model="gpd"`).
 
+[2.0.0]: https://github.com/AaronDJohnson/coppuccino/releases/tag/v2.0.0
 [1.1.0]: https://github.com/AaronDJohnson/coppuccino/releases/tag/v1.1.0
 [1.0.0]: https://github.com/AaronDJohnson/coppuccino/releases/tag/v1.0.0

@@ -202,7 +202,12 @@ def _rqs_bulk(xg, cdf_vals, edge_slope_floor=0.0):
     # RQS needs strictly increasing x knots; drop any ties (cdf_vals is already
     # strictly increasing thanks to the upstream monotonicity bump).
     keep = np.concatenate([[True], np.diff(xg) > 0])
-    xk, yk = xg[keep], yg[keep]
+    xk, yk = xg[keep], yg[keep].copy()
+    # the tie-drop keeps the FIRST knot of a tied block; the top endpoint's
+    # CDF value (exactly 1.0 in unit_range mode) must survive on the kept
+    # boundary knot or the spline's range silently tops out below it and the
+    # discarded mass reappears as an exact-at-bound sampling atom
+    yk[-1] = yg[-1]
     # PCHIP slopes at the knots — monotone by construction, strictly positive
     # floor so they can sit in RQS denominators without dividing by zero.
     dk = np.maximum(_ScipyPchip(xk, yk).derivative()(xk), _POS_FLOOR)
@@ -336,7 +341,8 @@ def make_empirical_cdf_spline(
         transforms; ``"rqs"`` additionally guarantees an exact, cheaper inverse,
         whereas the two PCHIP splines are only approximate inverses of each
         other. Note the
-        ``normalizing_flows_fit`` entry point defaults to ``"rqs"``; this
+        ``normalizing_flows_fit`` entry point resolves its default per
+        pipeline (``"smooth"`` for gaussian, ``"rqs"`` for uniform); this
         low-level function keeps ``"pchip"`` as its default for backward
         compatibility.
     unit_range : bool, optional
@@ -1046,8 +1052,12 @@ def make_smooth_marginal(samples: np.ndarray,
     # rf_log_* is the log of the clamped tail ratio (theta offset / knot
     # offset); the -_EXP_MAX cap doubles as the exp overflow guard.
     def _rf_log(bound, knot_offset):
-        eps = min(4.0 * float(np.spacing(abs(bound))) + 1e-30 * span,
-                  1e-10 * span)
+        # keep eps representable (>= 4 ULP of the bound) unless that would
+        # eat more than 1% of the support; in that pathological remainder
+        # (span < ~400 ULP of the bound) strictly-interior saturation is
+        # unrepresentable and the sampling-layer redraw catches the rows
+        eps = float(np.clip(4.0 * np.spacing(abs(bound)) + 1e-30 * span,
+                            1e-30 * span, 0.01 * span))
         return max(float(np.log(eps / knot_offset)), -_EXP_MAX)
 
     rf_log_L = _rf_log(prior_low, th1 - prior_low) if cL is not None else None

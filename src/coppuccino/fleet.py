@@ -34,7 +34,7 @@ Example
 ...                                     max_epochs=100)      # doctest: +SKIP
 >>> x = fleet.sample(512, rng_seed=0)             # (64, 512, 8)  # doctest: +SKIP
 >>> lp = fleet.log_prob(x)                        # (64, 512)     # doctest: +SKIP
->>> x7 = fleet.sample(512, rng_seed=0, source_index=7)   # single source
+>>> x7 = fleet.sample(512, rng_seed=0, source_index=7)  # doctest: +SKIP
 """
 import io
 from typing import Optional

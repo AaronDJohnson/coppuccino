@@ -149,12 +149,14 @@ def compute_injection_hdr(samples: np.ndarray, injection_params: np.ndarray, num
     For well-calibrated Bayesian inference, HDR values should follow a uniform
     distribution U(0, 1). Deviations indicate miscalibration or model misspecification.
 
-    Injections outside the coordinate-wise min/max support of ``samples`` are a
-    special case: ``check_in_support`` short-circuits them to HDR = 1.0 without
-    fitting or evaluating the flow, since such points fall in the extreme tail /
-    clipped region where the flow density is effectively minimal. When building
-    a calibration (P-P) plot, be aware that these 1.0 values are sentinels rather
-    than density-based results.
+    Injections outside the coordinate-wise min/max hull of ``samples`` are a
+    special case: ``check_in_support`` short-circuits them to HDR = 1.0 by
+    convention, without evaluating the flow at that point (the flow itself is
+    still fitted). Under the default smooth-tail marginals the flow assigns
+    finite, smoothly decaying density beyond the data hull, so the flow-based
+    HDR of such points would fall slightly below 1.0 (typically within ~1%).
+    When building a calibration (P-P) plot, treat these exact-1.0 values as
+    conservative sentinels rather than density-based results.
 
     The default normalizing flow parameters are tuned for typical inference problems.
     Adjust them based on your data characteristics:

@@ -46,7 +46,16 @@ coppuccino estimates the marginals **nonparametrically** and the copula with a
 
 ## How it works
 
-Fitting proceeds in two stages.
+Fitting proceeds in two stages, and two pipelines are available. The default
+(`copula_space="gaussian"`) maps each marginal to Gaussian space through a
+clip-free smooth-tail transform and learns the copula with a triangular
+spline flow over a normal base — the strongest choice for correlated
+posteriors. The cube-native alternative (`copula_space="uniform"`), shown in
+the diagram below, stops the marginals at the probability integral transform
+and learns the copula directly on the unit cube — the natural choice when
+weakly-constrained, flat-to-the-wall marginals dominate. Both are
+boundary-safe; they differ in where the copula lives and how the tails are
+modeled.
 
 ```mermaid
 flowchart LR
@@ -188,6 +197,8 @@ the original chain, plus an HDR calibration walkthrough in
 | Function | Purpose |
 | --- | --- |
 | `normalizing_flows_fit(chain, ...)` | Fit a copula flow to data; returns the fitted model. |
+| `normalizing_flows_fit_auto(chain, ...)` | Fit a ladder of candidate architectures concurrently; return the smallest statistically-comparable model. |
+| `normalizing_flows_fit_fleet(chains, prior_bounds, ...)` | Fit many per-source flows simultaneously (vmapped); returns a `FleetFlow` with batched `sample`/`log_prob`. |
 | `sample(flow, n_samples, rng_seed=...)` | Draw samples from a fitted flow. |
 | `log_prob(flow, samples)` | Evaluate the log density at given points. |
 | `sample_and_log_prob(flow, n_samples, ...)` | Draw samples and their log densities together (for importance sampling). |
@@ -232,19 +243,23 @@ how they behave at and beyond the edges of the data.
 ### Interpolant
 
 ```python
-flow = normalizing_flows_fit(data)                   # marginal="rqs" (default)
+flow = normalizing_flows_fit(data)                    # marginal="smooth" (default)
+flow = normalizing_flows_fit(data, copula_space="uniform")   # marginal="rqs"
 flow = normalizing_flows_fit(data, marginal="pchip",
                              copula_space="gaussian")  # original PCHIP interpolant
 ```
 
-Both families use the same empirical-quantile knots and the same tail and
-prior-bound handling, so they produce nearly identical fits. `"rqs"` (a monotone
-rational-quadratic spline) is preferred because its forward map, inverse, and
-derivative share a single parameterization and are mutually exact to machine
-precision, which keeps `sample_and_log_prob` weights honest. The `"pchip"` path
-builds the CDF and its inverse as two independent splines that are only
-approximate inverses of each other; it is retained for reproducing older fits
-and requires the Gaussianized pipeline (`copula_space="gaussian"`).
+`marginal=None` resolves per pipeline. The gaussian default `"smooth"` is a
+single clip-free monotone map of all of R onto the support — a
+rational-quadratic-spline bulk at the data quantiles joined to analytic
+tails — whose forward map, inverse, and derivative share one
+parameterization, so samples land strictly inside the support and densities
+match the sample stream to machine precision. The uniform pipeline uses
+`"rqs"` (a monotone rational-quadratic spline with the same exact-inverse
+property, as an exact bijection onto [0, 1]). The `"pchip"` path builds the
+CDF and its inverse as two independent splines that are only approximate
+inverses of each other; it is retained for reproducing older fits and
+requires the Gaussianized pipeline (`copula_space="gaussian"`).
 
 ### Prior bounds (recommended for MCMC chains)
 
@@ -254,10 +269,12 @@ bounds = np.array([[-10, 10], [-5, 5], [0, 100]])
 flow = normalizing_flows_fit(data, prior_bounds=bounds)
 ```
 
-By default the marginals clip to the observed data range. Supplying
-`prior_bounds` extends each marginal CDF to the prior edges, so the flow can
-generate samples across the full prior support rather than being capped at the
-most extreme training sample.
+Without `prior_bounds`, the default smooth marginals treat each side as
+unbounded and extend analytic tails beyond the data (Gaussian tails by
+default; see `tail_alpha` for heavier ones), while the uniform pipeline's
+support ends at the observed data range. Supplying `prior_bounds` anchors
+each marginal to the known support instead, so the flow covers the full
+prior box — recommended whenever the true bounds are known.
 
 ### Heavy-tailed marginals (experimental)
 
@@ -304,7 +321,7 @@ If you use coppuccino in your research, please cite it:
   author  = {Johnson, Aaron D.},
   title   = {coppuccino: copula normalizing flows in JAX},
   year    = {2026},
-  version = {1.1.0},
+  version = {2.0.0},
   url     = {https://github.com/AaronDJohnson/coppuccino}
 }
 ```
