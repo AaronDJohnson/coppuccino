@@ -202,6 +202,7 @@ the original chain, plus an HDR calibration walkthrough in
 | `sample(flow, n_samples, rng_seed=...)` | Draw samples from a fitted flow. |
 | `log_prob(flow, samples)` | Evaluate the log density at given points. |
 | `sample_and_log_prob(flow, n_samples, ...)` | Draw samples and their log densities together (for importance sampling). |
+| `calibrate_edge_bins(flow, samples, bin_edges, ...)` | Post-fit marginal edge calibration for a smooth Gaussian-space flow. |
 | `save_flow(flow, path)` / `load_flow(path)` | Serialize / deserialize a fitted flow. |
 | `compute_injection_hdr(samples, injection_params, ...)` | HDR credibility of injected/true parameters (calibration). |
 | `check_in_support(samples, injection_params)` | Whether a point lies within the sample support. |
@@ -288,6 +289,42 @@ Distribution to each tail via peaks-over-threshold, modeling the extremes more
 faithfully than the default Gaussian tail. `tail_quantile` sets the fraction of
 samples in each tail (default 0.05). This feature is **experimental** — its API
 may change — and it ignores `tail_extension` and `prior_bounds`.
+
+### Gaussian edge-bin calibration (experimental)
+
+A trained Gaussian-space copula can retain a good joint fit while drifting
+slightly from the intended one-dimensional marginal masses in its sparse tails.
+`calibrate_edge_bins` adds a fixed, coordinatewise monotone correction after
+training. It preserves ranks and the fitted copula, includes its Jacobian in
+`log_prob`, and is exactly the identity through a central region.
+
+```python
+from coppuccino import calibrate_edge_bins
+
+flow = normalizing_flows_fit(
+    data, copula_space="gaussian", prior_bounds=bounds,
+)
+shared_edges = [
+    np.linspace(low, high, 41) for low, high in bounds
+]
+flow, report = calibrate_edge_bins(
+    flow, data, shared_edges, edge_bins=1, return_report=True,
+)
+```
+
+This currently requires the Gaussian pipeline's default `marginal="smooth"`.
+With prior bounds as the outer histogram edges, `edge_bins=1` calibrates the
+first and last bin masses. By default it makes only the minimum correction needed
+to enter a 95% Wilson interval and leaves statistically compatible tails exactly
+unchanged. `reference_ess` should contain per-dimension effective sample sizes for
+MCMC input. Under-resolved reference bins or calibration tails raise instead of
+silently fitting noise; use coarser shared edges, more calibration draws, or the
+explicit `force=True` escape hatch.
+
+On an unbounded/cropped axis the function calibrates tail-inclusive cumulative
+masses instead, so underflow and overflow should be reported separately. The
+correction is marginal only and does not repair multivariate corner or tail-
+dependence errors. Periodic coordinates must be recentered or unwrapped first.
 
 ## Requirements
 

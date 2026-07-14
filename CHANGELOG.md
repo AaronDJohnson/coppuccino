@@ -35,6 +35,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   per-source fits for large catalogs.
 - `weight_decay` and `show_progress` fit options; save/load support for all
   new model types.
+- Experimental `calibrate_edge_bins()` post-fit calibration for smooth
+  Gaussian-space flows. It corrects selected marginal edge-bin CDF boundaries
+  with compact monotone splines while leaving a central region and the fitted
+  rank copula unchanged. A Wilson/ESS-aware minimum-change gate leaves compatible
+  tails untouched and rejects under-resolved calibration unless explicitly
+  forced. Calibrated models retain consistent sampling, `log_prob`, and save/load
+  behavior.
 
 ## [1.1.0] — 2026-07-05
 

@@ -115,5 +115,9 @@ module = "coppuccino.bijections"
 disable_error_code = ["misc", "operator", "arg-type"]
 
 [[tool.mypy.overrides]]
+module = "coppuccino.calibration"
+disable_error_code = ["misc"]
+
+[[tool.mypy.overrides]]
 module = ["coppuccino.copula_flows", "coppuccino.model_io"]
 disable_error_code = ["call-arg", "arg-type", "assignment", "return-value"]
