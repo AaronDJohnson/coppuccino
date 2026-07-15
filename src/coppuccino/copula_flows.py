@@ -1,4 +1,5 @@
 import warnings
+from collections.abc import Sequence
 from typing import Callable, Optional
 
 import numpy as np
@@ -9,7 +10,7 @@ from flowjax.bijections import RationalQuadraticSpline, Stack
 from flowjax.flows import coupling_flow, triangular_spline_flow
 from flowjax.train import fit_to_data
 from flowjax.distributions import Normal, Transformed, Uniform
-from paramax import non_trainable
+from paramax import non_trainable, unwrap
 import equinox as eqx
 from equinox import filter_jit
 
@@ -573,6 +574,225 @@ def _n_trainable_params(flow: Transformed) -> int:
     return int(sum(leaf.size for leaf in leaves))
 
 
+def _normalise_marginal_bin_edges(
+    bin_edges: Sequence[Optional[np.ndarray]], n_dims: int,
+) -> list[Optional[np.ndarray]]:
+    """Validate shared plotting edges for marginal-fidelity scoring."""
+    if len(bin_edges) != n_dims:
+        raise ValueError(
+            f"marginal_bin_edges has {len(bin_edges)} dimensions, but the "
+            f"chain has {n_dims}."
+        )
+    normalised: list[Optional[np.ndarray]] = []
+    for dim, edge in enumerate(bin_edges):
+        if edge is None:
+            normalised.append(None)
+            continue
+        edge = np.asarray(edge, dtype=float)
+        if edge.ndim != 1 or len(edge) < 3:
+            raise ValueError(
+                f"marginal_bin_edges[{dim}] must be a 1D array with at "
+                "least 3 edges, or None."
+            )
+        if not np.all(np.isfinite(edge)) or not np.all(np.diff(edge) > 0.0):
+            raise ValueError(
+                f"marginal_bin_edges[{dim}] must be finite and strictly increasing."
+            )
+        normalised.append(edge)
+    return normalised
+
+
+def _normalise_marginal_ess(
+    marginal_ess: Optional[
+        float | Sequence[float] | Sequence[Sequence[float]]
+    ],
+    n_dims: int,
+    n_reference: int,
+) -> np.ndarray:
+    """Return an effective size for each dimension and literal edge cell."""
+    if marginal_ess is None:
+        return np.full((n_dims, 4), float(n_reference))
+    ess = np.asarray(marginal_ess, dtype=float)
+    if ess.ndim == 0:
+        ess = np.full((n_dims, 4), float(ess))
+    elif ess.shape == (n_dims,):
+        ess = np.repeat(ess[:, None], 4, axis=1)
+    if (ess.shape != (n_dims, 4) or not np.all(np.isfinite(ess))
+            or np.any(ess <= 0.0) or np.any(ess > n_reference)):
+        raise ValueError(
+            "marginal_ess must be a positive scalar, one value per dimension, "
+            "or a (n_dimensions, 4) array in underflow/lower-bin/upper-bin/"
+            f"overflow order; every value must be <= the reference size ({n_reference})."
+        )
+    return ess
+
+
+def _edge_fidelity_features(
+    reference: np.ndarray,
+    bin_edges: list[Optional[np.ndarray]],
+    effective_sizes: np.ndarray,
+    min_count: int,
+) -> tuple[list[tuple[int, str, float, float, bool, float]], list[str]]:
+    """Build literal edge-bin and under/overflow probability targets."""
+    features: list[tuple[int, str, float, float, bool, float]] = []
+    unresolved: list[str] = []
+    for dim, edge in enumerate(bin_edges):
+        if edge is None:
+            continue
+        values = reference[:, dim]
+        specifications = [
+            ("underflow", float(edge[0]), float(np.mean(values < edge[0]))),
+            ("lower_bin", float(edge[1]),
+             float(np.mean((values >= edge[0]) & (values < edge[1])))),
+            ("upper_bin", float(edge[-2]),
+             float(np.mean((values >= edge[-2]) & (values <= edge[-1])))),
+            ("overflow", float(edge[-1]), float(np.mean(values > edge[-1]))),
+        ]
+        for cell, (kind, boundary, probability) in enumerate(specifications):
+            reference_size = float(effective_sizes[dim, cell])
+            effective_count = probability * reference_size
+            resolved = effective_count >= min_count
+            features.append((dim, kind, boundary, probability, resolved,
+                             reference_size))
+            if not resolved:
+                unresolved.append(
+                    f"dimension {dim} {kind} ({effective_count:.1f} effective)"
+                )
+    if not features:
+        raise ValueError(
+            "marginal_bin_edges contains only None entries; select at least one dimension."
+        )
+    return features, unresolved
+
+
+def _wilson_interval(
+    probability: float, n_eff: float, confidence: float,
+) -> tuple[float, float]:
+    """Wilson score interval for a binomial proportion with effective size."""
+    from scipy.special import ndtri
+
+    z = float(ndtri(0.5 + confidence / 2.0))
+    denominator = 1.0 + z**2 / n_eff
+    centre = (probability + z**2 / (2.0 * n_eff)) / denominator
+    radius = z * np.sqrt(
+        probability * (1.0 - probability) / n_eff + z**2 / (4.0 * n_eff**2)
+    ) / denominator
+    return float(max(0.0, centre - radius)), float(min(1.0, centre + radius))
+
+
+def _interval_gap(
+    target: float,
+    target_size: float,
+    estimate: float,
+    estimate_size: float,
+    confidence: float,
+) -> float:
+    """Directional separation between two Wilson intervals."""
+    target_low, target_high = _wilson_interval(target, target_size, confidence)
+    estimate_low, estimate_high = _wilson_interval(
+        estimate, estimate_size, confidence)
+    return float(max(0.0, estimate_low - target_high,
+                     target_low - estimate_high))
+
+
+def _score_edge_fidelity(
+    draws: np.ndarray,
+    bin_edges: list[Optional[np.ndarray]],
+    features: list[tuple[int, str, float, float, bool, float]],
+    confidence: float,
+) -> tuple[float, float, float, list[dict]]:
+    """Return raw and resolution-aware literal edge-mass errors.
+
+    Resolved literal bins use raw probability error. For a sparse cell, the
+    selection score counts only discrepancy beyond the reference and candidate
+    Wilson intervals. Thus a zero-count target cannot hide substantial
+    candidate overflow, while 1--7-count noise does not choose an architecture.
+    """
+    if not np.all(np.isfinite(draws)):
+        return np.inf, np.inf, np.inf, []
+    errors, selection_errors = [], []
+    details = []
+    for dim, kind, boundary, target, resolved, reference_size in features:
+        edge = bin_edges[dim]
+        assert edge is not None
+        values = draws[:, dim]
+        if kind == "underflow":
+            estimate = np.mean(values < boundary)
+        elif kind == "lower_bin":
+            estimate = np.mean((values >= edge[0]) & (values < boundary))
+        elif kind == "upper_bin":
+            estimate = np.mean((values >= boundary) & (values <= edge[-1]))
+        else:
+            estimate = np.mean(values > boundary)
+        error = abs(float(estimate) - target)
+        errors.append(error)
+        interval_gap = _interval_gap(
+            target, reference_size, float(estimate), len(draws), confidence)
+        selection_error = error if resolved else interval_gap
+        selection_errors.append(selection_error)
+        details.append({
+            "dimension": dim,
+            "component": kind,
+            "target": target,
+            "estimate": float(estimate),
+            "error": error,
+            "selection_error": selection_error,
+            "interval_gap": interval_gap,
+            "resolved": resolved,
+            "reference_ess": reference_size,
+            "reference_effective_count": target * reference_size,
+        })
+    return (float(np.max(errors)), float(np.mean(errors)),
+            float(np.max(selection_errors)), details)
+
+
+def _score_latent_marginal_fidelity(
+    flow: Transformed,
+    quantiles: np.ndarray,
+    n_samples: int,
+    rng_seed: int,
+) -> tuple[float, float, float, list[dict]]:
+    """Score drift from the marginal law expected by the outer PIT map."""
+    from scipy.special import ndtri
+
+    if not isinstance(flow.bijection, Stack):
+        raise ValueError("Expected a stacked empirical marginal transform.")
+    marginal_types = [type(unwrap(b)) for b in flow.bijection.bijections]
+    gaussian_types = (SmoothMarginalToGaussian, EmpiricalMarginalToGaussian)
+    if all(issubclass(kind, gaussian_types) for kind in marginal_types):
+        thresholds = ndtri(quantiles)
+    elif all(issubclass(kind, EmpiricalMarginalToUniform) for kind in marginal_types):
+        thresholds = quantiles
+    else:
+        raise ValueError(
+            "Marginal-fidelity selection requires a consistent Gaussian or "
+            "uniform marginal transform across dimensions."
+        )
+    draws = np.asarray(flow.base_dist.sample(jr.key(rng_seed), (n_samples,)))
+    if not np.all(np.isfinite(draws)):
+        return np.inf, np.inf, np.inf, []
+    estimates = np.mean(draws[:, :, None] < thresholds[None, None, :], axis=0)
+    errors = np.abs(estimates - quantiles[None, :])
+    maximum = float(np.max(errors))
+    details = [
+        {
+            "dimension": dim,
+            "component": f"cdf_{quantile:g}",
+            "target": float(quantile),
+            "estimate": float(estimates[dim, quantile_index]),
+            "error": float(errors[dim, quantile_index]),
+            "selection_error": float(errors[dim, quantile_index]),
+            "interval_gap": float(errors[dim, quantile_index]),
+            "resolved": True,
+            "reference_ess": np.inf,
+            "reference_effective_count": np.inf,
+        }
+        for dim in range(draws.shape[1])
+        for quantile_index, quantile in enumerate(quantiles)
+    ]
+    return maximum, float(np.mean(errors)), maximum, details
+
+
 def normalizing_flows_fit_auto(chain: np.ndarray,
                                candidates: Optional[list] = None,
                                val_frac: float = 0.15,
@@ -584,6 +804,21 @@ def normalizing_flows_fit_auto(chain: np.ndarray,
                                comparable_nats: float = 0.0,
                                verbose: bool = False,
                                return_table: bool = False,
+                               *,
+                               marginal_samples: int = 20_000,
+                               marginal_quantiles: Sequence[float] = (
+                                   0.01, 0.025, 0.05, 0.95, 0.975, 0.99),
+                               marginal_bin_edges: Optional[
+                                   Sequence[Optional[np.ndarray]]
+                               ] = None,
+                               marginal_ess: Optional[
+                                   float | Sequence[float]
+                                   | Sequence[Sequence[float]]
+                               ] = None,
+                               min_marginal_count: int = 20,
+                               marginal_confidence: float = 0.95,
+                               marginal_tolerance: Optional[float] = None,
+                               max_marginal_error: Optional[float] = None,
                                **shared_kwargs):
     """
     Fit a copula flow with automatic hyperparameter selection.
@@ -603,6 +838,16 @@ def normalizing_flows_fit_auto(chain: np.ndarray,
     resolved toward parsimony -- fewer parameters, faster fits, less
     overfitting risk on refits. ``selection="best"`` restores the plain
     argmax.
+
+    ``selection="marginal_fidelity"`` is the non-calibration option for edge
+    bins. It first forms the same held-out-likelihood-comparable pool, so a
+    better-looking marginal cannot buy its way in by damaging the joint fit.
+    Within that pool it selects from the lowest-error Monte Carlo tie band,
+    preferring the smallest model in a tie. This ranks candidates; set
+    ``max_marginal_error`` when an absolute edge-mass budget is required.
+    With ``marginal_bin_edges`` the score uses the literal first/last finite
+    intervals and their adjacent under/overflow masses, all on shared edges.
+    Without edges it measures drift at canonical copula-space tail quantiles.
 
     The held-out mean log-density estimates ``-H(pi, q)``; maximizing it over
     candidates minimizes ``KL(pi || q)`` up to the (candidate-independent)
@@ -646,12 +891,23 @@ def normalizing_flows_fit_auto(chain: np.ndarray,
              {"knots": 4, "flow_layers": 6},
              {"knots": 8, "flow_layers": 8}]
 
+        Marginal-fidelity selection uses three fits: 2/2 and 4/4 knots/layers
+        with ``tanh_max_val=2.0``, plus the existing 4/6,
+        ``tanh_max_val=3.0`` default as a protected baseline. An explicit
+        shared ``tanh_max_val`` applies to all three. Supply a shorter or
+        broader list to trade cost against the search range.
+
     val_frac : float, optional
         Fraction of the (clean) chain held out for scoring. Default 0.15.
     refit_best : bool, optional
         If True (default), refit the winning configuration on the full chain
-        before returning it, so no samples are wasted. The reported scores
-        always refer to the split fits.
+        before returning it. Marginal-fidelity refits get a fresh,
+        componentwise marginal audit and a conservative joint-density
+        regression sanity check; failures return the validated split fit.
+        Because a full-data refit includes the validation rows, that latter
+        check is not a second held-out guarantee. Use ``refit_best=False`` to
+        return the strictly held-out-validated split fit. Reported held-out
+        scores always refer to split fits.
     rng_seed : int, optional
         Seed for the split and for every candidate fit (all candidates see
         the identical split, so the comparison is paired). Default 999.
@@ -667,6 +923,8 @@ def normalizing_flows_fit_auto(chain: np.ndarray,
         ``"smallest_comparable"`` (default): smallest model whose held-out
         score is within tolerance of the best (see summary above).
         ``"best"``: plain argmax of the held-out score.
+        ``"marginal_fidelity"``: best marginal score among held-out-likelihood-
+        comparable candidates, with parsimony inside a Monte Carlo tie band.
     comparable_sems : float, optional
         Tolerance in units of the *paired* standard error of the score
         difference against the best candidate. Default 1.0 (the classic
@@ -680,7 +938,35 @@ def normalizing_flows_fit_auto(chain: np.ndarray,
     return_table : bool, optional
         If True, return ``(flow, table)`` where ``table`` is a list of dicts
         with keys ``config``, ``val_logp``, ``sem``, ``n_params``,
-        ``comparable``, ``selected``.
+        ``comparable``, ``selected``. Marginal selection adds component-level
+        targets, estimates, errors, resolution status, and refit diagnostics.
+    marginal_samples : int, optional
+        Candidate draws used for marginal scoring. Default 20,000.
+    marginal_quantiles : sequence of float, optional
+        Copula-space CDF probabilities used when physical edges are omitted.
+    marginal_bin_edges : sequence of array or None, optional
+        Shared physical histogram edges, one entry per dimension. ``None``
+        skips a dimension. The metric includes literal edge bins and
+        under/overflow outside each finite crop.
+    marginal_ess : float or sequence of float, optional
+        Effective reference size for sparse-bin decisions. Accepts a scalar,
+        one value per dimension, or shape ``(n_dimensions, 4)`` in
+        underflow/lower-bin/upper-bin/overflow order. Defaults to raw N.
+    min_marginal_count : int, optional
+        Effective count at which each literal cell is treated as resolved.
+        Sparse cells affect selection only by the directional gap between
+        reference and candidate Wilson intervals.
+    marginal_confidence : float, optional
+        Wilson confidence level for sparse cells. Default 0.95.
+    marginal_tolerance : float, optional
+        Heuristic Monte Carlo tie band, applied componentwise to refit audits.
+        Defaults to ``0.5/sqrt(marginal_samples)``; it is not a simultaneous
+        confidence interval over all candidates and components.
+    max_marginal_error : float, optional
+        Maximum acceptable raw probability-mass error in every scored cell.
+        Candidates inside this budget are preferred. If no held-out-
+        likelihood-comparable candidate meets it, the least-bad candidate is
+        returned with a warning. By default selection is relative only.
     **shared_kwargs
         Arguments passed to every candidate fit (e.g. ``prior_bounds``,
         ``copula_space``, ``max_epochs``).
@@ -716,24 +1002,137 @@ def normalizing_flows_fit_auto(chain: np.ndarray,
     n_val = max(1, int(round(len(clean) * val_frac)))
     val, fit_part = clean[perm[:n_val]], clean[perm[n_val:]]
 
-    if candidates is None:
-        candidates = [{"knots": 2, "flow_layers": 4},
-                      {"knots": 4, "flow_layers": 6},
-                      {"knots": 8, "flow_layers": 8}]
-
-    if selection not in ("smallest_comparable", "best"):
+    if selection not in ("smallest_comparable", "best", "marginal_fidelity"):
         raise ValueError(
-            f"selection must be 'smallest_comparable' or 'best', got {selection!r}."
+            "selection must be 'smallest_comparable', 'best', or "
+            f"'marginal_fidelity', got {selection!r}."
         )
+    try:
+        marginal_quantiles_are_default = tuple(marginal_quantiles) == (
+            0.01, 0.025, 0.05, 0.95, 0.975, 0.99)
+    except (TypeError, ValueError):
+        marginal_quantiles_are_default = False
+    if selection != "marginal_fidelity" and any((
+        marginal_samples != 20_000,
+        not marginal_quantiles_are_default,
+        marginal_bin_edges is not None,
+        marginal_ess is not None,
+        min_marginal_count != 20,
+        marginal_confidence != 0.95,
+        marginal_tolerance is not None,
+        max_marginal_error is not None,
+    )):
+        raise ValueError(
+            "Non-default marginal_* options require "
+            "selection='marginal_fidelity'."
+        )
+
+    if candidates is None:
+        if selection == "marginal_fidelity":
+            candidates = [{"knots": 2, "flow_layers": 2},
+                          {"knots": 4, "flow_layers": 4},
+                          {"knots": 4, "flow_layers": 6}]
+            if "tanh_max_val" not in shared_kwargs:
+                candidates[0]["tanh_max_val"] = 2.0
+                candidates[1]["tanh_max_val"] = 2.0
+        else:
+            candidates = [{"knots": 2, "flow_layers": 4},
+                          {"knots": 4, "flow_layers": 6},
+                          {"knots": 8, "flow_layers": 8}]
+
+    if len(candidates) == 0:
+        raise ValueError("candidates must contain at least one configuration.")
+
+    edge_features = None
+    normalised_edges = None
+    marginal_q = np.asarray([], dtype=float)
+    if selection == "marginal_fidelity":
+        if (not isinstance(marginal_samples, (int, np.integer))
+                or isinstance(marginal_samples, (bool, np.bool_))
+                or marginal_samples < 1000):
+            raise ValueError("marginal_samples must be at least 1000.")
+        if (not isinstance(min_marginal_count, (int, np.integer))
+                or isinstance(min_marginal_count, (bool, np.bool_))
+                or min_marginal_count < 1):
+            raise ValueError("min_marginal_count must be at least 1.")
+        if not 0.0 < marginal_confidence < 1.0:
+            raise ValueError("marginal_confidence must be strictly between 0 and 1.")
+        if (marginal_tolerance is not None
+                and (not np.isfinite(marginal_tolerance)
+                     or marginal_tolerance < 0.0)):
+            raise ValueError(
+                "marginal_tolerance must be finite and non-negative or None.")
+        if (max_marginal_error is not None
+                and (not np.isfinite(max_marginal_error)
+                     or not 0.0 <= max_marginal_error <= 1.0)):
+            raise ValueError(
+                "max_marginal_error must be finite and between 0 and 1, or None.")
+        if marginal_bin_edges is not None:
+            normalised_edges = _normalise_marginal_bin_edges(
+                marginal_bin_edges, clean.shape[1])
+            effective_sizes = _normalise_marginal_ess(
+                marginal_ess, clean.shape[1], len(clean))
+            edge_features, unresolved = _edge_fidelity_features(
+                clean, normalised_edges, effective_sizes, min_marginal_count)
+            if unresolved:
+                warnings.warn(
+                    "Marginal-fidelity selection found statistically under-resolved "
+                    "cells. Only discrepancies beyond their Wilson uncertainty "
+                    "will affect the relative score (an explicit raw-error budget "
+                    "still applies): " + "; ".join(unresolved),
+                    stacklevel=2,
+                )
+        else:
+            marginal_q = np.asarray(marginal_quantiles, dtype=float)
+            if (marginal_q.ndim != 1 or len(marginal_q) == 0
+                    or not np.all(np.isfinite(marginal_q))
+                    or np.any((marginal_q <= 0.0) | (marginal_q >= 1.0))):
+                raise ValueError(
+                    "marginal_quantiles must be a non-empty sequence strictly "
+                    "between 0 and 1."
+                )
+            marginal_q = np.unique(marginal_q)
+
+    marginal_seed = (int(rng_seed) + 104_729) % (2**31 - 1)
+    marginal_audit_seed = (int(rng_seed) + 130_363) % (2**31 - 1)
+
+    def _score_flow_marginals(fl, seed):
+        if normalised_edges is not None:
+            assert edge_features is not None
+            draws = sample(fl, marginal_samples, rng_seed=seed)
+            return _score_edge_fidelity(
+                draws, normalised_edges, edge_features, marginal_confidence)
+        return _score_latent_marginal_fidelity(
+            fl, marginal_q, marginal_samples, seed)
 
     def _fit_and_score(cand):
         # candidate fits are quiet by default (parallel progress bars garble);
         # an explicit show_progress in shared_kwargs/candidate still wins.
         kw = {"rng_seed": rng_seed, "show_progress": False,
               **shared_kwargs, **cand}
-        fl = normalizing_flows_fit(fit_part, **kw)
-        lp = np.asarray(log_prob(fl, val))
-        return fl, lp
+        try:
+            fl = normalizing_flows_fit(fit_part, **kw)
+            lp = np.asarray(log_prob(fl, val))
+            if lp.shape != (len(val),):
+                raise ValueError(
+                    f"log_prob returned shape {lp.shape}, expected {(len(val),)}."
+                )
+            marginal_error = np.nan
+            marginal_mean_error = np.nan
+            marginal_selection_error = np.nan
+            marginal_details = []
+            if selection == "marginal_fidelity":
+                (marginal_error, marginal_mean_error,
+                 marginal_selection_error, marginal_details) = (
+                    _score_flow_marginals(fl, marginal_seed))
+            return (fl, lp, marginal_error, marginal_mean_error,
+                    marginal_selection_error, marginal_details, None)
+        except Exception as exc:
+            marginal_failure = (np.inf if selection == "marginal_fidelity"
+                                else np.nan)
+            error = f"{type(exc).__name__}: {exc}"
+            return (None, np.full(len(val), np.nan), marginal_failure,
+                    marginal_failure, marginal_failure, [], error)
 
     if n_workers is None:
         import os
@@ -745,12 +1144,43 @@ def normalizing_flows_fit_auto(chain: np.ndarray,
     else:
         results = [_fit_and_score(c) for c in candidates]
 
-    flows = [fl for fl, _ in results]
-    lps = [lp for _, lp in results]
+    flows = [fl for fl, _, _, _, _, _, _ in results]
+    lps = [lp for _, lp, _, _, _, _, _ in results]
+    marginal_errors = np.asarray([err for _, _, err, _, _, _, _ in results])
+    marginal_mean_errors = np.asarray([
+        err for _, _, _, err, _, _, _ in results])
+    marginal_selection_errors = np.asarray([
+        err for _, _, _, _, err, _, _ in results])
+    marginal_details = [details for _, _, _, _, _, details, _ in results]
+    fit_errors = [error for _, _, _, _, _, _, error in results]
+    failed = [f"candidate {i}: {error}" for i, error in enumerate(fit_errors)
+              if error is not None]
+    if failed:
+        warnings.warn(
+            "normalizing_flows_fit_auto excluded failed fits: "
+            + "; ".join(failed),
+            stacklevel=2,
+        )
     scores = np.array([float(np.mean(lp)) for lp in lps])
     sems = np.array([float(np.std(lp) / np.sqrt(len(lp))) for lp in lps])
-    sizes = np.array([_n_trainable_params(fl) for fl in flows])
-    best_idx = int(np.argmax(scores))
+    failed_size = np.iinfo(np.int64).max
+    sizes = np.array([
+        _n_trainable_params(fl) if fl is not None else failed_size
+        for fl in flows
+    ])
+    finite_candidates = np.asarray([
+        fl is not None and bool(np.all(np.isfinite(lp)))
+        for fl, lp in zip(flows, lps)
+    ])
+    if not finite_candidates.any():
+        failure_text = f" Fit errors: {'; '.join(failed)}." if failed else ""
+        raise RuntimeError(
+            "normalizing_flows_fit_auto: every candidate produced a non-finite "
+            f"held-out score ({scores.tolist()}); the fits likely diverged. "
+            "Try a smaller learning_rate or more training samples."
+            + failure_text
+        )
+    best_idx = int(np.argmax(np.where(finite_candidates, scores, -np.inf)))
 
     # Comparability against the best, as a PAIRED test on the shared
     # validation points: the per-point score differences are highly
@@ -758,51 +1188,233 @@ def normalizing_flows_fit_auto(chain: np.ndarray,
     # the individual +-sem error bars.
     comparable = np.zeros(len(candidates), dtype=bool)
     for i, lp in enumerate(lps):
+        if not finite_candidates[i]:
+            continue
         diff = lps[best_idx] - lp
         sem_diff = float(np.std(diff) / np.sqrt(len(diff)))
         comparable[i] = float(np.mean(diff)) <= (
             comparable_sems * sem_diff + comparable_nats
         )
 
-    if selection == "smallest_comparable":
+    marginal_comparable = np.zeros(len(candidates), dtype=bool)
+    marginal_within_budget = np.zeros(len(candidates), dtype=bool)
+    if selection in ("smallest_comparable", "marginal_fidelity"):
         pool = np.flatnonzero(comparable)
         if len(pool) == 0:
-            # Degenerate paired test: NaN/-inf scores make even the best
-            # candidate incomparable to itself. Surface diverged fits
-            # loudly instead of an opaque IndexError.
-            if not np.isfinite(scores).any():
-                raise RuntimeError(
-                    "normalizing_flows_fit_auto: every candidate produced a "
-                    f"non-finite held-out score ({scores.tolist()}); the fits "
-                    "likely diverged. Try a smaller learning_rate or more "
-                    "training samples."
-                )
+            # Defensive fallback for a degenerate paired comparison. The best
+            # index was selected only from wholly finite held-out arrays.
             pool = np.array([best_idx])
-        # smallest parameter count; break size ties by score
-        sel_idx = int(pool[np.lexsort((-scores[pool], sizes[pool]))[0]])
+        if selection == "smallest_comparable":
+            # smallest parameter count; break size ties by score
+            sel_idx = int(pool[np.lexsort((-scores[pool], sizes[pool]))[0]])
+        else:
+            finite_pool = pool[np.isfinite(marginal_selection_errors[pool])]
+            if len(finite_pool) == 0:
+                raise RuntimeError(
+                    "Every held-out-comparable candidate produced a non-finite "
+                    "marginal-fidelity score."
+                )
+            ranking_pool = finite_pool
+            if max_marginal_error is not None:
+                finite_marginals = np.isfinite(marginal_errors)
+                marginal_within_budget[finite_marginals] = (
+                    marginal_errors[finite_marginals] <= max_marginal_error)
+                budget_pool = finite_pool[marginal_within_budget[finite_pool]]
+                if len(budget_pool):
+                    ranking_pool = budget_pool
+                else:
+                    warnings.warn(
+                        "No held-out-likelihood-comparable candidate met "
+                        f"max_marginal_error={max_marginal_error:g}; returning "
+                        "the least-bad fit. Inspect marginal_details before use.",
+                        stacklevel=2,
+                    )
+            best_marginal = float(np.min(
+                marginal_selection_errors[ranking_pool]))
+            tolerance = (0.5 / np.sqrt(marginal_samples)
+                         if marginal_tolerance is None else marginal_tolerance)
+            marginal_comparable[ranking_pool] = (
+                marginal_selection_errors[ranking_pool]
+                <= best_marginal + tolerance)
+            marginal_pool = np.flatnonzero(marginal_comparable)
+            order = np.lexsort((
+                -scores[marginal_pool],
+                marginal_selection_errors[marginal_pool],
+                sizes[marginal_pool],
+            ))
+            sel_idx = int(marginal_pool[order[0]])
     else:
         sel_idx = best_idx
 
     table = []
     for i, cand in enumerate(candidates):
-        table.append({"config": dict(cand), "val_logp": float(scores[i]),
-                      "sem": float(sems[i]), "n_params": int(sizes[i]),
-                      "comparable": bool(comparable[i]),
-                      "selected": i == sel_idx})
+        fit_status = ("failed" if flows[i] is None else
+                      "nonfinite_score" if not finite_candidates[i] else "ok")
+        row = {"config": dict(cand), "val_logp": float(scores[i]),
+               "sem": float(sems[i]),
+               "n_params": (None if flows[i] is None else int(sizes[i])),
+               "comparable": bool(comparable[i]),
+               "selected": i == sel_idx,
+               "fit_status": fit_status,
+               "fit_error": fit_errors[i]}
+        if selection == "marginal_fidelity":
+            worst = (max(marginal_details[i], key=lambda item: item["error"])
+                     if marginal_details[i] else None)
+            row.update({
+                "marginal_error": float(marginal_errors[i]),
+                "marginal_mean_error": float(marginal_mean_errors[i]),
+                "marginal_selection_error": float(marginal_selection_errors[i]),
+                "marginal_comparable": bool(marginal_comparable[i]),
+                "marginal_within_budget": (
+                    None if max_marginal_error is None
+                    else bool(marginal_within_budget[i])),
+                "marginal_components": (len(edge_features)
+                    if edge_features is not None
+                    else clean.shape[1] * len(marginal_q)),
+                "marginal_unresolved_components": sum(
+                    not item["resolved"] for item in marginal_details[i]),
+                "marginal_metric_source": ("literal_edge_bins"
+                    if edge_features is not None else "latent_quantiles"),
+                "marginal_worst_dimension": (
+                    None if worst is None else worst["dimension"]),
+                "marginal_worst_component": (
+                    None if worst is None else worst["component"]),
+                "marginal_details": marginal_details[i],
+            })
+        table.append(row)
         if verbose:
+            params_text = ("failed" if flows[i] is None else str(sizes[i]))
+            marginal_text = (
+                f"  marginal {marginal_errors[i]:.5f} "
+                f"(selection {marginal_selection_errors[i]:.5f})"
+                if selection == "marginal_fidelity" else "")
             print(f"[fit_auto] {i + 1}/{len(candidates)} {cand}: "
                   f"held-out logp {scores[i]:.3f} +- {sems[i]:.3f}  "
-                  f"params {sizes[i]}  comparable {bool(comparable[i])}")
+                  f"params {params_text}  comparable {bool(comparable[i])}"
+                  f"{marginal_text}")
 
     best_flow = flows[sel_idx]
+    assert best_flow is not None
+    used_refit = False
     if refit_best:
         kw = {"rng_seed": rng_seed, "show_progress": False,
               **shared_kwargs, **candidates[sel_idx]}
-        best_flow = normalizing_flows_fit(clean, **kw)
+        try:
+            refit_flow = normalizing_flows_fit(clean, **kw)
+            if selection == "marginal_fidelity":
+                (audit_error, audit_mean_error, audit_selection_error,
+                 audit_details) = _score_flow_marginals(
+                    best_flow, marginal_audit_seed)
+                (refit_error, refit_mean_error, refit_selection_error,
+                 refit_details) = _score_flow_marginals(
+                    refit_flow, marginal_audit_seed)
+                refit_lp = np.asarray(log_prob(refit_flow, val))
+                refit_density_finite = (
+                    refit_lp.shape == (len(val),)
+                    and bool(np.all(np.isfinite(refit_lp)))
+                )
+                refit_joint_sanity_passed = False
+                if refit_density_finite:
+                    refit_diff = lps[sel_idx] - refit_lp
+                    refit_sem_diff = float(
+                        np.std(refit_diff) / np.sqrt(len(refit_diff)))
+                    refit_joint_sanity_passed = float(np.mean(refit_diff)) <= (
+                        comparable_sems * refit_sem_diff + comparable_nats)
+                tolerance = (0.5 / np.sqrt(marginal_samples)
+                             if marginal_tolerance is None
+                             else marginal_tolerance)
+                details_align = (
+                    len(audit_details) == len(refit_details)
+                    and all(
+                        (before["dimension"], before["component"])
+                        == (after["dimension"], after["component"])
+                        for before, after in zip(audit_details, refit_details)
+                    )
+                )
+                regressions = []
+                if details_align:
+                    regressions = [
+                        f"dimension {before['dimension']} {before['component']}"
+                        for before, after in zip(audit_details, refit_details)
+                        if after["selection_error"]
+                        > before["selection_error"] + tolerance
+                    ]
+                audit_met_budget = (
+                    max_marginal_error is None
+                    or audit_error <= max_marginal_error
+                )
+                refit_met_budget = (
+                    max_marginal_error is None
+                    or refit_error <= max_marginal_error
+                )
+                refit_used = (
+                    np.isfinite(audit_selection_error)
+                    and np.isfinite(refit_selection_error)
+                    and refit_density_finite
+                    and refit_joint_sanity_passed
+                    and details_align
+                    and not regressions
+                    and refit_met_budget
+                )
+                table[sel_idx].update({
+                    "audit_marginal_error": float(audit_error),
+                    "audit_marginal_mean_error": float(audit_mean_error),
+                    "audit_marginal_selection_error": float(
+                        audit_selection_error),
+                    "audit_marginal_details": audit_details,
+                    "audit_marginal_within_budget": (
+                        None if max_marginal_error is None
+                        else bool(audit_met_budget)),
+                    "refit_marginal_error": float(refit_error),
+                    "refit_marginal_mean_error": float(refit_mean_error),
+                    "refit_marginal_selection_error": float(
+                        refit_selection_error),
+                    "refit_marginal_details": refit_details,
+                    "refit_density_finite": bool(refit_density_finite),
+                    "refit_marginal_within_budget": (
+                        None if max_marginal_error is None
+                        else bool(refit_met_budget)),
+                    "refit_joint_sanity_passed": bool(
+                        refit_joint_sanity_passed),
+                    "refit_regressed_components": regressions,
+                    "refit_used": bool(refit_used),
+                })
+                if refit_used:
+                    best_flow = refit_flow
+                    used_refit = True
+                else:
+                    budget_note = (
+                        " The returned split fit also exceeded the error budget "
+                        "on the fresh audit."
+                        if max_marginal_error is not None
+                        and not audit_met_budget else ""
+                    )
+                    warnings.warn(
+                        "The full-data refit worsened one or more marginal "
+                        "components, exceeded the requested error budget, or "
+                        "failed the joint-fit sanity or finite-density check; "
+                        "returning the validated split fit instead. The selected "
+                        "table row reports the refit diagnostics." + budget_note,
+                        stacklevel=2,
+                    )
+            else:
+                best_flow = refit_flow
+                used_refit = True
+        except Exception as exc:
+            refit_error_text = f"{type(exc).__name__}: {exc}"
+            table[sel_idx].update({
+                "refit_used": False,
+                "refit_error": refit_error_text,
+            })
+            warnings.warn(
+                "The full-data refit failed; returning the validated split fit "
+                f"instead ({refit_error_text}).",
+                stacklevel=2,
+            )
     if verbose:
         print(f"[fit_auto] selected {candidates[sel_idx]} "
               f"(held-out logp {scores[sel_idx]:.3f}, {sizes[sel_idx]} params"
-              f"{', refit on full chain' if refit_best else ''})")
+              f"{', refit on full chain' if used_refit else ''})")
 
     if return_table:
         return best_flow, table
@@ -818,7 +1430,6 @@ def _smooth_clamp_limits(flow) -> Optional[tuple[np.ndarray, np.ndarray]]:
     bijection = getattr(flow, "bijection", None)
     if not isinstance(bijection, Stack):
         return None
-    from paramax import unwrap
     los, his, found = [], [], False
     for b in bijection.bijections:
         m = unwrap(b)

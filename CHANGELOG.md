@@ -4,6 +4,20 @@ All notable changes to **coppuccino** are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `normalizing_flows_fit_auto(selection="marginal_fidelity")`, a non-calibration
+  model-selection remedy for Gaussian marginal drift. It ranks marginal fits
+  only among candidates that remain statistically comparable in held-out joint
+  likelihood, with an optional absolute probability-mass error budget. Shared
+  physical bin edges score literal first/last bins together with under/overflow;
+  each cell supports its own ESS and directional Wilson-interval treatment.
+  Component diagnostics are returned, failed candidates are isolated, and a
+  full-data refit that regresses any audited component or the joint-fit sanity
+  check automatically falls back to the validated split fit.
+
 ## [2.0.0] — 2026-07-11
 
 ### Changed
