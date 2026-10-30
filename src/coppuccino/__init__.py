@@ -16,7 +16,6 @@ from coppuccino.copula_flows import (
     sample,
     log_prob,
     sample_and_log_prob,
-    CopulaFlow,
 )
 from coppuccino.model_io import save_flow, load_flow
 from coppuccino.hdr import compute_injection_hdr, check_in_support
@@ -30,7 +29,6 @@ __all__ = [
     "sample",
     "log_prob",
     "sample_and_log_prob",
-    "CopulaFlow",
     "FleetFlow",
     "calibrate_edge_bins",
     "save_flow",

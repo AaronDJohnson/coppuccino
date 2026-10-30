@@ -186,3 +186,25 @@ cython_debug/
 diagnostics/
 *.pkl
 src/.DS_Store
+
+# LaTeX build products of docs/*.tex. The .tex source is tracked; the compiled
+# PDF is ~450 KB per rebuild and does not belong in history. (*.log is already
+# matched by the Django section above.)
+docs/*.pdf
+docs/*.aux
+docs/*.out
+docs/*.toc
+docs/*.bbl
+docs/*.blg
+docs/*.synctex.gz
+
+# Benchmark output written by scripts/bench_*.py. The drivers are tracked; their
+# results are machine-specific and get regenerated, not reviewed.
+scripts/*_results.json
+
+# Scratch working directories used by measurement and code-review passes. They
+# hold one-off drivers and their output and are never committed. The glob covers
+# the names actually in use (.fix-scratch/, .r2-scratch/) without needing a line
+# per pass. Worth ignoring even though untracked files never reach CI: the local
+# `uv run ruff check .` that CONTRIBUTING asks for does walk into them.
+.*-scratch/

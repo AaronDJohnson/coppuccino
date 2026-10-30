@@ -1,4 +1,4 @@
-"""Tests for the smooth-tail marginal (``copula_space="gaussian"`` default).
+"""Tests for the smooth-tail marginal (the ``normalizing_flows_fit`` default).
 
 ``marginal="smooth"`` replaces the legacy clipped PIT/ndtri marginal with a
 single clip-free diffeomorphism ``theta(z)``: R onto the support (RQS bulk on
@@ -13,19 +13,25 @@ The tests pin:
 * marginal-level exactness: round trip, true log-derivative, and an exact
   s == q shell comparison (z drawn from the *known* N(0,1) base, so expected
   shell masses are analytic Phi differences at any wall depth);
+* wall fidelity: the density reported at a prior bound against the analytic
+  truth for laws whose wall density is finite and positive, and that the
+  density integrates to 1 by grid-free Monte Carlo;
 * flow-level hygiene: no exact-bound atoms / out-of-bounds / NaN draws, no
   wall cliff or floor in log_prob, bounded per-decade ladder rates;
 * the sample_and_log_prob contract: the sampling layer redraws rows whose
   bounded tails saturated at the float64 wall-resolution limit, so the
   reported density is exactly log_prob for every emitted row;
-* guards, default resolution per copula_space, and save/load round trip.
+* guards, default marginal resolution, and save/load round trip.
 """
 
 import os
 import tempfile
+import warnings
 
+import jax.numpy as jnp
 import numpy as np
 import pytest
+from scipy import stats
 from scipy.stats import norm
 
 from coppuccino import (
@@ -65,7 +71,7 @@ def smooth_flow():
     """Fit once, reuse across tests (fits dominate test runtime)."""
     chain = _testbed_chain()
     flow = normalizing_flows_fit(
-        chain, prior_bounds=BOUNDS, copula_space="gaussian",
+        chain, prior_bounds=BOUNDS,
         max_epochs=60, rng_seed=3, show_progress=False,
     )
     return flow, chain
@@ -74,6 +80,17 @@ def smooth_flow():
 # ---------------------------------------------------------------------------
 # marginal-level: the bijection itself is exact
 # ---------------------------------------------------------------------------
+
+def _log_ddz(log_ddz, z):
+    """``log dtheta/dz`` as a plain numpy array."""
+    return np.asarray(log_ddz(jnp.asarray(z)))
+
+
+def _marginal_log_pdf(z_of_theta, log_ddz, x):
+    """Marginal log-density the map reports at data-space point(s) ``x``."""
+    z = np.asarray(z_of_theta(jnp.asarray(x)))
+    return -0.5 * z ** 2 - 0.5 * np.log(2 * np.pi) - _log_ddz(log_ddz, z)
+
 
 def _clamp_plateaus(theta_of_z, z_of_theta):
     """Self-reported clamp depths: fixed points of the deep round trip.
@@ -177,16 +194,26 @@ def test_marginal_handles_ties_and_spikes_both_walls():
     rng = np.random.default_rng(4)
     x = rng.beta(0.5, 0.5, 4000)          # spikes at BOTH walls
     x[:200] = 0.25                          # heavy tie block
-    theta_of_z, z_of_theta, _, _ = make_smooth_marginal(
+    theta_of_z, z_of_theta, log_ddz, _ = make_smooth_marginal(
         x, prior_low=0.0, prior_high=1.0)
     p_lo, p_hi = _clamp_plateaus(theta_of_z, z_of_theta)
     z = np.linspace(max(-7, p_lo + 1e-3), min(7, p_hi - 1e-3), 2001)
     th = np.asarray(theta_of_z(z))
     assert np.all(np.diff(th) >= 0)
     assert th.min() > 0.0 and th.max() < 1.0
-    dz = np.abs(np.asarray(z_of_theta(th)) - z)
+    z_back = np.asarray(z_of_theta(th))
+    dz = np.abs(z_back - z)
     assert np.max(dz[np.abs(z) <= 4.0]) < 1e-8
-    assert np.max(dz * np.maximum(np.abs(z), 1.0)) < 1e-3
+    # Deeper than that ``theta`` itself runs out of float64: within 1e-13 of a
+    # bound of magnitude 1 the wall offset is only representable to a part in
+    # 1e-3, so the round trip cannot be exact there and |dz| reaches 9.3e-4 on
+    # this fit. What the sampling contract actually needs is that the two
+    # directions report the same *density* at the same point, and that holds
+    # to 3.4e-10 -- the density is flat in that region, which is exactly why
+    # the z it is read off is imprecise.
+    lq_out = -0.5 * z ** 2 - _log_ddz(log_ddz, z)
+    lq_back = -0.5 * z_back ** 2 - _log_ddz(log_ddz, z_back)
+    assert np.max(np.abs(lq_out - lq_back)) < 1e-7
 
 
 # ---------------------------------------------------------------------------
@@ -204,24 +231,43 @@ def test_gaussian_default_resolves_to_smooth(smooth_flow):
 
 def test_guards():
     chain = _testbed_chain(600)
-    with pytest.raises(ValueError, match="uniform"):
+    with pytest.raises(ValueError, match="removed in coppuccino 3.0.0"):
         normalizing_flows_fit(chain, copula_space="uniform", marginal="smooth",
                               max_epochs=1)
     with pytest.raises(ValueError, match="tail_alpha"):
-        normalizing_flows_fit(chain, copula_space="gaussian", marginal="smooth",
+        normalizing_flows_fit(chain, marginal="smooth",
                               tail_extension=True, max_epochs=1)
     with pytest.raises(ValueError, match="tail_alpha"):
-        normalizing_flows_fit(chain, copula_space="gaussian", marginal="smooth",
+        normalizing_flows_fit(chain, marginal="smooth",
                               tail_model="gpd", max_epochs=1)
     with pytest.raises(ValueError, match="marginal"):
         normalizing_flows_fit(chain, marginal="nope", max_epochs=1)
+
+
+def test_default_marginal_warns_when_it_discards_tail_alpha():
+    """``tail_alpha`` is consumed only by ``marginal="smooth"``. Requesting a
+    legacy tail model *explicitly* alongside it raises (see ``test_guards``),
+    but leaving ``marginal`` at its default silently resolved to ``"rqs"`` and
+    dropped ``tail_alpha`` on the floor."""
+    chain = _testbed_chain(600)
+    with pytest.warns(UserWarning, match="tail_alpha=2.0 is ignored"):
+        flow = normalizing_flows_fit(chain, tail_extension=True, tail_alpha=2.0,
+                                     max_epochs=1, show_progress=False)
+    from paramax import unwrap
+    assert all(str(unwrap(b.marginal)) == "rqs" for b in flow.bijection.bijections)
+
+    # the default tail_alpha is not "discarded" in any meaningful sense
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        normalizing_flows_fit(chain, tail_extension=True, max_epochs=1,
+                              show_progress=False)
 
 
 def test_legacy_marginals_still_available():
     chain = _testbed_chain(1500)
     finite = np.array([[0., 1.], [-6., 6.], [-6., 6.], [-2., 2.]])
     flow = normalizing_flows_fit(chain, prior_bounds=finite,
-                                 copula_space="gaussian", marginal="rqs",
+                                 marginal="rqs",
                                  max_epochs=2, show_progress=False)
     assert np.all(np.isfinite(log_prob(flow, chain[:50])))
 
@@ -240,9 +286,29 @@ def test_no_atoms_no_oob_no_nan(smooth_flow):
 
 
 def test_wall_ladder_no_cliff_no_floor(smooth_flow):
-    """log q toward a hard wall changes at a bounded, smoothly varying rate:
-    no cliff (legacy: ~10-nat drop) and no floor (legacy: exactly constant
-    plateau below the last knot)."""
+    """log q toward a hard wall: finite, no cliff, and one declared plateau.
+
+    The marginal now carries a finite wall density, so its own ladder settles
+    onto a constant (checked to 0.05 nats below, and against the analytic
+    truth in ``test_wall_density_matches_the_analytic_truth``). What still
+    moves is the *copula*: past its outermost knot -- which sits on the most
+    extreme sample, so it is the deepest |z| the copula ever saw -- it
+    extrapolates linearly, and the bounded tail is allowed to run
+    ``_WALL_Z_MARGIN`` further before it saturates. Measured on this fixture
+    the joint ladder is monotone in |z| and its largest per-decade step is
+    4.15 nats (dim 0) and 1.79 (dim 3), so the bound below is a pin on that
+    extrapolation, not on the marginal. The per-decade bound over the first
+    six decades -- where |z| stays inside the copula's knots -- is the part
+    that tests the marginal.
+
+    The last rungs repeat, and that is the declared trade: below
+    ``x_clamp_lo`` / ``x_clamp_hi`` the tail saturates and every query reads
+    the same density. What must hold is that the plateau starts exactly where
+    the builder says it does, and nowhere earlier. Letting the tail run to
+    ``|z| = 8`` instead made all 15 rungs distinct but drove the wall value to
+    +12.87 (dim 0) and +11.96 (dim 3) against +9.91 and +2.51 here, above the
+    density of any draw the flow emits.
+    """
     flow, chain = smooth_flow
     med = np.median(chain, axis=0)
     ks = np.arange(1, 16)
@@ -255,9 +321,119 @@ def test_wall_ladder_no_cliff_no_floor(smooth_flow):
         lad = np.array(lad)
         d = np.diff(lad)
         assert np.all(np.isfinite(lad))
-        assert np.all(np.abs(d) < 2.6), d          # pdf grows at most ~1/(wall-x)
-        assert np.all(np.abs(np.diff(d[-8:])) < 2.5), d  # no cliff
-        assert not np.allclose(d[-5:], 0.0, atol=1e-3)   # no exact floor
+        assert np.all(np.abs(d[:6]) < 2.6), d   # pdf grows at most ~1/(wall-x)
+        assert np.all(np.abs(d) < 5.0), d       # no cliff anywhere
+
+        # the marginal alone -- the part this module owns -- converges
+        theta_of_z, z_of_theta, log_ddz, clamps = make_smooth_marginal(
+            chain[:, dim], prior_low=BOUNDS[dim, 0], prior_high=BOUNDS[dim, 1])
+        # the plateau is exactly the saturated sliver the builder declares:
+        # every rung outside it is a distinct query, every rung inside it
+        # repeats the wall value
+        offsets = 10.0 ** (-ks.astype(float))
+        clamp_offset = (clamps[0] - wall) if sign > 0 else (wall - clamps[1])
+        resolved = offsets > clamp_offset
+        # the plateau must not reach into the decades the steps above test:
+        # measured clamp offsets are 3.4e-12 (dim 0) and 5.8e-8 (dim 3)
+        assert resolved.sum() >= 7, clamp_offset
+        assert len(np.unique(lad[resolved])) == int(resolved.sum()), lad
+        assert np.all(lad[~resolved] == lad[-1]), lad
+        xs = wall + sign * 10.0 ** (-ks.astype(float))
+        marg = _marginal_log_pdf(z_of_theta, log_ddz, xs)
+        assert np.all(np.isfinite(marg))
+        assert np.max(np.abs(np.diff(marg[-5:]))) < 0.05, marg
+        assert abs(marg[-1] - float(_marginal_log_pdf(
+            z_of_theta, log_ddz, np.asarray(float(wall))))) < 0.05
+
+
+@pytest.mark.parametrize("law,lo,hi,truth,med_tol,max_tol", [
+    ("truncnorm", -1.0, 1.0,
+     lambda t: stats.truncnorm.logpdf(t, -1, 1), 1.5, 3.0),
+    ("uniform", 0.0, 1.0, lambda t: np.zeros_like(np.asarray(t, float)),
+     1.5, 3.0),
+])
+def test_wall_density_matches_the_analytic_truth(law, lo, hi, truth,
+                                                 med_tol, max_tol):
+    """At a wall where the truth is finite and positive, so is the report.
+
+    The bounded tail used to be ``theta = lo + gap * exp(c (z - z1))``, which
+    makes ``theta - lo`` log-normal: its density at the bound is 0 or
+    infinity depending on the fitted rate, never a positive constant. Over
+    the six probe points below (each bound, and 1e-9 / 1e-6 of the span
+    inside it) on 8 seeds x n = 1500, the old family gave median |error|
+    173.5 nats and worst 5.6e4 on truncated N(0, 1) over [-1, 1], and median
+    179.6 / worst 2.3e4 on U(0, 1) over [0, 1]. The current family gives
+    median 0.83 / worst 1.78 and median 0.74 / worst 1.49 respectively; the
+    thresholds here sit at roughly twice that, since the residual is set by
+    the outermost order statistic and moves with the seed family.
+    """
+    span = hi - lo
+    errors = []
+    for seed in range(8):
+        rng = np.random.default_rng(4000 + seed)
+        x = (stats.truncnorm.rvs(-1, 1, size=1500, random_state=rng)
+             if law == "truncnorm" else rng.uniform(lo, hi, 1500))
+        _, z_of_theta, log_ddz, _ = make_smooth_marginal(
+            x, prior_low=lo, prior_high=hi)
+        probes = np.array([lo, lo + 1e-9 * span, lo + 1e-6 * span,
+                           hi - 1e-6 * span, hi - 1e-9 * span, hi])
+        got = _marginal_log_pdf(z_of_theta, log_ddz, probes)
+        ref = np.array([float(truth(np.clip(p, lo + 1e-12 * span,
+                                            hi - 1e-12 * span)))
+                        for p in probes])
+        assert np.all(np.isfinite(got))
+        errors.extend(np.abs(got - ref))
+    assert np.median(errors) < med_tol, np.median(errors)
+    assert np.max(errors) < max_tol, np.max(errors)
+
+
+def test_bounded_density_integrates_to_one():
+    """Grid-free check that the marginal is a probability density.
+
+    Uniform importance sampling over the box, not quadrature: an earlier
+    trapezoid estimate of the same quantity was retracted as a grid artifact
+    (the boundary grid line carried the wall spike).
+    """
+    rng = np.random.default_rng(11)
+    for x, lo, hi in ((rng.beta(0.5, 3.0, 2000), 0.0, 1.0),
+                      (np.clip(rng.normal(0.9, 0.25, 2000), -1, 1), -1.0, 1.0),
+                      (rng.uniform(0.0, 1.0, 2000), 0.0, 1.0)):
+        _, z_of_theta, log_ddz, _ = make_smooth_marginal(
+            x, prior_low=lo, prior_high=hi)
+        u = rng.uniform(lo, hi, 400_000)
+        mass = np.mean(np.exp(_marginal_log_pdf(z_of_theta, log_ddz, u)))
+        mass *= (hi - lo)
+        assert abs(mass - 1.0) < 0.05, mass
+
+
+def test_guard_rails_on_scale_and_tail_alpha():
+    """Silently-broken maps become named errors.
+
+    Data far above the spline kernel's float64 headroom used to return a
+    non-finite, non-monotone map (standard normals scaled by 1e80: NaN round
+    trip; by 1e120: theta_of_z all NaN), and ``tail_alpha`` was checked only
+    for being non-negative, so 1e6 fitted silently and emitted samples up to
+    1.8e298.
+    """
+    x = np.random.default_rng(6).standard_normal(600)
+    with pytest.raises(ValueError, match="tail_alpha must be in"):
+        make_smooth_marginal(x, tail_alpha=1e6)
+    with pytest.raises(ValueError, match="tail_alpha must be in"):
+        make_smooth_marginal(x, tail_alpha=-0.5)
+    # the documented range still fits, and stays representable
+    theta = np.asarray(make_smooth_marginal(x, tail_alpha=10.0)[0](
+        np.random.default_rng(7).standard_normal(20000)))
+    assert np.all(np.isfinite(theta)) and np.max(np.abs(theta)) < 1e8
+
+    for scale in (1e80, 1e160):
+        with pytest.raises(ValueError, match=r"above the 1e\+75 limit"):
+            make_smooth_marginal(x * scale)
+    with pytest.raises(ValueError, match=r"above the 1e\+75 limit"):
+        make_smooth_marginal(x, prior_low=-1e80, prior_high=1e80)
+    # just under the limit still builds a finite monotone map
+    z = np.linspace(-6.0, 6.0, 401)
+    theta = np.asarray(make_smooth_marginal(x * 1e70)[0](z))
+    assert np.all(np.isfinite(theta)) and np.all(np.diff(theta) > 0)
 
 
 def test_sample_logprob_contract(smooth_flow):
@@ -269,11 +445,19 @@ def test_sample_logprob_contract(smooth_flow):
     s = np.asarray(s)
     d = np.abs(np.asarray(lq) - np.asarray(log_prob(flow, s)))
     assert np.max(d) < 1e-8, np.max(d)
-    # and no emitted row sits at/beyond a tail clamp
-    from coppuccino.copula_flows import _smooth_clamp_limits, _clamped_rows
-    limits = _smooth_clamp_limits(flow)
-    assert limits is not None
-    assert not _clamped_rows(s, limits).any()
+    # And no emitted row sits at or beyond a tail clamp. The oracle is read
+    # straight off the marginals, not from the sampler's own rejection helper:
+    # reusing that helper would make this assertion pass for any helper at all,
+    # including one that never rejects anything.
+    from paramax import unwrap
+    los, his = [], []
+    for b in flow.bijection.bijections:
+        m = unwrap(b)
+        los.append(-np.inf if m.x_clamp_lo is None else float(m.x_clamp_lo))
+        his.append(np.inf if m.x_clamp_hi is None else float(m.x_clamp_hi))
+    los, his = np.asarray(los), np.asarray(his)
+    assert np.any(np.isfinite(los) | np.isfinite(his)), "fixture has no bounds"
+    assert not np.any((s <= los[None, :]) | (s >= his[None, :]))
 
 
 def test_outlier_queries_finite_and_decaying(smooth_flow):
@@ -318,14 +502,63 @@ def test_save_load_round_trip(smooth_flow):
 
 def test_load_predates_tail_alpha_key():
     """Files saved before tail_alpha existed reconstruct with the default."""
-    from coppuccino.model_io import (_extract_spline_data,
-                                     _reconstruct_empirical_transforms)
+    from coppuccino.model_io import _extract_spline_data, _reconstruct_empirical_transforms
     chain = _testbed_chain(1500)
     flow = normalizing_flows_fit(chain, prior_bounds=BOUNDS,
-                                 copula_space="gaussian", max_epochs=2,
+                                 max_epochs=2,
                                  show_progress=False)
     data = _extract_spline_data(flow)
     data.pop('tail_alpha')
     stack = _reconstruct_empirical_transforms(data)
     from paramax import unwrap
     assert all(unwrap(b).tail_alpha == 0.0 for b in stack.bijections)
+
+
+def test_bounds_far_from_the_origin_with_a_wall_atom():
+    """A bound whose magnitude dwarfs the span still builds a usable map.
+
+    ``prior_high - thK`` rounds to exactly zero once ``bound + offset``
+    absorbs back to ``bound`` in float, which used to divide by zero in the
+    tail rate. The gap is floored at one ULP of the bound instead.
+    """
+    lo, hi = 1e10, 1e10 + 1e-4
+    rng = np.random.default_rng(0)
+    samples = np.concatenate([np.full(300, hi), rng.uniform(lo, hi, 300)])
+
+    theta_of_z, z_of_theta, log_dtheta_dz, *_ = make_smooth_marginal(
+        samples, prior_low=lo, prior_high=hi)
+
+    z = np.linspace(-6.0, 6.0, 401)
+    theta = np.asarray(theta_of_z(z))
+    assert np.all(np.isfinite(theta))
+    assert np.all((theta >= lo) & (theta <= hi))
+    # The whole support is ~50 ULPs wide at this magnitude, so monotonicity
+    # holds only to the float grid it is expressed on -- that is a property of
+    # the bounds, not of the map.
+    assert np.all(np.diff(theta) >= -np.spacing(hi))
+    assert np.all(np.isfinite(np.asarray(log_dtheta_dz(z))))
+    # the wall atom itself must not blow up
+    assert np.isfinite(float(z_of_theta(np.asarray(hi))))
+
+
+def test_absorption_window_does_not_scale_with_an_uninformative_prior():
+    """A wide prior must not swallow the interior of the chain.
+
+    The boundary-atom window was scaled by the *prior* span, so a diffuse
+    prior_bounds=[[0, 1e12]] on a chain spanning ~[5e2, 4e3] reached out to
+    x = 1000 and relocated every sample below it onto a single point --
+    z_of_theta was then bit-identical across two decades of real support.
+    """
+    rng = np.random.default_rng(0)
+    samples = rng.gamma(9.0, 200.0, 3000)
+    probe = np.array([50.0, 200.0, 400.0, 700.0, 1000.0])
+
+    _, z_wide, *_ = make_smooth_marginal(samples, prior_low=0.0,
+                                         prior_high=1e12)
+    z = np.asarray(z_wide(probe))
+    assert np.all(np.diff(z) > 0.0), "interior points collapsed onto one value"
+
+    # and the map must not depend on how uninformative the prior is
+    _, z_snug, *_ = make_smooth_marginal(samples, prior_low=0.0,
+                                         prior_high=5000.0)
+    assert np.allclose(z, np.asarray(z_snug(probe)), rtol=0, atol=0)

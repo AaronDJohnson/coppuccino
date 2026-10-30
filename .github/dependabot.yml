@@ -1,7 +1,8 @@
 version: 2
 updates:
   # Keep GitHub Actions (including the release-privileged publish job) current.
-  # Pair this with SHA-pinning the actions for supply-chain safety.
+  # Both workflows pin actions by full commit SHA; Dependabot understands those
+  # pins and rewrites the trailing version comment when it bumps one.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
@@ -10,3 +11,38 @@ updates:
       actions:
         patterns:
           - "*"
+
+  # uv.lock and the pyproject floors/ceilings. Without this the CI matrix only
+  # ever resolves from the committed lock ("highest") or from the declared floors
+  # ("lowest-direct"), so no job in the repo installs a dependency newer than the
+  # lock and a breaking upstream release reaches users with nothing red in CI.
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      # One PR per week for the scientific stack: jax, jaxlib, flowjax, equinox,
+      # interpax, paramax and jaxtyping are version-coupled, so bumping them
+      # separately produces resolutions that cannot install.
+      jax-stack:
+        patterns:
+          - "jax"
+          - "jaxlib"
+          - "jaxtyping"
+          - "equinox"
+          - "flowjax"
+          - "interpax"
+          - "paramax"
+          - "optax"
+      rest:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "jax"
+          - "jaxlib"
+          - "jaxtyping"
+          - "equinox"
+          - "flowjax"
+          - "interpax"
+          - "paramax"
+          - "optax"

@@ -14,9 +14,9 @@ quadratic-spline parameterization.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import Any, ClassVar, Optional
 import warnings
+from collections.abc import Sequence
+from typing import Any, ClassVar, NamedTuple, Optional
 
 import equinox as eqx
 import jax
@@ -25,56 +25,33 @@ import numpy as np
 from flowjax.bijections import AbstractBijection, Stack
 from flowjax.distributions import Transformed
 from paramax import non_trainable, unwrap
-from scipy.interpolate import PchipInterpolator
-from scipy.special import ndtri
 
-from coppuccino.bijections import SmoothMarginalToGaussian
+from coppuccino._stats import wilson_interval
+from coppuccino.bijections import (
+    _POS_FLOOR,
+    SmoothMarginalToGaussian,
+    _rqs_derivative,
+    _rqs_forward,
+    _rqs_inverse,
+    _rqs_knot_derivatives,
+)
 
 __all__ = ["calibrate_edge_bins"]
 
 
 _KNOT_DERIVATIVE_FLOOR = 1e-8
-_POSITIVE_FLOOR = 1e-30
 
 
-def _rqs_forward(x, xk, yk, dk):
-    """Evaluate a scalar monotone RQS and its log derivative."""
-    n_bins = xk.shape[0] - 1
-    k = jnp.clip(jnp.searchsorted(xk, x, side="right") - 1, 0, n_bins - 1)
-    width = xk[k + 1] - xk[k]
-    height = yk[k + 1] - yk[k]
-    secant = height / width
-    xi = (x - xk[k]) / width
-    one_minus_xi = 1.0 - xi
-    curvature = dk[k + 1] + dk[k] - 2.0 * secant
-    denominator = secant + curvature * xi * one_minus_xi
-    numerator = height * (secant * xi**2 + dk[k] * xi * one_minus_xi)
-    y = yk[k] + numerator / denominator
-
-    derivative_numerator = secant**2 * (
-        dk[k + 1] * xi**2 + 2.0 * secant * xi * one_minus_xi + dk[k] * one_minus_xi**2
-    )
-    derivative = derivative_numerator / denominator**2
-    return y, jnp.log(jnp.maximum(derivative, _POSITIVE_FLOOR))
+def _rqs_forward_and_log_det(x, xk, yk, dk):
+    """Evaluate a monotone RQS and its log derivative."""
+    return (_rqs_forward(x, xk, yk, dk),
+            jnp.log(_rqs_derivative(x, xk, yk, dk, floor=_POS_FLOOR)))
 
 
-def _rqs_inverse(y, xk, yk, dk):
+def _rqs_inverse_and_log_det(y, xk, yk, dk):
     """Evaluate the closed-form inverse RQS and its log derivative."""
-    n_bins = yk.shape[0] - 1
-    k = jnp.clip(jnp.searchsorted(yk, y, side="right") - 1, 0, n_bins - 1)
-    width = xk[k + 1] - xk[k]
-    height = yk[k + 1] - yk[k]
-    secant = height / width
-    alpha = y - yk[k]
-    curvature = dk[k + 1] + dk[k] - 2.0 * secant
-    a = height * (secant - dk[k]) + alpha * curvature
-    b = height * dk[k] - alpha * curvature
-    c = -secant * alpha
-    discriminant = jnp.maximum(b**2 - 4.0 * a * c, 0.0)
-    xi = 2.0 * c / (-b - jnp.sqrt(discriminant))
-    xi = jnp.clip(xi, 0.0, 1.0)
-    x = xk[k] + xi * width
-    _, forward_log_det = _rqs_forward(x, xk, yk, dk)
+    x = _rqs_inverse(y, xk, yk, dk)
+    _, forward_log_det = _rqs_forward_and_log_det(x, xk, yk, dk)
     return x, -forward_log_det
 
 
@@ -95,8 +72,11 @@ class _EdgeMarginalCalibration(AbstractBijection):
     upper_derivatives: jax.Array
     lower_enabled: bool = eqx.field(static=True)
     upper_enabled: bool = eqx.field(static=True)
-    cond_shape: ClassVar[None] = None
-    shape: ClassVar[tuple[int, ...]] = ()
+    # flowjax declares shape/cond_shape as equinox ``AbstractVar``, which mypy
+    # reads as instance variables of the base; a concrete ``ClassVar`` is the
+    # intended implementation here (both are per-class constants).
+    cond_shape: ClassVar[None] = None  # type: ignore[misc]
+    shape: ClassVar[tuple[int, ...]] = ()  # type: ignore[misc]
 
     def __init__(
         self,
@@ -132,11 +112,11 @@ class _EdgeMarginalCalibration(AbstractBijection):
         )
 
         lower_input = jnp.clip(x, self.lower_x[0], self.lower_x[-1])
-        lower_value, lower_log_det = _rqs_forward(
+        lower_value, lower_log_det = _rqs_forward_and_log_det(
             lower_input, self.lower_x, self.lower_y, self.lower_derivatives
         )
         upper_input = jnp.clip(x, self.upper_x[0], self.upper_x[-1])
-        upper_value, upper_log_det = _rqs_forward(
+        upper_value, upper_log_det = _rqs_forward_and_log_det(
             upper_input, self.upper_x, self.upper_y, self.upper_derivatives
         )
 
@@ -166,11 +146,11 @@ class _EdgeMarginalCalibration(AbstractBijection):
         )
 
         lower_input = jnp.clip(y, self.lower_y[0], self.lower_y[-1])
-        lower_value, lower_log_det = _rqs_inverse(
+        lower_value, lower_log_det = _rqs_inverse_and_log_det(
             lower_input, self.lower_x, self.lower_y, self.lower_derivatives
         )
         upper_input = jnp.clip(y, self.upper_y[0], self.upper_y[-1])
-        upper_value, upper_log_det = _rqs_inverse(
+        upper_value, upper_log_det = _rqs_inverse_and_log_det(
             upper_input, self.upper_x, self.upper_y, self.upper_derivatives
         )
 
@@ -188,12 +168,16 @@ class _EdgeMarginalCalibration(AbstractBijection):
 
 
 def _window_derivatives(x_knots: np.ndarray, y_knots: np.ndarray) -> np.ndarray:
-    """Positive shape-preserving knot derivatives with unit-slope guards."""
-    derivative = np.asarray(PchipInterpolator(x_knots, y_knots).derivative()(x_knots), dtype=float)
-    derivative = np.maximum(derivative, _KNOT_DERIVATIVE_FLOOR)
-    derivative[0] = 1.0
-    derivative[-1] = 1.0
-    return derivative
+    """Positive shape-preserving knot derivatives with unit-slope guards.
+
+    The floor is far above the generic ``_POS_FLOOR`` the other RQS knots use:
+    a window here must stay invertible at working precision, not merely
+    non-degenerate. The unit endpoint slopes are what make each window join
+    the identity core with a continuous Jacobian.
+    """
+    return _rqs_knot_derivatives(
+        x_knots, y_knots, floor=_KNOT_DERIVATIVE_FLOOR, edge_slopes=(1.0, 1.0)
+    )
 
 
 def _make_calibration(
@@ -328,24 +312,6 @@ def _is_edge_calibrated(flow: Transformed) -> bool:
     )
 
 
-def _wilson_interval(
-    probability: np.ndarray,
-    effective_n: float,
-    confidence_level: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Wilson score intervals, allowing a non-integer effective sample size."""
-    z = float(ndtri(0.5 + confidence_level / 2.0))
-    z2_over_n = z**2 / effective_n
-    denominator = 1.0 + z2_over_n
-    center = (probability + 0.5 * z2_over_n) / denominator
-    half_width = (
-        z
-        * np.sqrt(probability * (1.0 - probability) / effective_n + z**2 / (4.0 * effective_n**2))
-        / denominator
-    )
-    return center - half_width, center + half_width
-
-
 def _normalise_reference_ess(
     reference_ess: Optional[float | Sequence[float]],
     n_dims: int,
@@ -373,7 +339,7 @@ def _gated_probabilities(
     force: bool,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Return minimum-change targets plus active masks and score intervals."""
-    lower, upper = _wilson_interval(target, effective_n, confidence_level)
+    lower, upper = wilson_interval(target, effective_n, confidence_level)
     if force:
         return target.copy(), np.ones_like(target, dtype=bool), lower, upper
     active_low = before < lower
@@ -381,6 +347,329 @@ def _gated_probabilities(
     active = active_low | active_high
     fitted = np.where(active_low, lower, np.where(active_high, upper, before))
     return fitted, active, lower, upper
+
+
+class _CalibrationSettings(NamedTuple):
+    """The validated scalar knobs every dimension's calibration shares.
+
+    Bundling them keeps the per-dimension helpers from re-declaring the public
+    signature; the public function still takes them one by one.
+    """
+
+    edge_bins: int
+    core_quantiles: tuple[float, float]
+    n_calibration_samples: int
+    confidence_level: float
+    min_reference_bin_count: int
+    min_calibration_tail_count: int
+    force: bool
+
+
+def _flow_marginals(flow: Transformed) -> list[SmoothMarginalToGaussian]:
+    """Return the flow's smooth marginal transforms, rejecting anything else.
+
+    Notes
+    -----
+    The ``FleetFlow`` import is deferred: ``coppuccino.fleet`` imports this
+    package's fitting and IO modules, so importing it at module scope would
+    close an import cycle. ``coppuccino.copula_flows`` defers it for the same
+    reason.
+    """
+    if not isinstance(flow, Transformed):
+        from coppuccino.fleet import FleetFlow
+
+        if isinstance(flow, FleetFlow):
+            raise TypeError(
+                "calibrate_edge_bins() takes a single fitted Transformed flow; a "
+                f"FleetFlow of {flow.n_sources} sources carries per-source cube "
+                "marginals and no Gaussian marginal stack to calibrate. Refit the "
+                "source of interest with normalizing_flows_fit(chain, "
+                "prior_bounds=...) and calibrate that flow."
+            )
+        raise TypeError("calibrate_edge_bins requires a fitted Transformed flow.")
+    if getattr(flow, "arch", None) is not None:
+        raise ValueError("calibrate_edge_bins currently supports Gaussian-space flows only.")
+    if _is_edge_calibrated(flow):
+        raise ValueError("This flow already has an edge calibration layer.")
+    if not isinstance(flow.bijection, Stack):
+        raise ValueError("Expected the flow's outer marginal transform to be a Stack.")
+
+    marginals = [unwrap(bijection) for bijection in flow.bijection.bijections]
+    for dim, marginal in enumerate(marginals):
+        if not isinstance(marginal, SmoothMarginalToGaussian):
+            raise ValueError(
+                "calibrate_edge_bins requires every marginal to be a "
+                "SmoothMarginalToGaussian, as produced by normalizing_flows_fit("
+                "..., marginal='smooth') -- the default. Dimension "
+                f"{dim} carries {type(marginal).__name__}."
+            )
+    return marginals
+
+
+def _clean_reference(reference_samples: np.ndarray, n_dims: int) -> np.ndarray:
+    """Coerce the reference sample and drop non-finite rows, with a count."""
+    reference = np.asarray(reference_samples, dtype=float)
+    if reference.ndim != 2 or reference.shape[1] != n_dims:
+        raise ValueError(f"reference_samples must have shape (n, {n_dims}); got {reference.shape}.")
+    finite = np.isfinite(reference).all(axis=1)
+    if not finite.all():
+        warnings.warn(
+            f"calibrate_edge_bins dropped {int((~finite).sum())} non-finite rows.",
+            stacklevel=3,
+        )
+        reference = reference[finite]
+    if len(reference) < 20:
+        raise ValueError("calibrate_edge_bins needs at least 20 finite reference rows.")
+    return reference
+
+
+def _validated_settings(
+    edge_bins: int,
+    core_quantiles: tuple[float, float],
+    n_calibration_samples: int,
+    confidence_level: float,
+    min_reference_bin_count: int,
+    min_calibration_tail_count: int,
+    force: bool,
+) -> _CalibrationSettings:
+    """Range-check the scalar knobs, naming the offending one."""
+    if not isinstance(edge_bins, int) or edge_bins < 1:
+        raise ValueError("edge_bins must be a positive integer.")
+    q_low, q_high = map(float, core_quantiles)
+    if not 0.0 < q_low < q_high < 1.0:
+        raise ValueError("core_quantiles must satisfy 0 < low < high < 1.")
+    if n_calibration_samples < 1_000:
+        raise ValueError("n_calibration_samples must be at least 1,000.")
+    confidence_level = float(confidence_level)
+    if not 0.0 < confidence_level < 1.0:
+        raise ValueError("confidence_level must lie strictly between 0 and 1.")
+    if not isinstance(min_reference_bin_count, int) or min_reference_bin_count < 1:
+        raise ValueError("min_reference_bin_count must be a positive integer.")
+    if not isinstance(min_calibration_tail_count, int) or min_calibration_tail_count < 1:
+        raise ValueError("min_calibration_tail_count must be a positive integer.")
+    return _CalibrationSettings(
+        edge_bins=edge_bins,
+        core_quantiles=(q_low, q_high),
+        n_calibration_samples=n_calibration_samples,
+        confidence_level=confidence_level,
+        min_reference_bin_count=min_reference_bin_count,
+        min_calibration_tail_count=min_calibration_tail_count,
+        force=force,
+    )
+
+
+def _edge_cdf_targets(
+    reference_column: np.ndarray,
+    lower_boundaries: np.ndarray,
+    upper_boundaries: np.ndarray,
+    dim: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Empirical CDF of the reference at each requested edge boundary."""
+    sorted_reference = np.sort(reference_column)
+    lower_counts = np.searchsorted(sorted_reference, lower_boundaries, side="left")
+    upper_counts = np.searchsorted(sorted_reference, upper_boundaries, side="left")
+    lower_probabilities = lower_counts / len(reference_column)
+    upper_probabilities = upper_counts / len(reference_column)
+
+    probabilities = np.concatenate([lower_probabilities, upper_probabilities])
+    if np.any(probabilities <= 0.0) or np.any(probabilities >= 1.0):
+        raise ValueError(
+            f"Dimension {dim} has a requested edge boundary with empirical "
+            "probability 0 or 1; widen/aggregate the edge bins."
+        )
+    if not np.all(np.diff(lower_probabilities) > 0.0):
+        raise ValueError(f"Dimension {dim} has an empty lower edge bin.")
+    if not np.all(np.diff(upper_probabilities) > 0.0):
+        raise ValueError(f"Dimension {dim} has an empty upper edge bin.")
+    if lower_probabilities[-1] >= upper_probabilities[0]:
+        raise ValueError(f"Dimension {dim} edge calibration regions overlap.")
+    return lower_probabilities, upper_probabilities
+
+
+def _reference_interval_counts(
+    lower_probabilities: np.ndarray,
+    upper_probabilities: np.ndarray,
+    effective_size: float,
+    settings: _CalibrationSettings,
+    dim: int,
+) -> np.ndarray:
+    """Effective reference counts in the selected tail-inclusive intervals.
+
+    Unlike ``np.histogram`` counts these include under/overflow on a cropped
+    axis, which is what the CDF anchors are defined against.
+    """
+    interval_probabilities = np.concatenate(
+        [
+            np.diff(np.concatenate([[0.0], lower_probabilities])),
+            np.diff(np.concatenate([upper_probabilities, [1.0]])),
+        ]
+    )
+    effective_interval_counts = interval_probabilities * effective_size
+    if np.any(effective_interval_counts < settings.min_reference_bin_count):
+        message = (
+            f"Dimension {dim} has a selected tail interval with effective "
+            f"count {effective_interval_counts.min():.1f}, below "
+            f"min_reference_bin_count={settings.min_reference_bin_count}; aggregate "
+            "the bins or provide a larger effective reference sample."
+        )
+        if settings.force:
+            warnings.warn(message, stacklevel=4)
+        else:
+            raise ValueError(message)
+    return effective_interval_counts
+
+
+def _check_calibration_resolution(
+    fitted_lower: np.ndarray,
+    fitted_upper: np.ndarray,
+    active_lower: np.ndarray,
+    active_upper: np.ndarray,
+    settings: _CalibrationSettings,
+    dim: int,
+) -> None:
+    """Require enough calibration draws to resolve each fitted quantile.
+
+    An inactive anchor is still a knot of the calibration spline, so the
+    intervals a fitted quantile has to resolve are the gaps between *all*
+    consecutive anchors, not only the active ones. A side with no active anchor
+    is disabled and estimates no quantile at all, so only the gaps touching an
+    active anchor are checked.
+    """
+    lower_gaps = np.diff(np.concatenate([[0.0], fitted_lower]))
+    upper_gaps = np.diff(np.concatenate([fitted_upper, [1.0]]))
+    lower_checked = active_lower.copy()
+    lower_checked[1:] |= active_lower[:-1]
+    upper_checked = active_upper.copy()
+    upper_checked[:-1] |= active_upper[1:]
+    active_probability_intervals = np.concatenate(
+        [lower_gaps[lower_checked], upper_gaps[upper_checked]]
+    )
+    if not active_probability_intervals.size:
+        return
+    calibration_counts = active_probability_intervals * settings.n_calibration_samples
+    if np.any(calibration_counts < settings.min_calibration_tail_count):
+        message = (
+            f"Dimension {dim} has an active calibration interval with only "
+            f"{calibration_counts.min():.1f} expected calibration draws, "
+            f"below min_calibration_tail_count={settings.min_calibration_tail_count}; "
+            "increase n_calibration_samples or aggregate the bins."
+        )
+        if settings.force:
+            warnings.warn(message, stacklevel=4)
+        else:
+            raise ValueError(message)
+
+
+def _marginal_clamp_limits(
+    marginal: SmoothMarginalToGaussian,
+) -> tuple[Optional[float], Optional[float]]:
+    """Latent positions of the marginal's float64 clamps, where it has them."""
+    return (
+        (
+            float(marginal.z_of_theta(jnp.asarray(marginal.x_clamp_lo)))
+            if marginal.x_clamp_lo is not None
+            else None
+        ),
+        (
+            float(marginal.z_of_theta(jnp.asarray(marginal.x_clamp_hi)))
+            if marginal.x_clamp_hi is not None
+            else None
+        ),
+    )
+
+
+def _calibrate_dimension(
+    dim: int,
+    marginal: SmoothMarginalToGaussian,
+    edge: np.ndarray,
+    reference_column: np.ndarray,
+    physical_column: np.ndarray,
+    latent_column: np.ndarray,
+    effective_size: float,
+    settings: _CalibrationSettings,
+) -> tuple[_EdgeMarginalCalibration, dict[str, Any]]:
+    """Build one coordinate's calibration window pair and its report entry."""
+    edge_bins = settings.edge_bins
+    lower_boundaries = edge[1 : edge_bins + 1]
+    upper_boundaries = edge[-edge_bins - 1 : -1]
+    lower_probabilities, upper_probabilities = _edge_cdf_targets(
+        reference_column, lower_boundaries, upper_boundaries, dim
+    )
+    effective_interval_counts = _reference_interval_counts(
+        lower_probabilities, upper_probabilities, effective_size, settings, dim
+    )
+
+    target = np.asarray(marginal.z_of_theta(jnp.asarray(reference_column)))
+    lower_target = np.asarray(marginal.z_of_theta(jnp.asarray(lower_boundaries)))
+    upper_target = np.asarray(marginal.z_of_theta(jnp.asarray(upper_boundaries)))
+    before_lower = np.asarray(
+        [np.mean(physical_column < boundary) for boundary in lower_boundaries]
+    )
+    before_upper = np.asarray(
+        [np.mean(physical_column < boundary) for boundary in upper_boundaries]
+    )
+    fitted_lower, active_lower, lower_ci, lower_ci_high = _gated_probabilities(
+        lower_probabilities,
+        before_lower,
+        effective_size,
+        settings.confidence_level,
+        settings.force,
+    )
+    fitted_upper, active_upper, upper_ci, upper_ci_high = _gated_probabilities(
+        upper_probabilities,
+        before_upper,
+        effective_size,
+        settings.confidence_level,
+        settings.force,
+    )
+    _check_calibration_resolution(
+        fitted_lower, fitted_upper, active_lower, active_upper, settings, dim
+    )
+
+    # Compatible boundaries are literal identity anchors. Active boundaries
+    # use the nearest Wilson edge (or the raw ECDF under force=True), making
+    # the statistically smallest correction that is supported by the data.
+    lower_source = lower_target.copy()
+    upper_source = upper_target.copy()
+    if active_lower.any():
+        lower_source[active_lower] = np.quantile(latent_column, fitted_lower[active_lower])
+    if active_upper.any():
+        upper_source[active_upper] = np.quantile(latent_column, fitted_upper[active_upper])
+
+    calibration, identity_core = _make_calibration(
+        np.atleast_1d(lower_source),
+        np.atleast_1d(lower_target),
+        np.atleast_1d(upper_source),
+        np.atleast_1d(upper_target),
+        latent_column,
+        target,
+        settings.core_quantiles,
+        _marginal_clamp_limits(marginal),
+        (bool(active_lower.any()), bool(active_upper.any())),
+    )
+    report = {
+        "bin_edges": edge.copy(),
+        "lower_boundaries": lower_boundaries.copy(),
+        "upper_boundaries": upper_boundaries.copy(),
+        "target_lower_cdf": lower_probabilities.copy(),
+        "target_upper_cdf": upper_probabilities.copy(),
+        "before_lower_cdf": before_lower.copy(),
+        "before_upper_cdf": before_upper.copy(),
+        "fitted_lower_cdf": fitted_lower.copy(),
+        "fitted_upper_cdf": fitted_upper.copy(),
+        "lower_confidence_interval": np.column_stack([lower_ci, lower_ci_high]),
+        "upper_confidence_interval": np.column_stack([upper_ci, upper_ci_high]),
+        "active_lower": active_lower.copy(),
+        "active_upper": active_upper.copy(),
+        "reference_ess": float(effective_size),
+        "effective_interval_counts": effective_interval_counts.copy(),
+        "lower_source_knots": np.atleast_1d(lower_source).copy(),
+        "lower_target_knots": np.atleast_1d(lower_target).copy(),
+        "upper_source_knots": np.atleast_1d(upper_source).copy(),
+        "upper_target_knots": np.atleast_1d(upper_target).copy(),
+        "identity_core_latent": identity_core,
+    }
+    return calibration, report
 
 
 def calibrate_edge_bins(
@@ -471,49 +760,18 @@ def calibrate_edge_bins(
     Periodic coordinates must be recentered/unwrapped before calibration; a
     monotone linear-coordinate correction cannot cross a circular seam.
     """
-    if not isinstance(flow, Transformed):
-        raise TypeError("calibrate_edge_bins requires a fitted Transformed flow.")
-    if getattr(flow, "arch", None) is not None:
-        raise ValueError("calibrate_edge_bins currently supports Gaussian-space flows only.")
-    if _is_edge_calibrated(flow):
-        raise ValueError("This flow already has an edge calibration layer.")
-    if not isinstance(flow.bijection, Stack):
-        raise ValueError("Expected the flow's outer marginal transform to be a Stack.")
-
-    marginals = [unwrap(bijection) for bijection in flow.bijection.bijections]
-    if not all(isinstance(marginal, SmoothMarginalToGaussian) for marginal in marginals):
-        raise ValueError(
-            "calibrate_edge_bins requires copula_space='gaussian' with marginal='smooth'."
-        )
+    marginals = _flow_marginals(flow)
     n_dims = len(marginals)
-
-    reference = np.asarray(reference_samples, dtype=float)
-    if reference.ndim != 2 or reference.shape[1] != n_dims:
-        raise ValueError(f"reference_samples must have shape (n, {n_dims}); got {reference.shape}.")
-    finite = np.isfinite(reference).all(axis=1)
-    if not finite.all():
-        warnings.warn(
-            f"calibrate_edge_bins dropped {int((~finite).sum())} non-finite rows.",
-            stacklevel=2,
-        )
-        reference = reference[finite]
-    if len(reference) < 20:
-        raise ValueError("calibrate_edge_bins needs at least 20 finite reference rows.")
-
-    if not isinstance(edge_bins, int) or edge_bins < 1:
-        raise ValueError("edge_bins must be a positive integer.")
-    q_low, q_high = map(float, core_quantiles)
-    if not 0.0 < q_low < q_high < 1.0:
-        raise ValueError("core_quantiles must satisfy 0 < low < high < 1.")
-    if n_calibration_samples < 1_000:
-        raise ValueError("n_calibration_samples must be at least 1,000.")
-    confidence_level = float(confidence_level)
-    if not 0.0 < confidence_level < 1.0:
-        raise ValueError("confidence_level must lie strictly between 0 and 1.")
-    if not isinstance(min_reference_bin_count, int) or min_reference_bin_count < 1:
-        raise ValueError("min_reference_bin_count must be a positive integer.")
-    if not isinstance(min_calibration_tail_count, int) or min_calibration_tail_count < 1:
-        raise ValueError("min_calibration_tail_count must be a positive integer.")
+    reference = _clean_reference(reference_samples, n_dims)
+    settings = _validated_settings(
+        edge_bins,
+        core_quantiles,
+        n_calibration_samples,
+        confidence_level,
+        min_reference_bin_count,
+        min_calibration_tail_count,
+        force,
+    )
 
     edges = _normalise_bin_edges(bin_edges, n_dims)
     effective_sizes = _normalise_reference_ess(reference_ess, n_dims, len(reference))
@@ -536,153 +794,18 @@ def calibrate_edge_bins(
     calibrations = []
     dimension_reports = []
     for dim, (marginal, edge) in enumerate(zip(marginals, edges)):
-        lower_boundaries = edge[1 : edge_bins + 1]
-        upper_boundaries = edge[-edge_bins - 1 : -1]
-        sorted_reference = np.sort(reference[:, dim])
-        lower_counts = np.searchsorted(sorted_reference, lower_boundaries, side="left")
-        upper_counts = np.searchsorted(sorted_reference, upper_boundaries, side="left")
-        lower_probabilities = lower_counts / len(reference)
-        upper_probabilities = upper_counts / len(reference)
-
-        probabilities = np.concatenate([lower_probabilities, upper_probabilities])
-        if np.any(probabilities <= 0.0) or np.any(probabilities >= 1.0):
-            raise ValueError(
-                f"Dimension {dim} has a requested edge boundary with empirical "
-                "probability 0 or 1; widen/aggregate the edge bins."
-            )
-        if not np.all(np.diff(lower_probabilities) > 0.0):
-            raise ValueError(f"Dimension {dim} has an empty lower edge bin.")
-        if not np.all(np.diff(upper_probabilities) > 0.0):
-            raise ValueError(f"Dimension {dim} has an empty upper edge bin.")
-        if lower_probabilities[-1] >= upper_probabilities[0]:
-            raise ValueError(f"Dimension {dim} edge calibration regions overlap.")
-
-        # Use the same tail-inclusive intervals as the CDF anchors. Unlike
-        # np.histogram counts, these include under/overflow on cropped axes.
-        interval_probabilities = np.concatenate(
-            [
-                np.diff(np.concatenate([[0.0], lower_probabilities])),
-                np.diff(np.concatenate([upper_probabilities, [1.0]])),
-            ]
-        )
-        effective_interval_counts = interval_probabilities * effective_sizes[dim]
-        if np.any(effective_interval_counts < min_reference_bin_count):
-            message = (
-                f"Dimension {dim} has a selected tail interval with effective "
-                f"count {effective_interval_counts.min():.1f}, below "
-                f"min_reference_bin_count={min_reference_bin_count}; aggregate "
-                "the bins or provide a larger effective reference sample."
-            )
-            if force:
-                warnings.warn(message, stacklevel=2)
-            else:
-                raise ValueError(message)
-
-        source = latent_draws[:, dim]
-        target = np.asarray(marginal.z_of_theta(jnp.asarray(reference[:, dim])))
-        lower_target = np.asarray(marginal.z_of_theta(jnp.asarray(lower_boundaries)))
-        upper_target = np.asarray(marginal.z_of_theta(jnp.asarray(upper_boundaries)))
-        before_lower = np.asarray(
-            [np.mean(physical_draws[:, dim] < boundary) for boundary in lower_boundaries]
-        )
-        before_upper = np.asarray(
-            [np.mean(physical_draws[:, dim] < boundary) for boundary in upper_boundaries]
-        )
-        fitted_lower, active_lower, lower_ci, lower_ci_high = _gated_probabilities(
-            lower_probabilities,
-            before_lower,
-            effective_sizes[dim],
-            confidence_level,
-            force,
-        )
-        fitted_upper, active_upper, upper_ci, upper_ci_high = _gated_probabilities(
-            upper_probabilities,
-            before_upper,
-            effective_sizes[dim],
-            confidence_level,
-            force,
-        )
-
-        active_probability_intervals = []
-        if active_lower.any():
-            active_probability_intervals.extend(
-                np.diff(np.concatenate([[0.0], fitted_lower[active_lower]])).tolist()
-            )
-        if active_upper.any():
-            active_probability_intervals.extend(
-                np.diff(np.concatenate([fitted_upper[active_upper], [1.0]])).tolist()
-            )
-        if active_probability_intervals:
-            calibration_counts = np.asarray(active_probability_intervals) * n_calibration_samples
-            if np.any(calibration_counts < min_calibration_tail_count):
-                message = (
-                    f"Dimension {dim} has an active calibration interval with only "
-                    f"{calibration_counts.min():.1f} expected calibration draws, "
-                    f"below min_calibration_tail_count={min_calibration_tail_count}; "
-                    "increase n_calibration_samples or aggregate the bins."
-                )
-                if force:
-                    warnings.warn(message, stacklevel=2)
-                else:
-                    raise ValueError(message)
-
-        # Compatible boundaries are literal identity anchors. Active boundaries
-        # use the nearest Wilson edge (or the raw ECDF under force=True), making
-        # the statistically smallest correction that is supported by the data.
-        lower_source = lower_target.copy()
-        upper_source = upper_target.copy()
-        if active_lower.any():
-            lower_source[active_lower] = np.quantile(source, fitted_lower[active_lower])
-        if active_upper.any():
-            upper_source[active_upper] = np.quantile(source, fitted_upper[active_upper])
-
-        calibration, identity_core = _make_calibration(
-            np.atleast_1d(lower_source),
-            np.atleast_1d(lower_target),
-            np.atleast_1d(upper_source),
-            np.atleast_1d(upper_target),
-            source,
-            target,
-            (q_low, q_high),
-            (
-                (
-                    float(marginal.z_of_theta(jnp.asarray(marginal.x_clamp_lo)))
-                    if marginal.x_clamp_lo is not None
-                    else None
-                ),
-                (
-                    float(marginal.z_of_theta(jnp.asarray(marginal.x_clamp_hi)))
-                    if marginal.x_clamp_hi is not None
-                    else None
-                ),
-            ),
-            (bool(active_lower.any()), bool(active_upper.any())),
+        calibration, dimension_report = _calibrate_dimension(
+            dim,
+            marginal,
+            edge,
+            reference[:, dim],
+            physical_draws[:, dim],
+            latent_draws[:, dim],
+            float(effective_sizes[dim]),
+            settings,
         )
         calibrations.append(non_trainable(calibration))
-        dimension_reports.append(
-            {
-                "bin_edges": edge.copy(),
-                "lower_boundaries": lower_boundaries.copy(),
-                "upper_boundaries": upper_boundaries.copy(),
-                "target_lower_cdf": lower_probabilities.copy(),
-                "target_upper_cdf": upper_probabilities.copy(),
-                "before_lower_cdf": before_lower.copy(),
-                "before_upper_cdf": before_upper.copy(),
-                "fitted_lower_cdf": fitted_lower.copy(),
-                "fitted_upper_cdf": fitted_upper.copy(),
-                "lower_confidence_interval": np.column_stack([lower_ci, lower_ci_high]),
-                "upper_confidence_interval": np.column_stack([upper_ci, upper_ci_high]),
-                "active_lower": active_lower.copy(),
-                "active_upper": active_upper.copy(),
-                "reference_ess": float(effective_sizes[dim]),
-                "effective_interval_counts": effective_interval_counts.copy(),
-                "lower_source_knots": np.atleast_1d(lower_source).copy(),
-                "lower_target_knots": np.atleast_1d(lower_target).copy(),
-                "upper_source_knots": np.atleast_1d(upper_source).copy(),
-                "upper_target_knots": np.atleast_1d(upper_target).copy(),
-                "identity_core_latent": identity_core,
-            }
-        )
+        dimension_reports.append(dimension_report)
 
     calibration_stack = Stack(calibrations)
     calibrated_inner = Transformed(flow.base_dist, calibration_stack)
@@ -693,8 +816,8 @@ def calibrate_edge_bins(
             "n_reference_samples": len(reference),
             "n_calibration_samples": n_calibration_samples,
             "edge_bins": edge_bins,
-            "core_quantiles": (q_low, q_high),
-            "confidence_level": confidence_level,
+            "core_quantiles": settings.core_quantiles,
+            "confidence_level": settings.confidence_level,
             "force": force,
             "min_reference_bin_count": min_reference_bin_count,
             "min_calibration_tail_count": min_calibration_tail_count,

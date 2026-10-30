@@ -10,15 +10,30 @@ from coppuccino import (
     normalizing_flows_fit_auto,
     sample,
 )
-from coppuccino.copula_flows import _edge_fidelity_features, _score_edge_fidelity
+from coppuccino.copula_flows import (
+    _edge_fidelity_features,
+    _n_trainable_params,
+    _score_edge_fidelity,
+    _tie_band,
+    normalizing_flows_fit,
+)
 
 
 @pytest.fixture(scope="module")
 def data():
+    """Correlated samples inside BOUNDS, with a wall atom on each bound.
+
+    ``np.clip`` puts a mass of samples *exactly* on the bound, which is both
+    the documented use of ``prior_bounds`` and the case that used to poison
+    every held-out mean here: ``z_of_theta`` did not apply the clamp that
+    ``log_dtheta_dz`` did, so an at-bound row scored around -5e5 nats and
+    swamped the comparison the selection rules are built on. Keeping the
+    clipped data means these selection tests would notice that regression.
+    """
     rng = np.random.default_rng(0)
     n = 1500
     a = rng.uniform(-1.0, 1.0, n)
-    b = np.clip(0.6 * a + 0.3 * rng.standard_normal(n), -1, 1)
+    b = np.clip(0.6 * a + 0.3 * rng.standard_normal(n), -1.0, 1.0)
     return np.stack([a, b], 1)
 
 
@@ -27,7 +42,7 @@ BOUNDS = np.array([[-1.0, 1.0], [-1.0, 1.0]])
 
 def test_selects_and_returns_working_flow(data):
     flow, table = normalizing_flows_fit_auto(
-        data, prior_bounds=BOUNDS, copula_space="uniform", max_epochs=40,
+        data, prior_bounds=BOUNDS, max_epochs=40,
         candidates=[{"knots": 4, "flow_layers": 3}, {"knots": 8, "flow_layers": 3}],
         return_table=True, selection="best",
     )
@@ -49,7 +64,7 @@ def test_smallest_comparable_prefers_parsimony(data):
     """With a generous absolute tolerance, the smaller model must win even if
     the bigger one scores marginally higher."""
     _, table = normalizing_flows_fit_auto(
-        data, prior_bounds=BOUNDS, copula_space="uniform", max_epochs=40,
+        data, prior_bounds=BOUNDS, max_epochs=40,
         candidates=[{"knots": 2, "flow_layers": 3}, {"knots": 8, "flow_layers": 6}],
         return_table=True, refit_best=False,
         comparable_nats=1.0,   # everything within 1 nat counts as comparable
@@ -62,7 +77,7 @@ def test_smallest_comparable_prefers_parsimony(data):
 def test_zero_tolerance_degenerates_to_best(data):
     """With tolerance 0, smallest_comparable must select the argmax."""
     _, table = normalizing_flows_fit_auto(
-        data, prior_bounds=BOUNDS, copula_space="uniform", max_epochs=40,
+        data, prior_bounds=BOUNDS, max_epochs=40,
         candidates=[{"knots": 2, "flow_layers": 3}, {"knots": 4, "flow_layers": 3}],
         return_table=True, refit_best=False,
         comparable_sems=0.0, comparable_nats=0.0,
@@ -71,26 +86,30 @@ def test_zero_tolerance_degenerates_to_best(data):
     assert table[int(np.argmax(scores))]["selected"]
 
 
-def test_cross_mode_candidates(data):
+def test_zero_parameter_candidate_is_comparable(data):
+    """A flow_layers=0 rung competes on the same held-out scale as a trained one."""
     flow, table = normalizing_flows_fit_auto(
         data, prior_bounds=BOUNDS, max_epochs=40,
-        candidates=[{"copula_space": "uniform", "knots": 4, "flow_layers": 3},
-                    {"copula_space": "gaussian", "knots": 4, "flow_layers": 3}],
+        candidates=[{"flow_layers": 0, "whiten": True},
+                    {"knots": 4, "flow_layers": 3}],
         return_table=True,
     )
-    # scores comparable in theta space across modes; one candidate selected
+    # scores comparable in theta space across capacities; one candidate selected
     assert sum(r["selected"] for r in table) == 1
     assert np.all(np.isfinite([r["val_logp"] for r in table]))
+    # the frozen whitening affine is not a fitted degree of freedom
+    assert table[0]["n_params"] == 0
+    assert table[1]["n_params"] > 0
 
 
 def test_reproducible_selection(data):
     _, t1 = normalizing_flows_fit_auto(
-        data, prior_bounds=BOUNDS, copula_space="uniform", max_epochs=30,
+        data, prior_bounds=BOUNDS, max_epochs=30,
         candidates=[{"knots": 4, "flow_layers": 3}, {"knots": 6, "flow_layers": 3}],
         return_table=True, refit_best=False, rng_seed=5,
     )
     _, t2 = normalizing_flows_fit_auto(
-        data, prior_bounds=BOUNDS, copula_space="uniform", max_epochs=30,
+        data, prior_bounds=BOUNDS, max_epochs=30,
         candidates=[{"knots": 4, "flow_layers": 3}, {"knots": 6, "flow_layers": 3}],
         return_table=True, refit_best=False, rng_seed=5,
     )
@@ -103,13 +122,47 @@ def test_too_few_samples_raises():
         normalizing_flows_fit_auto(np.random.randn(20, 2))
 
 
+@pytest.mark.parametrize("val_frac", [0.0, -0.5, 1.0, 1.5, np.nan])
+def test_val_frac_must_be_a_proper_fraction(data, val_frac):
+    """``val_frac <= 0`` used to be clamped to a *one-row* held-out set, which
+    reports ``sem: 0.0`` beside a normal-looking ``val_logp`` -- a table a
+    caller cannot tell apart from a real split. ``val_frac >= 1`` surfaced as
+    'every candidate fit raised ... Insufficient samples for empirical
+    transform', naming neither ``val_frac`` nor the real cause."""
+    with pytest.raises(ValueError, match="val_frac") as exc:
+        normalizing_flows_fit_auto(
+            data, val_frac=val_frac, candidates=[{"knots": 2, "flow_layers": 2}],
+            max_epochs=2, refit_best=False, n_workers=1)
+    assert repr(val_frac) in str(exc.value)
+
+
+def test_val_frac_that_starves_either_side_names_both_counts(data):
+    """A fraction inside (0, 1) can still leave a part too small to use."""
+    with pytest.raises(ValueError, match="held-out rows and fitting needs"):
+        normalizing_flows_fit_auto(
+            data, val_frac=0.999, candidates=[{"knots": 2, "flow_layers": 2}],
+            max_epochs=2, refit_best=False, n_workers=1)
+
+
+def test_auto_reports_dropped_nonfinite_rows_like_the_single_fitter(data):
+    """The same dirty chain used to be reported through one entry point and
+    silently cleaned by the other."""
+    dirty = data.copy()
+    dirty[3, 1] = np.nan
+    dirty[7, 0] = np.inf
+    with pytest.warns(UserWarning, match=r"dropped 2 of 1500 rows"):
+        normalizing_flows_fit_auto(
+            dirty, candidates=[{"knots": 2, "flow_layers": 2}], max_epochs=2,
+            refit_best=False, n_workers=1)
+
+
 def test_parallel_matches_sequential(data):
     """Concurrent candidate fits must reproduce sequential results exactly
     (fixed per-candidate seeds and split => execution order cannot matter)."""
-    kw = dict(prior_bounds=BOUNDS, copula_space="uniform", max_epochs=30,
-              candidates=[{"knots": 2, "flow_layers": 3},
-                          {"knots": 4, "flow_layers": 3}],
-              return_table=True, refit_best=False, rng_seed=11)
+    kw = {"prior_bounds": BOUNDS, "max_epochs": 30,
+          "candidates": [{"knots": 2, "flow_layers": 3},
+                         {"knots": 4, "flow_layers": 3}],
+          "return_table": True, "refit_best": False, "rng_seed": 11}
     _, t_seq = normalizing_flows_fit_auto(data, n_workers=1, **kw)
     _, t_par = normalizing_flows_fit_auto(data, n_workers=2, **kw)
     assert [r["selected"] for r in t_seq] == [r["selected"] for r in t_par]
@@ -459,7 +512,7 @@ def test_marginal_fidelity_gaussian_smoke(data):
 
 def test_marginal_fidelity_uniform_smoke(data):
     _, table = normalizing_flows_fit_auto(
-        data, prior_bounds=BOUNDS, copula_space="uniform", max_epochs=5,
+        data, prior_bounds=BOUNDS, max_epochs=5,
         candidates=[{"knots": 2, "flow_layers": 2}],
         selection="marginal_fidelity", marginal_samples=1000,
         refit_best=False, n_workers=1, return_table=True)
@@ -503,7 +556,7 @@ def test_new_marginal_options_preserve_old_positional_api():
     assert names[names.index("comparable_nats") + 1:names.index("verbose") + 2] == [
         "verbose", "return_table"]
     assert all(
-        inspect.Parameter.KEYWORD_ONLY == parameters[names.index(name)].kind
+        parameters[names.index(name)].kind == inspect.Parameter.KEYWORD_ONLY
         for name in ("marginal_samples", "marginal_bin_edges",
                      "max_marginal_error")
     )
@@ -589,11 +642,40 @@ def test_all_candidate_failures_are_aggregated(monkeypatch, data):
         raise RuntimeError("synthetic candidate failure")
 
     monkeypatch.setattr(module, "normalizing_flows_fit", fail_fit)
-    with pytest.warns(UserWarning, match="excluded failed fits"):
-        with pytest.raises(RuntimeError, match="Fit errors"):
+    # When *every* candidate raised, nothing diverged: the error leads with
+    # the actual exceptions rather than the misleading "try a smaller
+    # learning_rate" advice, and still names each failing candidate.
+    with pytest.warns(UserWarning, match="excluded failed fits"), \
+            pytest.raises(RuntimeError, match="every candidate fit raised") as exc:
             normalizing_flows_fit_auto(
                 data, candidates=[{"knots": 2}, {"knots": 4}],
                 refit_best=False, n_workers=1)
+    assert "candidate 0" in str(exc.value) and "candidate 1" in str(exc.value)
+    assert "synthetic candidate failure" in str(exc.value)
+    assert "learning_rate" not in str(exc.value)
+
+
+def test_partial_failure_still_reports_divergence_advice(monkeypatch, data):
+    """A mix of raised and non-finite candidates keeps the diagnostic path."""
+    import coppuccino.copula_flows as module
+
+    real_fit = module.normalizing_flows_fit
+    calls = {"n": 0}
+
+    def flaky_fit(values, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("synthetic candidate failure")
+        return real_fit(values, **kwargs)
+
+    monkeypatch.setattr(module, "normalizing_flows_fit", flaky_fit)
+    monkeypatch.setattr(module, "log_prob",
+                        lambda flow, x: np.full(len(x), np.nan))
+    with pytest.warns(UserWarning, match="excluded failed fits"), \
+            pytest.raises(RuntimeError, match="likely diverged"):
+        normalizing_flows_fit_auto(
+            data, candidates=[{"knots": 2}, {"knots": 4}],
+            max_epochs=3, refit_best=False, n_workers=1)
 
 
 def test_marginal_options_require_marginal_selection(data):
@@ -603,3 +685,193 @@ def test_marginal_options_require_marginal_selection(data):
     with pytest.raises(ValueError, match="require selection='marginal_fidelity'"):
         normalizing_flows_fit_auto(
             data, marginal_samples=1000, refit_best=False)
+
+
+def _refit_probe(monkeypatch, refit_log_prob):
+    """Monkeypatch the module so the full-chain refit has a chosen held-out score.
+
+    Returns the chain to fit; the produced flows expose ``full_refit``.
+    """
+    import coppuccino.copula_flows as module
+
+    chain = _values_from_edge_masses([0.10, 0.20, 0.40, 0.20, 0.10])
+
+    def fake_fit(values, **kwargs):
+        del kwargs
+        return SimpleNamespace(full_refit=len(values) == len(chain))
+
+    monkeypatch.setattr(module, "normalizing_flows_fit", fake_fit)
+    monkeypatch.setattr(
+        module, "log_prob",
+        lambda flow, values: np.full(
+            len(values), refit_log_prob if flow.full_refit else 0.0))
+    monkeypatch.setattr(module, "sample",
+                        lambda flow, n_samples, rng_seed=None: chain)
+    monkeypatch.setattr(module, "_n_trainable_params", lambda flow: 10)
+    return chain
+
+
+@pytest.mark.parametrize("selection", ["smallest_comparable", "best"])
+def test_default_selections_reject_a_nonfinite_refit(monkeypatch, selection):
+    """The finite-density check now guards every selection mode, not just
+    marginal_fidelity: the default paths used to swap in the refit unchecked."""
+    chain = _refit_probe(monkeypatch, np.nan)
+
+    with pytest.warns(UserWarning, match="finite-density check"):
+        flow, table = normalizing_flows_fit_auto(
+            chain, candidates=[{"knots": 2, "flow_layers": 2}],
+            selection=selection, refit_best=True, n_workers=1,
+            return_table=True)
+    assert not flow.full_refit
+    assert table[0]["refit_used"] is False
+    assert table[0]["refit_density_finite"] is False
+
+
+@pytest.mark.parametrize("selection", ["smallest_comparable", "best"])
+def test_default_selections_keep_a_finite_refit(monkeypatch, selection):
+    """A refit with a finite held-out density is still adopted, and says so."""
+    chain = _refit_probe(monkeypatch, -0.5)
+
+    flow, table = normalizing_flows_fit_auto(
+        chain, candidates=[{"knots": 2, "flow_layers": 2}],
+        selection=selection, refit_best=True, n_workers=1, return_table=True)
+    assert flow.full_refit
+    assert table[0]["refit_used"] is True
+    assert table[0]["refit_density_finite"] is True
+
+
+def test_selected_row_reports_refit_used_without_a_refit(data):
+    """``refit_used`` is on the selected row even when refit_best=False, so the
+    caller never has to infer which fit they were handed."""
+    _, table = normalizing_flows_fit_auto(
+        data, prior_bounds=BOUNDS, max_epochs=5,
+        candidates=[{"knots": 2, "flow_layers": 2}],
+        refit_best=False, n_workers=1, return_table=True)
+    assert table[0]["refit_used"] is False
+
+
+@pytest.mark.parametrize(
+    "selection, refit_best",
+    [("best", True), ("smallest_comparable", False),
+     ("marginal_fidelity", True)],
+)
+def test_every_table_row_carries_every_key(monkeypatch, selection, refit_best):
+    """The row schema is uniform: same keys on every row, in every mode.
+
+    Presence used to depend on the selection rule *and* on whether the row was
+    the selected one, so ``row["refit_used"]`` was a KeyError on non-selected
+    rows and ``pandas.DataFrame(table)`` came out ragged.
+    """
+    import coppuccino.copula_flows as module
+
+    chain = _values_from_edge_masses([0.10, 0.20, 0.40, 0.20, 0.10])
+    candidates = [{"candidate_id": 0}, {"candidate_id": 1}]
+
+    monkeypatch.setattr(
+        module, "normalizing_flows_fit",
+        lambda values, **kw: SimpleNamespace(
+            candidate_id=kw.get("candidate_id", 0)))
+    monkeypatch.setattr(module, "log_prob",
+                        lambda flow, values: np.full(
+                            len(values), -1.0 * flow.candidate_id))
+    monkeypatch.setattr(module, "sample",
+                        lambda flow, n_samples, rng_seed=None: chain)
+    monkeypatch.setattr(module, "_n_trainable_params",
+                        lambda flow: 10 + flow.candidate_id)
+
+    _, table = normalizing_flows_fit_auto(
+        chain, candidates=candidates, selection=selection,
+        refit_best=refit_best, n_workers=1, return_table=True,
+        **({"marginal_samples": 1000, "min_marginal_count": 1,
+            "marginal_bin_edges": [np.array([-2.0, -1.0, 1.0, 2.0])]}
+           if selection == "marginal_fidelity" else {}))
+
+    key_sets = [frozenset(row) for row in table]
+    assert len(set(key_sets)) == 1, "rows disagree about their key set"
+    for row in table:
+        # the keys a caller indexes directly, on every row rather than one
+        assert row["refit_used"] in (True, False)
+        for key in ("refit_error", "refit_density_finite", "marginal_error",
+                    "marginal_details", "refit_regressed_components",
+                    "audit_marginal_error", "n_params", "fit_status"):
+            assert key in row
+    assert sum(row["selected"] for row in table) == 1
+    # a non-selected row was never refit, and says so rather than omitting it
+    unselected = next(row for row in table if not row["selected"])
+    assert unselected["refit_used"] is False
+    assert unselected["refit_density_finite"] is None
+
+
+def test_tie_band_default_and_override():
+    """Both the selection ranking and the refit audit read the same band."""
+    assert _tie_band(10_000, None) == pytest.approx(0.005)
+    assert _tie_band(40_000, None) == pytest.approx(0.0025)
+    assert _tie_band(10_000, 0.0) == 0.0
+    assert _tie_band(10_000, 0.02) == pytest.approx(0.02)
+
+
+def test_auto_validates_prior_bounds_before_fitting(data):
+    """A malformed box used to be swallowed per candidate and resurface as
+    'the fits likely diverged. Try a smaller learning_rate'."""
+    with pytest.raises(ValueError, match="outside prior_bounds"):
+        normalizing_flows_fit_auto(
+            data, prior_bounds=np.array([[-0.1, 0.1], [-0.1, 0.1]]),
+            candidates=[{"knots": 2, "flow_layers": 2}], max_epochs=2,
+            refit_best=False, n_workers=1)
+    with pytest.raises(ValueError, match=r"prior_bounds must be \(n_params, 2\)"):
+        normalizing_flows_fit_auto(
+            data, prior_bounds=np.array([[-1.0, 1.0]]),
+            candidates=[{"knots": 2, "flow_layers": 2}], max_epochs=2,
+            refit_best=False, n_workers=1)
+
+
+def test_auto_rejects_a_non_two_dimensional_chain(data):
+    with pytest.raises(ValueError, match=r"chain must be \(n_samples, n_params\)"):
+        normalizing_flows_fit_auto(data[:, 0], refit_best=False)
+
+
+def test_parameter_count_is_independent_of_the_marginal_family(data):
+    """``smallest_comparable`` ranks by trainable parameter count, so that count
+    must measure the copula architecture only. The marginal transforms are
+    frozen, so the family must not move it -- otherwise a candidate list mixing
+    families would be ranked by family rather than by capacity."""
+    kw = {"prior_bounds": BOUNDS, "max_epochs": 1, "show_progress": False,
+          "knots": 4, "flow_layers": 6}
+    sizes = {
+        marginal: _n_trainable_params(
+            normalizing_flows_fit(data, marginal=marginal, **kw))
+        for marginal in ("smooth", "rqs", "pchip")
+    }
+    assert len(set(sizes.values())) == 1, sizes
+    assert all(size > 0 for size in sizes.values())
+    # and capacity, which is what the rule is meant to measure, does move it
+    smaller = _n_trainable_params(normalizing_flows_fit(
+        data, prior_bounds=BOUNDS, max_epochs=1, show_progress=False,
+        knots=2, flow_layers=2))
+    assert smaller < sizes["smooth"]
+
+
+def test_a_diverged_candidate_is_reported_as_failed_not_ok(data):
+    """A finite-parameter divergence must not occupy a scored table row.
+
+    ``learning_rate=60`` returns finite parameters, so a parameter-only
+    convergence check let it through: the candidate arrived here as an
+    ordinary flow and the table carried ``fit_status: "ok"`` beside a
+    ``val_logp`` hundreds of nats below every healthy rung -- a number a
+    caller has no way to read as "this fit blew up". It now raises inside the
+    candidate fit, which is the failure path this table already models.
+    """
+    with pytest.warns(UserWarning, match="excluded failed fits"):
+        flow, table = normalizing_flows_fit_auto(
+            data, prior_bounds=BOUNDS, max_epochs=20, selection="best",
+            candidates=[{"learning_rate": 60.0}, {"learning_rate": 1e-3}],
+            return_table=True, refit_best=False, n_workers=1)
+    diverged, healthy = table
+    assert diverged["fit_status"] == "failed"
+    assert "optimizer diverged" in diverged["fit_error"]
+    assert np.isnan(diverged["val_logp"])
+    assert diverged["n_params"] is None
+    assert not diverged["selected"]
+    # ... and the surviving rung is what comes back, still usable
+    assert healthy["fit_status"] == "ok" and healthy["selected"]
+    assert np.all(np.isfinite(log_prob(flow, data[:50])))

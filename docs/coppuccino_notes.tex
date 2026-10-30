@@ -1,0 +1,670 @@
+\documentclass[11pt]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage[margin=1in]{geometry}
+\usepackage[hidelinks]{hyperref}
+\usepackage{framed}
+
+% --- notation ---------------------------------------------------------------
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\Ncal}{\mathcal{N}}
+\newcommand{\x}{\bm{x}}
+\newcommand{\z}{\bm{z}}
+\newcommand{\uu}{\bm{u}}
+\newcommand{\yy}{\bm{y}}
+\newcommand{\eps}{\bm{\varepsilon}}
+\newcommand{\Fhat}{\widehat{F}}
+\newcommand{\fhat}{\widehat{f}}
+\newcommand{\Qhat}{\widehat{Q}}
+\DeclareMathOperator{\sd}{sd}
+\DeclareMathOperator{\Var}{Var}
+
+\newtheorem*{deriv}{Derivation}
+\theoremstyle{remark}
+\newtheorem*{plain}{In words}
+
+\title{\textbf{The coppuccino copula flow, derived from scratch}\\[2pt]
+\large A plain--language note with all the mathematics}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{framed}
+\noindent
+\textbf{Status: tutorial derivation, not the shipped default.}
+These notes derive the copula--flow construction using the
+\emph{monotone piecewise--cubic (PCHIP) double--spline} marginal, which is the
+model coppuccino shipped in 1.0.0 and which survives today only as
+\texttt{normalizing\_flows\_fit(marginal="pchip")}, retained for reproducing
+older fits. What the notes \emph{do} describe, and what remains accurate:
+Sklar's theorem and the copula factorization (Sec.~\ref{sec:copula}), the
+change--of--variables identity and the marginal Jacobian
+(Secs.~\ref{sec:problem}, \ref{sec:gaussianization}), monotone Hermite interpolation
+(Sec.~\ref{sec:pchip}), the Gaussian tail extension available as
+\texttt{tail\_extension=True} (Sec.~\ref{sec:tail}), the triangular spline
+copula flow (Sec.~\ref{sec:copula-flow}), and the assembled model density and
+sampling procedure (Secs.~\ref{sec:master}, \ref{sec:algorithms}).
+
+\medskip\noindent
+What they do \emph{not} describe: the default marginal since 2.0.0,
+\texttt{marginal="smooth"} --- a single clip--free monotone map of all of
+$\R$ onto the support (a rational--quadratic--spline bulk at the data quantiles
+joined to analytic tails), whose forward map, inverse and derivative share one
+parameterization rather than being two independently fitted splines. That
+family is what the boundary discussion of Sec.~\ref{sec:why} should be read
+against; the caveat stated there is the PCHIP--era one. The notes were written
+against coppuccino~1.x and revised for 3.0.0 only to remove references to API
+that 3.0.0 deleted. \texttt{coppuccino\_notes.pdf} in this directory is a build
+artifact of an \emph{earlier} revision of this source: it predates this box and
+is not rebuilt automatically, so where the two disagree the \texttt{.tex} is
+authoritative. Rebuild it with
+\texttt{pdflatex coppuccino\_notes.tex} run three times (once for the aux file,
+once for the table of contents, once for the cross--references).
+\end{framed}
+
+\begin{abstract}
+\noindent
+This is a companion to the terse methods description: same architecture, but
+nothing assumed. We build the model one piece at a time and derive every formula,
+and we stop to explain the machine--learning vocabulary (a ``normalizing flow'',
+``training'', a ``base distribution'', why the Jacobian is cheap) in ordinary
+terms. If you are comfortable with calculus and probability but have never taken
+a machine--learning course, this is written for you. The target is the
+Gaussianized--marginal pipeline with monotone piecewise--cubic (PCHIP)
+marginals --- see the status box above for how that relates to what the library
+fits by default today.
+\end{abstract}
+
+\tableofcontents
+
+\section{The problem, and the one trick we use everywhere}
+\label{sec:problem}
+
+We have $N$ samples $\{\x^{(n)}\}_{n=1}^{N}$ drawn from some unknown continuous
+density $p(\x)$ on $\R^{d}$ --- think of the posterior draws that come out of an
+MCMC sampler. We want two things: to \emph{evaluate} $p(\x)$ at new points, and
+to \emph{draw} fresh samples from it. A model that does both lets us resample a
+posterior cheaply, compute importance weights, and run calibration checks.
+
+Everything below rests on a single identity from calculus: the
+\emph{change--of--variables} formula for densities. It is worth deriving once,
+carefully, because we will use it three times.
+
+\subsection{Change of variables for densities}
+
+Let $g:\R^{d}\to\R^{d}$ be a smooth, invertible map (a \emph{diffeomorphism}),
+and let $\yy=g(\x)$. If $\x$ has density $p_X$, what is the density $p_Y$ of
+$\yy$?
+
+\begin{deriv}
+Probability mass is conserved: for any region $A\subseteq\R^{d}$, the chance that
+$\x\in A$ must equal the chance that $\yy\in g(A)$,
+\begin{equation}
+\int_{A} p_X(\x)\,\mathrm{d}\x \;=\; \int_{g(A)} p_Y(\yy)\,\mathrm{d}\yy .
+\end{equation}
+Change the integration variable on the right from $\yy$ back to $\x$ via
+$\yy=g(\x)$. The volume element transforms by the absolute Jacobian determinant,
+$\mathrm{d}\yy=\bigl|\det J_g(\x)\bigr|\,\mathrm{d}\x$, where
+$J_g(\x)=\partial g/\partial\x$ is the $d\times d$ matrix of partial derivatives.
+Substituting,
+\begin{equation}
+\int_{A} p_X(\x)\,\mathrm{d}\x
+= \int_{A} p_Y\bigl(g(\x)\bigr)\,\bigl|\det J_g(\x)\bigr|\,\mathrm{d}\x .
+\end{equation}
+This holds for \emph{every} region $A$, so the integrands must agree pointwise,
+\begin{equation}
+\label{eq:cov-forward}
+p_X(\x) = p_Y\bigl(g(\x)\bigr)\,\bigl|\det J_g(\x)\bigr| .
+\end{equation}
+Solving for $p_Y$ (write $\x=g^{-1}(\yy)$ and use that the Jacobian of the
+inverse is the inverse of the Jacobian, so its determinant is the reciprocal),
+\begin{equation}
+\label{eq:cov}
+\boxed{\;
+p_Y(\yy) = p_X\bigl(g^{-1}(\yy)\bigr)\,
+\Bigl|\det J_{g^{-1}}(\yy)\Bigr|
+= \frac{p_X\bigl(g^{-1}(\yy)\bigr)}{\bigl|\det J_g(g^{-1}(\yy))\bigr|}. \;}
+\end{equation}
+\end{deriv}
+
+\begin{plain}
+A density is ``probability per unit volume''. When a map stretches a region, the
+same probability is spread over a larger volume, so the density drops --- by
+exactly the local volume--stretch factor, which is $|\det J|$. That factor is the
+only thing the change of variables adds. In one dimension it is just
+$|\mathrm{d}y/\mathrm{d}x|$; the determinant is its multivariate generalization.
+\end{plain}
+
+Taking logarithms of \eqref{eq:cov} turns the product into a sum, which is how it
+always appears below:
+\begin{equation}
+\label{eq:logcov}
+\log p_Y(\yy) = \log p_X\bigl(g^{-1}(\yy)\bigr) + \log\Bigl|\det J_{g^{-1}}(\yy)\Bigr| .
+\end{equation}
+Two facts we will lean on. (i)~If $g$ acts on each coordinate separately,
+$y_i=g_i(x_i)$, then $J_g$ is \emph{diagonal} and
+$\log|\det J_g|=\sum_i\log|g_i'(x_i)|$ --- a sum of one--dimensional terms.
+(ii)~If $g$ is \emph{triangular} ($y_i$ depends only on $x_1,\dots,x_i$), then
+$J_g$ is triangular and $\log|\det J_g|=\sum_i\log|\partial y_i/\partial x_i|$ ---
+still just the diagonal. Both cases cost $O(d)$ instead of the $O(d^3)$ of a
+general determinant. This is the entire reason the architecture is built from
+coordinatewise and triangular maps.
+
+\section{What a normalizing flow is}
+\label{sec:flow-intro}
+
+A \emph{normalizing flow} is a way to build a flexible density that you can both
+evaluate and sample from. The recipe has two ingredients:
+\begin{enumerate}
+\item a \emph{base distribution} --- a simple density you can already sample and
+      evaluate, almost always a standard Gaussian $\eps\sim\Ncal(\bm0,I_d)$;
+\item a \emph{learnable invertible map} $T_\theta:\R^d\to\R^d$, where $\theta$ is
+      a vector of adjustable numbers (the ``parameters'').
+\end{enumerate}
+The model \emph{samples} by drawing $\eps$ from the base and pushing it through
+the map, $\x=T_\theta(\eps)$. Its density follows immediately from the change of
+variables \eqref{eq:cov}, with the base playing the role of $p_X$ and $T_\theta$
+the role of $g^{-1}$'s inverse:
+\begin{equation}
+\label{eq:flow-density}
+\log p_\theta(\x)
+= \underbrace{\log\Ncal\!\bigl(T_\theta^{-1}(\x);\,\bm0,I_d\bigr)}_{\text{base density at the pre-image}}
+\;+\;
+\underbrace{\log\Bigl|\det \tfrac{\partial T_\theta^{-1}}{\partial\x}(\x)\Bigr|}_{\text{volume correction}} .
+\end{equation}
+
+\begin{plain}
+The name says what it does: run \emph{backwards} (data $\to$ base), a good flow
+turns the complicated data distribution into the simple, ``normalized'' Gaussian.
+Run forwards, it turns Gaussian noise into data. Because the map is invertible
+and we can compute its Jacobian, \eqref{eq:flow-density} gives an exact density
+--- not an approximation or a bound.
+\end{plain}
+
+\paragraph{What ``learnable'' and ``training'' mean.}
+The parameters $\theta$ start at some arbitrary value and are adjusted until the
+model fits the data. ``Fits'' is made precise by \emph{maximum likelihood}: we
+want the density that makes the observed samples as probable as possible, i.e.\
+we maximize the average log--density of the data,
+\begin{equation}
+\label{eq:mle}
+\theta^\star = \arg\max_\theta\ \frac1N\sum_{n=1}^N \log p_\theta\bigl(\x^{(n)}\bigr).
+\end{equation}
+Maximizing \eqref{eq:mle} is the same as minimizing the Kullback--Leibler
+divergence from the data distribution to the model, so the fitted model is the
+closest reachable density to the truth in that sense. The maximization is done by
+\emph{gradient ascent}: compute the gradient of \eqref{eq:mle} with respect to
+$\theta$ (automatic differentiation does this for us), take a small step uphill,
+repeat. ``Adam'' is just a popular gradient--ascent rule with per--parameter
+adaptive step sizes; ``epoch'' means one pass through the data; ``early
+stopping'' means we watch the objective on a held--out slice of the samples and
+stop when it stops improving, to avoid overfitting. None of this changes the
+model --- it only chooses $\theta$.
+
+\paragraph{How $T_\theta$ is built, and why it stays invertible.}
+A single simple invertible map is not expressive enough, so $T_\theta$ is a
+\emph{composition} of many simple invertible layers,
+$T_\theta=T_L\circ\cdots\circ T_1$. A composition of invertible maps is
+invertible, and by the chain rule its log--Jacobian is the sum of the layers',
+so we only ever need each layer to be invertible with a cheap Jacobian. Two layer
+types, alternated, make up the flow used here (Section~\ref{sec:copula-flow});
+both were chosen precisely so their Jacobians are diagonal or triangular, per the
+remark at the end of Section~\ref{sec:problem}. (Many flows in the literature use
+small neural networks inside the layers; the one here does not --- it is built
+from monotone splines and triangular linear maps, which keeps it simple to
+reason about.)
+
+\section{The copula idea: separate the marginals from the dependence}
+\label{sec:copula}
+
+Fitting a flow directly to raw data is hard when the individual coordinates have
+awkward shapes --- sharp peaks, hard boundaries, heavy tails, multiple modes.
+The flow burns its capacity reshaping each axis instead of learning how the axes
+relate. The copula construction removes that burden.
+
+\subsection{Sklar's theorem, and why it is almost obvious}
+
+Write the marginal CDF of coordinate $i$ as $F_i$ and its density as
+$p_i=F_i'$. Define the \emph{probability integral transform} (PIT) of each
+coordinate, $u_i=F_i(x_i)$.
+
+\begin{deriv}[the PIT makes a coordinate uniform]
+If $X$ has continuous, strictly increasing CDF $F$, then $U=F(X)$ is uniform on
+$(0,1)$. Compute its CDF directly, for $u\in(0,1)$:
+\begin{equation}
+\Pr(U\le u)=\Pr\bigl(F(X)\le u\bigr)=\Pr\bigl(X\le F^{-1}(u)\bigr)
+= F\bigl(F^{-1}(u)\bigr)=u,
+\end{equation}
+which is the CDF of a $\mathrm{Uniform}(0,1)$ variable. (We used that $F$ is
+increasing to invert the inequality.)
+\end{deriv}
+
+So after the PIT, every coordinate of $\uu=(u_1,\dots,u_d)$ is marginally
+uniform, while the \emph{joint} arrangement of $\uu$ still records how the
+original coordinates move together. That joint law is the \emph{copula}: by
+definition, a copula $C$ is the joint CDF of $\uu$, and its density $c$ carries
+all of the dependence and none of the marginal shape (each marginal of $c$ is
+flat). Sklar's theorem is the statement that this always factors,
+\begin{equation}
+\label{eq:sklar}
+p(\x)=c\bigl(F_1(x_1),\dots,F_d(x_d)\bigr)\ \prod_{i=1}^{d} p_i(x_i).
+\end{equation}
+
+\begin{deriv}[Sklar's density, from the change of variables]
+The map $\x\mapsto\uu$ with $u_i=F_i(x_i)$ is coordinatewise, so by
+\eqref{eq:cov-forward} and fact~(i),
+$p(\x)=c(\uu)\prod_i|\mathrm{d}u_i/\mathrm{d}x_i|
+      =c(\uu)\prod_i F_i'(x_i)=c(\uu)\prod_i p_i(x_i)$,
+which is exactly \eqref{eq:sklar}. So Sklar's theorem is just the change of
+variables applied to the PIT; the density of $\uu$ \emph{is} the copula density
+$c$.
+\end{deriv}
+
+The plan writes itself: estimate the $d$ marginals $F_i$ nonparametrically (they
+absorb every awkward one--dimensional shape), and model the copula $c$ with a
+flow. The flow now only has to represent dependence, which is a much easier job.
+
+\subsection{Why go through a Gaussian instead of staying on the cube}
+
+One could model $c$ directly on the unit cube $[0,1]^d$. The pipeline described
+here instead sends each uniform coordinate one step further, to a standard normal,
+\begin{equation}
+\label{eq:gaussianize}
+z_i=\Phi^{-1}(u_i)=\Phi^{-1}\bigl(F_i(x_i)\bigr),
+\end{equation}
+where $\Phi$ is the standard--normal CDF (so $\Phi^{-1}$ is its quantile
+function). By the same PIT argument in reverse, $z_i$ is then marginally standard
+normal. The advantage is that the flow now lives on unbounded space with a
+Gaussian base that already matches the marginals, so it need not fight the hard
+walls of the cube; the price, discussed at the end, is boundary behavior. We call
+$M:\x\mapsto\z$ the \emph{marginal Gaussianization map}. It acts on each
+coordinate independently.
+
+In the library both choices are still built. The single--flow entry point
+\texttt{normalizing\_flows\_fit} is the Gaussianized pipeline derived here; the
+many--source entry point \texttt{normalizing\_flows\_fit\_fleet} models the
+copula on the cube directly, over a uniform base, and is the one to reach for
+when the marginals run flat into a hard wall.
+
+\section{Architecture overview}
+\label{sec:arch}
+
+Two stages, one frozen and one trained. Reading the pipeline forwards
+(generative) and backwards (evaluation):
+\begin{equation}
+\label{eq:pipeline}
+\eps\;\sim\;\Ncal(\bm0,I_d)
+\ \xrightarrow[\text{copula flow (trained)}]{\ T_\theta\ }\ \z
+\ \xrightarrow[\text{Gaussianization (frozen)}]{\ M^{-1}\ }\ \x .
+\end{equation}
+Stage~1 is the coordinatewise map $M$ of \eqref{eq:gaussianize}, fixed once the
+marginals $\Fhat_i$ are estimated. Stage~2 is the flow $T_\theta$ of
+Section~\ref{sec:flow-intro}, which models the joint law $p_Z$ of the Gaussianized
+data. The next three sections derive each stage and then compose them.
+
+\section{Stage 1: the marginal Gaussianization, differentiated}
+\label{sec:gaussianization}
+
+We need the Jacobian of $M$ to use the change of variables. Because $M$ is
+coordinatewise, we only need one coordinate's derivative; drop the index $i$.
+The map is $z=\Phi^{-1}(F(x))$, a composition, so use the chain rule with
+$u=F(x)$:
+\begin{equation}
+\frac{\mathrm{d}z}{\mathrm{d}x}
+=\frac{\mathrm{d}z}{\mathrm{d}u}\,\frac{\mathrm{d}u}{\mathrm{d}x}.
+\end{equation}
+The second factor is $\mathrm{d}u/\mathrm{d}x=F'(x)=f(x)$, the marginal density.
+For the first factor we differentiate an inverse function.
+
+\begin{deriv}[derivative of $\Phi^{-1}$]
+Let $\phi=\Phi'$ be the standard--normal density. From $\Phi(\Phi^{-1}(u))=u$,
+differentiate both sides in $u$: $\phi(\Phi^{-1}(u))\cdot(\Phi^{-1})'(u)=1$, so
+\begin{equation}
+(\Phi^{-1})'(u)=\frac{1}{\phi(\Phi^{-1}(u))}=\frac{1}{\phi(z)} .
+\end{equation}
+\end{deriv}
+
+\noindent Combining,
+\begin{equation}
+\label{eq:marginal-jac}
+\boxed{\;\frac{\mathrm{d}z}{\mathrm{d}x}=\frac{f(x)}{\phi(z)},
+\qquad z=\Phi^{-1}\bigl(F(x)\bigr).\;}
+\end{equation}
+Restoring the coordinate index and using fact~(i), the log--Jacobian of the full
+map $M$ is the sum
+\begin{equation}
+\label{eq:M-logdet}
+\log\Bigl|\det \tfrac{\partial M}{\partial\x}\Bigr|
+=\sum_{i=1}^{d}\Bigl[\log f_i(x_i)-\log\phi(z_i)\Bigr].
+\end{equation}
+The inverse map, used when we sample, undoes each step: apply the normal CDF, then
+the marginal quantile function,
+\begin{equation}
+\label{eq:M-inverse}
+x_i=F_i^{-1}\bigl(\Phi(z_i)\bigr).
+\end{equation}
+Everything in \eqref{eq:marginal-jac}--\eqref{eq:M-inverse} needs three
+one--dimensional objects per coordinate: the CDF $F$, its density $f=F'$, and its
+inverse $F^{-1}$. Building those from the samples is the next section.
+
+\section{Stage 1, continued: estimating the marginal with a monotone spline}
+\label{sec:pchip}
+
+We estimate each marginal CDF as a smooth, strictly increasing curve through the
+empirical CDF, using a monotone piecewise--cubic Hermite interpolant (PCHIP).
+Drop the coordinate index.
+
+\subsection{Knots and the empirical CDF}
+
+Choose $K$ knots at empirical quantiles of the sample,
+\begin{equation}
+\label{eq:knots}
+x_g^{(m)}=\Qhat\!\Bigl(\tfrac{m}{K-1}\Bigr),\qquad m=0,\dots,K-1,
+\end{equation}
+where $\Qhat$ is the sample quantile function. Spacing the knots evenly in
+\emph{probability} (not in $x$) places them densely where the data are dense.
+The empirical CDF value at a knot is the fraction of samples at or below it,
+\begin{equation}
+\label{eq:ecdf}
+\Fhat^{(m)}=\frac1N\,\#\bigl\{n:x^{(n)}\le x_g^{(m)}\bigr\}.
+\end{equation}
+The knot count is set adaptively,
+$K=\max\!\bigl(20,\min(K_{\max},\lfloor N/3\rfloor)\bigr)$ with default
+$K_{\max}=200$, so small samples do not get an over--fine grid.
+
+\subsection{Cubic Hermite interpolation, and the basis}
+
+Between two adjacent knots we want a cubic that matches the CDF value \emph{and}
+a chosen slope at each end (matching slopes is what makes the joined curve
+smooth, i.e.\ $C^1$). On $[x_g^{(m)},x_g^{(m+1)}]$ set
+$h_m=x_g^{(m+1)}-x_g^{(m)}$ and the local coordinate $t=(x-x_g^{(m)})/h_m\in[0,1]$.
+Writing the endpoint values $y_0=\Fhat^{(m)},y_1=\Fhat^{(m+1)}$ and the (rescaled)
+endpoint slopes, the interpolant is
+\begin{equation}
+\label{eq:hermite}
+\Fhat(x)=\Fhat^{(m)}H_{00}(t)+h_m d_m H_{10}(t)
+        +\Fhat^{(m+1)}H_{01}(t)+h_m d_{m+1}H_{11}(t),
+\end{equation}
+with the cubic Hermite basis
+\begin{equation}
+\label{eq:hbasis}
+\begin{aligned}
+H_{00}(t)&=2t^3-3t^2+1, & H_{10}(t)&=t^3-2t^2+t,\\
+H_{01}(t)&=-2t^3+3t^2,  & H_{11}(t)&=t^3-t^2.
+\end{aligned}
+\end{equation}
+
+\begin{deriv}[where the basis comes from]
+Each basis cubic is the unique degree--3 polynomial isolating one endpoint
+condition. Take $H_{00}$: we require value $1$ at $t=0$, value $0$ at $t=1$, and
+slope $0$ at both ends. Writing $H_{00}=a+bt+ct^2+et^3$, the four conditions
+$H_{00}(0)=1,\ H_{00}'(0)=0,\ H_{00}(1)=0,\ H_{00}'(1)=0$ give $a=1,\ b=0$, and
+$c+e=-1,\ 2c+3e=0$, hence $e=2,c=-3$, i.e.\ $H_{00}=1-3t^2+2t^3$. The other three
+follow the same way. One checks that
+$\Fhat(x_g^{(m)})=\Fhat^{(m)}$, $\Fhat(x_g^{(m+1)})=\Fhat^{(m+1)}$,
+$\Fhat'(x_g^{(m)})=d_m$, and $\Fhat'(x_g^{(m+1)})=d_{m+1}$ --- the factor $h_m$ in
+\eqref{eq:hermite} converts the slope in $x$ to a slope in $t$ (chain rule).
+\end{deriv}
+
+\subsection{Choosing the slopes so the CDF cannot wiggle}
+
+Nothing so far forces $\Fhat$ to be increasing --- and a CDF that dips would give
+a negative density, which is nonsense. The slopes $d_m$ must be chosen to keep the
+interpolant monotone. Let $\delta_m=(\Fhat^{(m+1)}-\Fhat^{(m)})/h_m\ge0$ be the
+secant slope across interval $m$.
+
+\begin{plain}
+Intuition: if the data say the CDF rises gently across one bin and steeply across
+the next, the knot between them should have a slope somewhere in between --- and
+if the data flatten out (a local plateau), the slope there should be zero so the
+curve does not overshoot and come back down.
+\end{plain}
+
+Fritsch and Carlson \cite{FritschCarlson1980} made this precise: the Hermite
+piece is monotone on a bin whenever the endpoint slopes lie in a bounded region
+around the secant (a sufficient version is $0\le d_m\le 3\min(\delta_{m-1},
+\delta_m)$). PCHIP picks the slopes to sit safely inside that region: a knot at a
+local extremum ($\delta_{m-1}\delta_m\le0$) gets $d_m=0$, and otherwise $d_m$ is
+the \emph{weighted harmonic mean} of the two neighbouring secants,
+\begin{equation}
+\label{eq:fc}
+d_m=\frac{w_1+w_2}{\,w_1/\delta_{m-1}+w_2/\delta_m\,},
+\qquad w_1=2h_m+h_{m-1},\quad w_2=h_m+2h_{m-1},
+\end{equation}
+with a one--sided formula at the two ends of the grid.
+
+\begin{plain}
+Why a harmonic mean rather than an ordinary average? The harmonic mean of two
+positive numbers is dominated by the \emph{smaller} one and collapses to zero if
+either does. That is exactly the safe behaviour: near a flat bin the slope is
+pulled toward zero, which is what prevents overshoot. The result is guaranteed
+nondecreasing, so $\Fhat$ is a genuine CDF.
+\end{plain}
+
+\subsection{The density and the quantile function for free}
+
+The marginal density is just the analytic derivative of \eqref{eq:hermite} --- a
+continuous, nonnegative, piecewise--quadratic function,
+\begin{equation}
+\label{eq:pdf}
+\fhat(x)=\Fhat'(x)=\frac{1}{h_m}\Bigl[\Fhat^{(m)}H_{00}'(t)+h_m d_m H_{10}'(t)
++\Fhat^{(m+1)}H_{01}'(t)+h_m d_{m+1}H_{11}'(t)\Bigr],
+\end{equation}
+(the $1/h_m$ is again the chain rule, $\mathrm{d}t/\mathrm{d}x$). Having $\fhat$
+in closed form is what makes the marginal Jacobian \eqref{eq:marginal-jac} cheap
+--- no numerical differentiation. The quantile function $F^{-1}$ needed for
+sampling is a \emph{second} PCHIP interpolant, this one through the swapped knots
+$\{(\Fhat^{(m)},x_g^{(m)})\}$ (CDF value on the horizontal axis, $x$ on the
+vertical). Because the two splines are fit independently, they invert each other
+only up to the interpolation error, which shrinks as the knot count $K$ grows
+(and saturates at $K_{\max}$).
+
+\subsection{Beyond the data range: the Gaussian tail}
+\label{sec:tail}
+
+The knots \eqref{eq:knots} only cover $[x_{\min},x_{\max}]$. By default the CDF
+is held flat at its boundary value outside that range (appropriate when a prior
+bounds the parameter). To extrapolate more gracefully on unbounded parameters,
+continue the CDF with a Gaussian tail matched at the boundary. Fit a Gaussian to
+the coordinate, $\mu=\bar x$, $\sigma=\sd(x)$, with CDF
+$\Phi_{\mu,\sigma}(x)=\Phi((x-\mu)/\sigma)$, and require the tail to meet the
+interpolant continuously.
+
+\begin{deriv}[the matching constants]
+On the left we want a scaled Gaussian CDF, $\Fhat(x)=c_{\mathrm{lo}}\,
+\Phi_{\mu,\sigma}(x)$ for $x<x_{\min}$, that agrees with the interpolant's
+boundary value $F_{\mathrm{lo}}=\Fhat(x_{\min})$. Setting $x=x_{\min}$ and solving,
+\begin{equation}
+c_{\mathrm{lo}}\,\Phi_{\mu,\sigma}(x_{\min})=F_{\mathrm{lo}}
+\ \Longrightarrow\
+c_{\mathrm{lo}}=\frac{F_{\mathrm{lo}}}{\Phi_{\mu,\sigma}(x_{\min})}.
+\end{equation}
+On the right we scale the \emph{survival} function so that
+$\Fhat(x)=1-c_{\mathrm{hi}}\bigl[1-\Phi_{\mu,\sigma}(x)\bigr]$ matches
+$F_{\mathrm{hi}}=\Fhat(x_{\max})$ at $x=x_{\max}$:
+\begin{equation}
+1-c_{\mathrm{hi}}\bigl[1-\Phi_{\mu,\sigma}(x_{\max})\bigr]=F_{\mathrm{hi}}
+\ \Longrightarrow\
+c_{\mathrm{hi}}=\frac{1-F_{\mathrm{hi}}}{1-\Phi_{\mu,\sigma}(x_{\max})}.
+\end{equation}
+\end{deriv}
+
+\noindent Putting the three pieces together,
+\begin{equation}
+\label{eq:tail-cdf}
+\Fhat(x)=
+\begin{cases}
+c_{\mathrm{lo}}\,\Phi_{\mu,\sigma}(x), & x<x_{\min},\\[3pt]
+\text{PCHIP interpolant \eqref{eq:hermite}}, & x_{\min}\le x\le x_{\max},\\[3pt]
+1-c_{\mathrm{hi}}\bigl[1-\Phi_{\mu,\sigma}(x)\bigr], & x>x_{\max}.
+\end{cases}
+\end{equation}
+The tail density is the derivative, $c_{\mathrm{lo}}\phi_{\mu,\sigma}(x)$ on the
+left and $c_{\mathrm{hi}}\phi_{\mu,\sigma}(x)$ on the right, and the tail quantile
+inverts in closed form, e.g.\ on the left
+$x=\mu+\sigma\,\Phi^{-1}(u/c_{\mathrm{lo}})$. The match is continuous in the CDF;
+the density can have a kink at the join, which is harmless for the transform.
+
+\section{Stage 2: the copula flow}
+\label{sec:copula-flow}
+
+The flow $T_\theta$ models the joint density $p_Z$ of the Gaussianized vector
+$\z$. Concretely it is a stack of $L$ layers, each combining two invertible
+pieces whose Jacobians we already know how to handle cheaply.
+
+\paragraph{Piece one: an elementwise monotone spline.}
+Each coordinate is passed through its own increasing rational--quadratic spline
+--- a curve stitched from pieces that are each a ratio of two quadratics,
+constrained to be monotone with adjustable knot heights, widths, and slopes.
+These knot parameters live in $\theta$ and are what training adjusts. Because the
+spline acts coordinate by coordinate, its Jacobian is diagonal and its
+log--determinant is $\sum_i\log(\text{spline slope})_i$. (A $\tanh$ squashes the
+input to a finite window first, so the spline only has to be defined on a bounded
+interval; the constant \texttt{tanh\_max\_val} sets that window.) This piece adds
+nonlinearity but, on its own, cannot make coordinates interact.
+
+\paragraph{Piece two: a triangular linear map.}
+The coordinates are then mixed by an affine map $\z\mapsto L\z+\bm b$ with $L$ a
+triangular matrix. Triangularity is the whole point: by fact~(ii) of
+Section~\ref{sec:problem} the Jacobian is $L$, its determinant is the product of
+the diagonal, and $\log|\det|=\sum_i\log|L_{ii}|$. This is what lets one
+coordinate's transformation depend on the others --- i.e.\ what actually models
+dependence --- without an expensive determinant. Alternating the orientation of
+$L$ (lower, then upper, \dots) across layers lets every coordinate eventually
+influence every other.
+
+\paragraph{The flow's density.}
+Stacking these layers gives an invertible $T_\theta$ whose log--Jacobian is the
+sum of the per--layer diagonal terms, so \eqref{eq:flow-density} specialises to
+\begin{equation}
+\label{eq:pz}
+\log p_Z(\z)=\log\Ncal\!\bigl(T_\theta^{-1}(\z);\bm0,I_d\bigr)
++\sum_{\ell=1}^{L}\log\Bigl|\det \tfrac{\partial T_\ell^{-1}}{\partial(\cdot)}\Bigr|,
+\end{equation}
+every term of which is an $O(d)$ sum over a diagonal. Because the marginals were
+already standardized in Stage~1, the base $\Ncal(\bm0,I_d)$ is a good starting
+guess for $\z$, and the flow only has to bend it into the right dependence.
+
+\paragraph{Training.}
+The parameters $\theta$ are fit by the maximum likelihood of
+Section~\ref{sec:flow-intro}. Since the marginal maps are frozen, the marginal
+term in the full density (next section) does not depend on $\theta$, so
+maximizing the data likelihood is equivalent to maximizing
+$\sum_n\log p_Z\bigl(M(\x^{(n)})\bigr)$ on the fixed Gaussianized data --- we
+literally transform the data once, then train an ordinary flow on it (Adam, early
+stopping on a held--out split).
+
+\section{Putting the stages together: the model density}
+\label{sec:master}
+
+Now compose. The model is $\x=M^{-1}(T_\theta(\eps))$, so its density is the flow
+density for $\z$ pushed through the marginal map $M$. Apply the change of
+variables \eqref{eq:logcov} to $M$, using its log--Jacobian \eqref{eq:M-logdet}:
+\begin{equation}
+\label{eq:master}
+\boxed{\;
+\log p(\x)=\log p_Z(\z)+\sum_{i=1}^{d}\Bigl[\log \fhat_i(x_i)-\log\phi(z_i)\Bigr],
+\qquad z_i=\Phi^{-1}\bigl(\Fhat_i(x_i)\bigr).\;}
+\end{equation}
+The first term is the flow \eqref{eq:pz}; the sum is the marginal correction. That
+is the whole model density.
+
+\begin{deriv}[the same formula, read as a copula --- a good consistency check]
+Sklar \eqref{eq:sklar} says $\log p(\x)=\log c(\uu)+\sum_i\log\fhat_i(x_i)$ with
+$u_i=\Fhat_i(x_i)$. We only need to see that the flow supplies $\log c$. The
+copula density is the density of $\uu$; since $\z=\Phi^{-1}(\uu)$ coordinatewise,
+the change of variables \eqref{eq:cov-forward} with fact~(i) gives
+\begin{equation}
+c(\uu)=p_Z(\z)\prod_{i}\Bigl|\frac{\mathrm{d}z_i}{\mathrm{d}u_i}\Bigr|
+      =p_Z(\z)\prod_i\frac{1}{\phi(z_i)},
+\quad\text{i.e.}\quad
+\log c(\uu)=\log p_Z(\z)-\sum_i\log\phi(z_i),
+\end{equation}
+using $\mathrm{d}z_i/\mathrm{d}u_i=(\Phi^{-1})'(u_i)=1/\phi(z_i)$. Substituting
+into Sklar reproduces \eqref{eq:master} exactly. So ``the flow's density minus the
+Gaussian marginal terms'' \emph{is} the log--copula --- the two viewpoints agree.
+\end{deriv}
+
+\section{Sampling and evaluation, as procedures}
+\label{sec:algorithms}
+
+Both directions of the pipeline \eqref{eq:pipeline} are now explicit.
+
+\medskip
+\noindent\textbf{To evaluate} $\log p(\x)$ at a point:
+\begin{enumerate}\itemsep2pt
+\item Gaussianize: $u_i\leftarrow\Fhat_i(x_i)$, then $z_i\leftarrow\Phi^{-1}(u_i)$, for each $i$.
+\item Return $\log p_Z(\z)+\sum_i\bigl[\log\fhat_i(x_i)-\log\phi(z_i)\bigr]$.
+\end{enumerate}
+
+\noindent\textbf{To sample} $\x\sim p$:
+\begin{enumerate}\itemsep2pt
+\item Draw $\eps\sim\Ncal(\bm0,I_d)$ and push it through the flow, $\z\leftarrow T_\theta(\eps)$.
+\item Invert the marginals, $x_i\leftarrow\Fhat_i^{-1}\bigl(\Phi(z_i)\bigr)$, for each $i$.
+\end{enumerate}
+Doing both in one forward pass returns a sample together with its exact
+log--density, which is what importance weighting needs.
+
+\section{Why the pieces were chosen, and one caveat}
+\label{sec:why}
+
+\begin{itemize}
+\item \textbf{Separation of concerns.} The nonparametric marginals \eqref{eq:hermite}
+absorb every hard one--dimensional shape, so the flow \eqref{eq:pz} spends all its
+parameters on dependence. Each half does the job it is good at.
+\item \textbf{Everything is closed--form.} The marginal CDF, its density, and (up
+to interpolation error) its inverse all come from cheap spline evaluations; the
+flow's density and inverse are exact. So \eqref{eq:master} is an exact density,
+not a bound, and samples come with honest weights.
+\item \textbf{Cheap Jacobians throughout.} Every map in the pipeline is
+coordinatewise or triangular, so every determinant is an $O(d)$ sum over a
+diagonal --- the reason the whole thing scales.
+\item \textbf{Caveat at hard boundaries.} Gaussianization sends the ends of the
+range to $\pm\infty$ through $\Phi^{-1}$, so a query \emph{at} a hard bound
+arrives at the copula flow at a very large $|z|$, where the flow is
+extrapolating past its outermost knot. The density it reports there is
+self--consistent with the sampler --- draws and \texttt{log\_prob} come from one
+parameterization --- but it is not a trustworthy pointwise value, and on a chain
+that really has mass sitting on a wall it is much \emph{larger} than the
+interior density rather than smaller. The Gaussian pipeline is the right choice
+on unbounded parameters and whenever the tail models of
+Section~\ref{sec:tail} are needed; when the density at the wall itself is the
+quantity of interest, the cube--native fleet pipeline never leaves $[0,1]^d$ and
+does not have this failure mode. Note also that the double--spline construction
+of Section~\ref{sec:pchip} inverts only up to interpolation error; the
+\texttt{marginal="smooth"} default named in the status box replaces it with a
+single parameterization whose inverse is exact.
+\end{itemize}
+
+\begin{thebibliography}{9}
+
+\bibitem{Sklar1959}
+A.~Sklar,
+\emph{Fonctions de r\'epartition \`a $n$ dimensions et leurs marges},
+Publ.\ Inst.\ Statist.\ Univ.\ Paris \textbf{8}, 229--231 (1959).
+
+\bibitem{FritschCarlson1980}
+F.~N.~Fritsch and R.~E.~Carlson,
+\emph{Monotone piecewise cubic interpolation},
+SIAM J.\ Numer.\ Anal.\ \textbf{17}, 238--246 (1980).
+
+\bibitem{Durkan2019}
+C.~Durkan, A.~Bekasov, I.~Murray, and G.~Papamakarios,
+\emph{Neural spline flows},
+Advances in Neural Information Processing Systems (NeurIPS) \textbf{32} (2019).
+
+\bibitem{Papamakarios2021}
+G.~Papamakarios, E.~Nalisnick, D.~J.~Rezende, S.~Mohamed, and
+B.~Lakshminarayanan,
+\emph{Normalizing flows for probabilistic modeling and inference},
+J.\ Mach.\ Learn.\ Res.\ \textbf{22}, 1--64 (2021).
+
+\end{thebibliography}
+
+\end{document}

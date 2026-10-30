@@ -2,19 +2,57 @@ name: Publish to PyPI
 
 # Publishes the package whenever a GitHub Release is published.
 # Uses PyPI Trusted Publishing (OIDC) — no API tokens are stored in the repo.
+#
+# Every action is pinned to a full commit SHA rather than a tag or branch: this
+# workflow holds the trusted-publisher grant, and a tag (let alone a branch ref
+# such as the upstream-recommended `@release/v1`) can be moved by the action's
+# owner at any time. Dependabot bumps the SHAs and rewrites the trailing version
+# comment; keep the two in sync by hand if you edit a pin manually.
 on:
   release:
     types: [published]
 
+# Least privilege by default. Each job re-declares only what it needs.
+permissions: {}
+
 jobs:
-  build:
-    name: Build distributions
+  test:
+    name: Test the released commit
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        # Oldest and newest supported Python. test.yml runs the full matrix on
+        # push/PR to main; this leg exists so that a release cut from a commit
+        # that never went through main cannot upload an untested artifact.
+        python-version: ["3.11", "3.14"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
+        with:
+          enable-cache: true
+
+      - name: Verify lockfile is current
+        run: uv lock --check
+
+      - name: Run tests
+        run: uv run --python ${{ matrix.python-version }} pytest tests/ -q
+
+  build:
+    name: Build distributions
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
 
       - name: Build sdist and wheel
         run: uv build
@@ -22,7 +60,16 @@ jobs:
       - name: Check package metadata
         run: uvx twine check dist/*
 
-      - uses: actions/upload-artifact@v4
+      # hatchling assembles the wheel from the filesystem, so a source file that
+      # is untracked in git is present locally and absent from a CI checkout.
+      # Installing and importing the built wheel is what catches that.
+      - name: Import the built wheel in a clean environment
+        run: |
+          uv venv /tmp/wheelcheck
+          VIRTUAL_ENV=/tmp/wheelcheck uv pip install dist/*.whl
+          /tmp/wheelcheck/bin/python -c "import coppuccino; print(coppuccino.__file__)"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: dist
           path: dist/
@@ -39,10 +86,10 @@ jobs:
     permissions:
       id-token: write  # required for Trusted Publishing (OIDC)
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           name: dist
           path: dist/
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
