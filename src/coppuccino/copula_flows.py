@@ -14,12 +14,7 @@ from flowjax.train import fit_to_data
 from paramax import non_trainable, unwrap
 from paramax.wrappers import NonTrainable
 
-from coppuccino.bijections import (
-    EmpiricalMarginalToGaussian,
-    SmoothMarginalToGaussian,
-    make_empirical_cdf_spline,
-    make_smooth_marginal,
-)
+from coppuccino.bijections import SmoothMarginalToGaussian, make_smooth_marginal
 
 __all__ = [
     "normalizing_flows_fit", "normalizing_flows_fit_auto",
@@ -101,9 +96,8 @@ def _validate_prior_bounds(prior_bounds, chain: np.ndarray) -> np.ndarray:
     ``[[low0, low1], [high0, high1]]`` transposition: laid out that way the
     rows usually still satisfy ``low < high``, so an ordering test alone lets
     it through. It also has to be an error rather than a repair, because the
-    marginal families disagree about what a too-narrow box means -- the
-    default ``"smooth"`` marginal folds every out-of-range row onto the wall
-    while the legacy spline families ignore the bound entirely.
+    marginal map folds every out-of-range row onto the wall, which would
+    silently relocate data rather than fit it.
 
     The containment message prints the offending numbers at full ``repr``
     precision rather than ``%g``: the violation that a float round-tripped
@@ -286,13 +280,15 @@ def _assert_fit_converged(flow: Transformed, initial_copula,
 
     Measured, all at ``max_epochs=40`` and all in nats per dimension. A
     legitimate grid of 842 fits (9 laws x ``learning_rate`` in 1e-4, 1e-3,
-    1e-2, 5e-2 x shapes (400, 2) and (1200, 3) x ``marginal`` "smooth" and
-    "rqs" x seeds 0 and 7 x three architectures) produced no positive deficit
+    1e-2, 5e-2 x shapes (400, 2) and (1200, 3) x the smooth and the
+    since-removed "rqs" marginal x seeds 0 and 7 x three architectures)
+    produced no positive deficit
     at all: every fit beat its own initialization, the closest by -0.0395. A
     second envelope of 48 fits covering the axes that grid omits
     (``prior_bounds`` including a Beta(0.5, 3) spike on [0, 1], the since-removed
-    ``whiten`` option, ``weight_decay``, ``tail_alpha``, ``patience=1``,
-    ``marginal="pchip"``, dimensions up to 8, ``n`` from 200 to 8,000,
+    ``whiten`` option, ``weight_decay``, ``tail_alpha``, ``patience=1``, the
+    since-removed ``marginal="pchip"``, dimensions up to 8, ``n`` from 200 to
+    8,000,
     ``max_epochs=200``) ran from -2.21 to 0.0 -- the 0.0 being a since-removed
     zero-layer rung, which had nothing to train and so was exactly its own
     baseline.
@@ -355,55 +351,30 @@ def _resolve_seed(rng_seed: Optional[int]) -> int:
     return int(rng_seed)
 
 
-def _create_empirical_transforms(samples: np.ndarray, min_eps: float = 1e-7,
-                                  num_points: int = 200, tail_extension: bool = False,
+def _create_empirical_transforms(samples: np.ndarray, num_points: int = 200,
                                   prior_bounds: Optional[np.ndarray] = None,
-                                  tail_model: str = "gaussian",
-                                  tail_quantile: float = 0.05,
-                                  marginal: str = "rqs",
                                   tail_alpha: float = 0.0):
     """
     Create empirical marginal transforms for copula modeling.
 
-    Constructs individual empirical CDF transforms for each parameter dimension
-    and stacks them into a single bijection. This is the first step in copula
-    modeling, transforming marginals to Gaussian.
+    Constructs one smooth-tail marginal map per parameter dimension
+    (:func:`coppuccino.bijections.make_smooth_marginal`) and stacks them into
+    a single bijection. This is the first step in copula modeling,
+    transforming marginals to Gaussian.
 
     Parameters
     ----------
     samples : np.ndarray
         Input samples with shape (n_samples, n_params).
-    min_eps : float, optional
-        Minimum epsilon for CDF bounds. Default is 1e-7.
     num_points : int, optional
-        Number of grid points for each marginal CDF spline. Default is 200.
+        Number of grid points for each marginal spline. Default is 200.
         Automatically clamped to a sensible range based on sample size.
-    tail_extension : bool, optional
-        If True, extend the CDF/quantile beyond the observed data range using
-        a Gaussian tail model. Default is False (clip to data bounds), which
-        is appropriate for MCMC chains bounded by prior support.
     prior_bounds : np.ndarray, optional
         Prior support bounds with shape (n_params, 2), where each row is
-        [low, high] for that parameter. When provided, the CDF grid extends
-        to the prior edges so the flow can sample the full prior support.
-    tail_model : str, optional
-        ``"gaussian"`` (default) or the experimental ``"gpd"`` peaks-over-
-        threshold model.
-    tail_quantile : float, optional
-        GPD tail fraction, only used when ``tail_model="gpd"`` (default 0.05).
-        See :func:`coppuccino.bijections.make_empirical_cdf_spline` for both.
-    marginal : str, optional
-        Marginal family for every dimension: ``"smooth"`` (the clip-free
-        diffeomorphism built by
-        :func:`coppuccino.bijections.make_smooth_marginal`, and what
-        ``normalizing_flows_fit`` resolves to by default), or the legacy spline
-        families ``"rqs"`` (default here) and ``"pchip"``. See
-        :func:`coppuccino.bijections.make_empirical_cdf_spline` for the latter
-        two. ``min_eps``, ``tail_extension``, ``tail_model`` and
-        ``tail_quantile`` apply only to the legacy families.
+        [low, high] for that parameter. When provided, each marginal's tail
+        runs to the prior edge, so the flow can sample the full prior support.
     tail_alpha : float, optional
-        Tail heaviness on unbounded sides, used only by ``marginal="smooth"``.
-        Default 0.0 (Gaussian tails).
+        Tail heaviness on unbounded sides. Default 0.0 (Gaussian tails).
 
     Returns
     -------
@@ -440,49 +411,35 @@ def _create_empirical_transforms(samples: np.ndarray, min_eps: float = 1e-7,
     for j in range(x.shape[1]):
         param_samples = x[:, j]
         if len(param_samples) > _MIN_SAMPLES_PER_DIM:
-            # The builders (and scipy underneath them) know nothing about the
-            # column they were handed, so a degenerate parameter otherwise
-            # surfaces as a bare "needs at least two distinct sample values" /
-            # "`x` must contain at least 2 elements" with nothing to bisect on.
+            # The builder (and scipy underneath it) knows nothing about the
+            # column it was handed, so a degenerate parameter otherwise
+            # surfaces as a bare "needs at least two distinct sample values"
+            # with nothing to bisect on.
             try:
                 p_low = float(prior_bounds[j, 0]) if prior_bounds is not None else None
                 p_high = float(prior_bounds[j, 1]) if prior_bounds is not None else None
-                # A non-finite bound means unbounded on that side (the legacy
-                # spline builders would otherwise fail inside scipy with an
-                # unrelated-looking error)
+                # A non-finite bound means unbounded on that side, and the
+                # bijection records it as None so the prior box ignores it.
                 if p_low is not None and not np.isfinite(p_low):
                     p_low = None
                 if p_high is not None and not np.isfinite(p_high):
                     p_high = None
-                if marginal == "smooth":
-                    # clip-free diffeomorphism z in R <-> theta in (lo, hi):
-                    # no CDF clip, no quantile clamp (no boundary sample atoms),
-                    # no floored wall density (no cliffs); honest analytic tails.
-                    theta_of_z, z_of_theta, log_dtheta_dz, x_clamps = \
-                        make_smooth_marginal(
-                            param_samples, num_points=num_points,
-                            prior_low=p_low, prior_high=p_high,
-                            tail_alpha=tail_alpha)
-                    # mypy folds flowjax's AbstractVar shape/cond_shape into the
-                    # synthesised __init__, so it reads these as the first two
-                    # positional arguments. See the ClassVar note on the class.
-                    empirical_transforms.append(non_trainable(SmoothMarginalToGaussian(  # type: ignore[call-arg]
-                        param_samples, theta_of_z, z_of_theta, log_dtheta_dz,
-                        num_points=num_points, prior_low=p_low, prior_high=p_high,
-                        tail_alpha=tail_alpha,
-                        x_clamp_lo=x_clamps[0], x_clamp_hi=x_clamps[1])))
-                    continue
-                _, cdf_fn, quantile_fn, pdf_fn = make_empirical_cdf_spline(
-                    param_samples, num_points=num_points, min_eps=min_eps,
-                    tail_extension=tail_extension, prior_low=p_low, prior_high=p_high,
-                    tail_model=tail_model, tail_quantile=tail_quantile,
-                    marginal=marginal)
-                empirical_transforms.append(non_trainable(EmpiricalMarginalToGaussian(  # type: ignore[call-arg]
-                    param_samples, cdf_fn, quantile_fn, pdf_fn, min_eps=min_eps,  # type: ignore[arg-type]
-                    num_points=num_points, tail_extension=tail_extension,
-                    prior_low=p_low, prior_high=p_high,
-                    tail_model=tail_model, tail_quantile=tail_quantile,
-                    marginal=marginal)))
+                # clip-free diffeomorphism z in R <-> theta in (lo, hi):
+                # no CDF clip, no quantile clamp (no boundary sample atoms),
+                # no floored wall density (no cliffs); honest analytic tails.
+                theta_of_z, z_of_theta, log_dtheta_dz, x_clamps = \
+                    make_smooth_marginal(
+                        param_samples, num_points=num_points,
+                        prior_low=p_low, prior_high=p_high,
+                        tail_alpha=tail_alpha)
+                # mypy folds flowjax's AbstractVar shape/cond_shape into the
+                # synthesised __init__, so it reads these as the first two
+                # positional arguments. See the ClassVar note on the class.
+                empirical_transforms.append(non_trainable(SmoothMarginalToGaussian(  # type: ignore[call-arg]
+                    param_samples, theta_of_z, z_of_theta, log_dtheta_dz,
+                    num_points=num_points, prior_low=p_low, prior_high=p_high,
+                    tail_alpha=tail_alpha,
+                    x_clamp_lo=x_clamps[0], x_clamp_hi=x_clamps[1])))
             except ValueError as exc:
                 raise ValueError(f"parameter (column) {j}: {exc}") from exc
         else:
@@ -581,15 +538,12 @@ def _fit_chain_entry(
     return Transformed(updated_flow, transform)
 
 
-def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
+def normalizing_flows_fit(chain: np.ndarray, *, rng_seed: int = 999,
                           knots: int = 4, patience: int = 30, learning_rate: float = 1e-3,
                           max_epochs: int = 400, flow_layers: int = 6,
-                          num_points: int = 200, tail_extension: bool = False,
+                          num_points: int = 200,
                           tanh_max_val: float = 3.0,
                           prior_bounds: Optional[np.ndarray] = None,
-                          tail_model: str = "gaussian",
-                          tail_quantile: float = 0.05,
-                          marginal: Optional[str] = None,
                           tail_alpha: float = 0.0,
                           weight_decay: float = 0.0,
                           show_progress: bool = True) -> Transformed:
@@ -602,18 +556,13 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
 
     Marginals map to Gaussian space and the copula is a triangular spline flow
     over a normal base -- the strongest choice for heavily correlated
-    posteriors (the affine layer captures near-linear dependence). With the
-    default ``marginal="smooth"`` the marginal map is a clip-free
-    diffeomorphism of all of R onto the support (RQS bulk + analytic tails):
-    no boundary sample atoms, no wall density cliffs (though the density *at*
-    a bound is not quantitatively faithful -- see ``SmoothMarginalToGaussian``),
-    and honest smoothly-decaying densities for outliers / beyond-data queries
-    (``tail_alpha`` sets Gaussian vs heavier tails on unbounded sides). The
-    legacy clipped marginals remain available as ``marginal="rqs"`` /
-    ``"pchip"`` (required for ``tail_extension`` / ``tail_model="gpd"``);
-    they can disagree between sample stream and reported density in slivers
-    at hard support boundaries, which can absorb independence-MCMC
-    walkers.
+    posteriors (the affine layer captures near-linear dependence). Each
+    marginal map is a clip-free diffeomorphism of all of R onto the support
+    (RQS bulk + analytic tails): no boundary sample atoms, no wall density
+    cliffs (though the density *at* a bound is not quantitatively faithful --
+    see ``SmoothMarginalToGaussian``), and honest smoothly-decaying densities
+    for outliers / beyond-data queries (``tail_alpha`` sets Gaussian vs
+    heavier tails on unbounded sides).
     The approach combines flexibility in modeling marginals (via empirical CDFs)
     with powerful dependency modeling (via normalizing flows).
 
@@ -622,7 +571,7 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
     chain : np.ndarray
         Training samples with shape (n_samples, n_params). Rows containing
         non-finite values (NaN or +-inf) are dropped, with a warning, before
-        fitting. Any other shape raises.
+        fitting. Any other shape raises. Every other argument is keyword-only.
     rng_seed : int, optional
         Random seed for reproducibility. Must be a non-negative integer.
         Default is 999.
@@ -642,14 +591,9 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
         Number of coupling layers in the triangular spline flow. Must be an
         integer >= 1. Default is 6.
     num_points : int, optional
-        Number of grid points for each marginal CDF spline. Must be an integer
+        Number of grid points for each marginal spline. Must be an integer
         >= 2. Default is 200. Automatically clamped based on sample size.
         Increase for distributions with fine structure (e.g. many narrow modes).
-    tail_extension : bool, optional
-        If True, extend the marginal CDF beyond the observed data range using
-        a Gaussian tail model. This allows the flow to generate samples beyond
-        the training range. Default is False, which is appropriate for MCMC
-        chains bounded by prior support.
     tanh_max_val : float, optional
         Maximum value for the tanh clipping in the spline flow base space.
         Must be finite and strictly positive.
@@ -659,8 +603,8 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
         representable tail dependence.
     prior_bounds : np.ndarray, optional
         Prior support bounds with shape (n_params, 2), where each row is
-        [low, high] for that parameter. When provided, the empirical CDF grid
-        extends to the prior edges, allowing the flow to sample the full prior
+        [low, high] for that parameter. When provided, each marginal's tail
+        runs to the prior edge, allowing the flow to sample the full prior
         support rather than being limited to the most extreme training sample.
         Recommended for MCMC chains. Either side may be ``-inf``/``+inf``,
         meaning unbounded there; ``nan`` is rejected rather than read as
@@ -673,37 +617,11 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
             Malformed or too-narrow ``prior_bounds`` now raise ValueError.
             Previously a narrower-than-data box was accepted and handled
             differently by each marginal family.
-    tail_model : str, optional
-        Marginal tail model: ``"gaussian"`` (default) or ``"gpd"``.
-        ``"gpd"`` is **experimental**: it fits a Generalized Pareto Distribution
-        via peaks-over-threshold to each marginal's tails, which is appropriate
-        for heavy-tailed data but ignores ``tail_extension`` and ``prior_bounds``.
-        See :func:`coppuccino.bijections.make_empirical_cdf_spline`.
-    tail_quantile : float, optional
-        Fraction of samples in each GPD tail. Only used when
-        ``tail_model="gpd"``. Default is 0.05 (5%).
-    marginal : str, optional
-        Marginal transform family: ``"smooth"``, ``"rqs"``, or ``"pchip"``.
-        ``"smooth"`` (the gaussian pipeline's default) is a single clip-free
-        monotone map of R onto the support with analytic tails. ``"rqs"``
-        (the legacy gaussian bulk) is a monotone rational-quadratic spline
-        with a closed-form,
-        machine-precision inverse from a single parameterization.
-        ``"pchip"`` builds the CDF and its inverse as two independent splines
-        that are only approximate inverses of each other; it is retained for
-        backward compatibility and reproducing older fits.
-
-        Default ``None`` resolves to ``"smooth"`` (clip-free smooth-tail
-        diffeomorphism; see
-        :func:`coppuccino.bijections.make_smooth_marginal`), except when a
-        legacy tail model is requested (``tail_extension=True`` or
-        ``tail_model="gpd"``), which pre-date the smooth marginal and resolve
-        to ``"rqs"``. ``tail_alpha`` applies only to ``"smooth"``.
     tail_alpha : float, optional
-        Tail heaviness for ``marginal="smooth"`` on *unbounded* sides (no
-        prior bound given): 0.0 (default) gives Gaussian tails; larger values
-        give progressively heavier tails. Bounded sides always use the
-        exponential wall-approach tails. Ignored by other marginals.
+        Tail heaviness on *unbounded* sides (no prior bound given): 0.0
+        (default) gives Gaussian tails; larger values give progressively
+        heavier tails, up to 10. Bounded sides always use the wall tail (see
+        :class:`coppuccino.bijections.SmoothMarginalToGaussian`).
     weight_decay : float, optional
         AdamW weight decay on the trainable flow parameters. Must be finite
         and non-negative. Default 0.0
@@ -728,8 +646,8 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
     ------
     ValueError
         If ``chain`` is not a non-empty 2-D array, if ``prior_bounds`` is
-        malformed or narrower than the chain, if ``marginal``/``tail_model``
-        name an unknown family, or if any training knob is out of range
+        malformed or narrower than the chain, if ``tail_alpha`` is outside
+        [0, 10], or if any training knob is out of range
         (``rng_seed >= 0``, ``knots >= 2``, ``patience >= 1``,
         ``max_epochs >= 1``, ``num_points >= 2``, ``flow_layers >= 1``,
         ``learning_rate > 0``, ``tanh_max_val > 0``, ``weight_decay >= 0``).
@@ -778,38 +696,9 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
     The triangular spline flow uses autoregressive transformations that are
     particularly efficient for capturing dependencies in high-dimensional data.
     """
-    if tail_model not in ("gaussian", "gpd"):
-        raise ValueError(
-            f"tail_model must be 'gaussian' or 'gpd', got {tail_model!r}")
-    if marginal is None:
-        # The clip-free smooth-tail marginal is the default. The legacy tail
-        # models pre-date it and still need the legacy spline family, so
-        # requesting them resolves to it (old code keeps working).
-        marginal = "rqs" if (tail_extension or tail_model == "gpd") else "smooth"
-        if marginal != "smooth" and tail_alpha != 0.0:
-            # Requesting the same combination explicitly raises below; the
-            # default path silently resolved away the only consumer of
-            # tail_alpha, so say so rather than dropping it.
-            warnings.warn(
-                f"tail_alpha={tail_alpha!r} is ignored: tail_extension=True / "
-                "tail_model='gpd' resolved the default marginal to 'rqs', and "
-                "tail_alpha applies only to marginal='smooth'.",
-                stacklevel=2,
-            )
-    if marginal not in ("pchip", "rqs", "smooth"):
-        raise ValueError(
-            f"marginal must be 'pchip', 'rqs' or 'smooth', got {marginal!r}")
-
     _validate_fit_hyperparameters(
         rng_seed, knots, patience, learning_rate, max_epochs, flow_layers,
         num_points, tanh_max_val, weight_decay)
-
-    if marginal == "smooth" and (tail_extension or tail_model == "gpd"):
-        raise ValueError(
-            "marginal='smooth' models tails natively (see tail_alpha) and "
-            "is incompatible with tail_extension=True / tail_model='gpd'. "
-            "Use the legacy marginal='rqs' or 'pchip' for those code paths."
-        )
 
     key = jr.key(rng_seed)
 
@@ -817,8 +706,7 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
 
     # Filter non-finite rows once so both transform creation and training use
     # clean data. Infinities have to go too: they reach scipy as a bare "`y`
-    # must contain only finite values", and under marginal="pchip" they do not
-    # raise at all -- the fit returns a flow that samples nothing but NaN.
+    # must contain only finite values".
     bad_rows = ~np.isfinite(chain).all(axis=1)
     n_dropped = int(bad_rows.sum())
     if n_dropped:
@@ -835,10 +723,8 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
 
     # Create initial transforms using the helper function
     transform, inverse_log_det = _create_empirical_transforms(
-        clean_chain, num_points=num_points, tail_extension=tail_extension,
-        prior_bounds=prior_bounds,
-        tail_model=tail_model, tail_quantile=tail_quantile,
-        marginal=marginal, tail_alpha=tail_alpha)
+        clean_chain, num_points=num_points, prior_bounds=prior_bounds,
+        tail_alpha=tail_alpha)
 
     # The training chain in copula space. inverse_log_det is the jitted
     # marginal map; _fit_chain_entry calls the same compiled function, so this
@@ -1665,8 +1551,8 @@ def sample(flow: Transformed, n_samples: int, rng_seed: Optional[int] = None) ->
     standard normal base distribution and transforming through the trained
     flow.
 
-    For smooth-marginal flows (the default ``marginal="smooth"``), rows whose
-    bounded tails saturated at the float64 wall-resolution limit are redrawn.
+    Rows whose bounded marginal tails saturated at the wall-resolution limit
+    are redrawn.
     The emitted stream is then the reported density truncated to the
     clamp-free region and renormalized -- a constant that cancels in MH
     ratios -- so there are no near-boundary sample lumps.

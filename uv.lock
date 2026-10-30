@@ -95,7 +95,6 @@ dependencies = [
     { name = "cloudpickle" },
     { name = "equinox" },
     { name = "flowjax" },
-    { name = "interpax" },
     { name = "jax" },
     { name = "jaxlib" },
     { name = "jaxtyping" },
@@ -121,7 +120,6 @@ requires-dist = [
     { name = "cloudpickle", specifier = ">=2.2.1,<4.0.0" },
     { name = "equinox", specifier = ">=0.13.2,<0.14.0" },
     { name = "flowjax", specifier = ">=17.2.1,<18.0.0" },
-    { name = "interpax", specifier = ">=0.3.11,<0.4.0" },
     { name = "jax", specifier = ">=0.4.38,<0.8" },
     { name = "jaxlib", specifier = ">=0.4.38,<0.8" },
     { name = "jaxtyping", specifier = ">=0.3.6,<0.4.0" },
@@ -182,22 +180,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/72/34/14ca021ce8e5dfedc35312d08ba8bf51fdd999c576889fc2c24cb97f4f10/iniconfig-2.3.0.tar.gz", hash = "sha256:c76315c77db068650d49c5b56314774a7804df16fee4402c1f19d6d15d8c4730", size = 20503, upload-time = "2025-10-18T21:55:43.219Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/cb/b1/3846dd7f199d53cb17f49cba7e651e9ce294d8497c8c150530ed11865bb8/iniconfig-2.3.0-py3-none-any.whl", hash = "sha256:f631c04d2c48c52b84d0d0549c99ff3859c98df65b3101406327ecc7d53fbf12", size = 7484, upload-time = "2025-10-18T21:55:41.639Z" },
-]
-
-[[package]]
-name = "interpax"
-version = "0.3.14"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "equinox" },
-    { name = "jax" },
-    { name = "jaxtyping" },
-    { name = "lineax" },
-    { name = "numpy" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/38/b2/06d071b6eade1ea7e3bb0660aa3c1f8fd6484fa611cc45cd424d2bbebecf/interpax-0.3.14.tar.gz", hash = "sha256:5018c18a07d946be7466504f385b4e5ac632cd7b006c1cead42b1aefe37e16e3", size = 58669, upload-time = "2026-04-18T00:35:09.305Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/c8/77/3b4c3db18738ffc146887f3b47e44159d370509c3ee302f0456a8f0dfcac/interpax-0.3.14-py3-none-any.whl", hash = "sha256:070c5242227fa65bd7dafc472ae2ed0c4df9891fbbbede73a8b04e21859a5d47", size = 28104, upload-time = "2026-04-18T00:35:07.774Z" },
 ]
 
 [[package]]
@@ -335,21 +317,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/8b/78/f0bb41a6f2bbd3c77bdcc66980dc0d69ca1192a0ecec25377afcc5e6db73/librt-0.12.0-cp314-cp314t-win32.whl", hash = "sha256:8d73191883553ee0739741544bf3b00aba2a1224e45d9580b30cbc29e21dc03b", size = 97752, upload-time = "2026-06-30T16:14:06.555Z" },
     { url = "https://files.pythonhosted.org/packages/92/24/e279c27972ab051a070237cfa45728fa51670c3f22f1a4d391711e9f4c31/librt-0.12.0-cp314-cp314t-win_amd64.whl", hash = "sha256:e1cbb037324e759f0afa270229731ff0047772667f3cb38ef5df2cabf0175ede", size = 119562, upload-time = "2026-06-30T16:14:07.908Z" },
     { url = "https://files.pythonhosted.org/packages/06/e6/42a475bfca683b0cd5366f6dd06580062b7e567bb8534d225c877c2f14f3/librt-0.12.0-cp314-cp314t-win_arm64.whl", hash = "sha256:bca1472acbd473eff61059b4409f802c5a1bcb4cd0344d06f939df9c4c125d40", size = 104282, upload-time = "2026-06-30T16:14:09.29Z" },
-]
-
-[[package]]
-name = "lineax"
-version = "0.1.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "equinox" },
-    { name = "jax" },
-    { name = "jaxtyping" },
-    { name = "typing-extensions" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/35/d6/4e28416a6fe58dd6bc7565b1ffa330f4d0ba7d74212642b1b734c511299e/lineax-0.1.0.tar.gz", hash = "sha256:5f1a8f060142af2cdbf7d66b99e8d3071c3aa734b677df6339df4b4c4c0554d2", size = 50209, upload-time = "2026-01-27T21:17:26.652Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/80/0c/2ed47112fc1958a0a81c9b015d4e1861953a1ec3a17b081c0180a25ce82c/lineax-0.1.0-py3-none-any.whl", hash = "sha256:f00911c6b07d427c4835db46856970c8348bc82a035b51f4386ad09382af957a", size = 74600, upload-time = "2026-01-27T21:17:25.33Z" },
 ]
 
 [[package]]

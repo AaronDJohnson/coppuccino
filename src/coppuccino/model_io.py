@@ -22,12 +22,7 @@ from flowjax.bijections import Stack
 from flowjax.distributions import Transformed
 from paramax import non_trainable, unwrap
 
-from coppuccino.bijections import (
-    EmpiricalMarginalToGaussian,
-    SmoothMarginalToGaussian,
-    make_empirical_cdf_spline,
-    make_smooth_marginal,
-)
+from coppuccino.bijections import SmoothMarginalToGaussian, make_smooth_marginal
 
 __all__ = ["save_flow", "load_flow"]
 
@@ -299,151 +294,86 @@ def _extract_spline_data(flow: Transformed) -> dict:
     Parameters
     ----------
     flow : Transformed
-        A fitted copula flow with empirical marginal transforms.
+        A fitted copula flow with smooth-tail marginal transforms.
 
     Returns
     -------
     dict
-        Dictionary containing all data needed to reconstruct the splines:
-        - 'samples': list of sample arrays for each dimension
-        - 'min_eps': list of min_eps values for each dimension
-        - 'num_dims': number of dimensions
+        Everything needed to rebuild the marginals, one list entry per
+        dimension: 'samples', 'num_points', 'prior_low', 'prior_high',
+        'tail_alpha' and 'marginal' (always 'smooth'), plus 'num_dims'.
     """
-    # The flow structure is: Transformed(inner_flow, Stack([EmpiricalMarginalToGaussian, ...]))
+    # The flow structure is: Transformed(inner_flow, Stack([SmoothMarginalToGaussian, ...]))
     transform = flow.bijection
 
     spline_data: dict = {
         'samples': [],
-        'min_eps': [],
         'num_points': [],
-        'tail_extension': [],
         'prior_low': [],
         'prior_high': [],
-        'tail_model': [],
-        'tail_quantile': [],
         'marginal': [],
         'tail_alpha': [],
         'num_dims': 0
     }
 
-    if isinstance(transform, Stack):
-        spline_data['num_dims'] = len(transform.bijections)
-        for bij in transform.bijections:
-            if isinstance(bij, SmoothMarginalToGaussian):
-                # Clip-free smooth-tail marginal: fully determined by
-                # (samples, num_points, prior bounds, tail_alpha).
-                spline_data['marginal'].append('smooth')
-                spline_data['samples'].append(np.array(unwrap(bij.samples)))
-                spline_data['num_points'].append(int(unwrap(bij.num_points)))
-                p_low = unwrap(bij.prior_low)
-                p_high = unwrap(bij.prior_high)
-                spline_data['prior_low'].append(float(p_low) if p_low is not None else None)
-                spline_data['prior_high'].append(float(p_high) if p_high is not None else None)
-                spline_data['tail_alpha'].append(float(unwrap(bij.tail_alpha)))
-                # Unused by this marginal -- inert values keep the parallel
-                # per-dimension lists aligned.
-                spline_data['min_eps'].append(0.0)
-                spline_data['tail_extension'].append(False)
-                spline_data['tail_model'].append('gaussian')
-                spline_data['tail_quantile'].append(0.05)
-            elif isinstance(bij, EmpiricalMarginalToGaussian):
-                # Unwrap the NonTrainable wrapper to get the actual numpy array
-                samples = unwrap(bij.samples)
-                spline_data['samples'].append(np.array(samples))
-                min_eps = unwrap(bij.min_eps)
-                spline_data['min_eps'].append(float(min_eps))
-                # Save reconstruction metadata
-                spline_data['num_points'].append(int(unwrap(bij.num_points)))
-                spline_data['tail_extension'].append(bool(unwrap(bij.tail_extension)))
-                p_low = unwrap(bij.prior_low)
-                p_high = unwrap(bij.prior_high)
-                spline_data['prior_low'].append(float(p_low) if p_low is not None else None)
-                spline_data['prior_high'].append(float(p_high) if p_high is not None else None)
-                # tail_model / tail_quantile (default values used for older
-                # bijections that predate these attributes)
-                spline_data['tail_model'].append(
-                    str(unwrap(getattr(bij, 'tail_model', 'gaussian')))
-                )
-                spline_data['tail_quantile'].append(
-                    float(unwrap(getattr(bij, 'tail_quantile', 0.05)))
-                )
-                # marginal family (default 'pchip' for bijections that predate
-                # this attribute, which were always PCHIP-based)
-                spline_data['marginal'].append(
-                    str(unwrap(getattr(bij, 'marginal', 'pchip')))
-                )
-                spline_data['tail_alpha'].append(0.0)
-            else:
-                raise ValueError(f"Unexpected bijection type: {type(bij)}")
-    else:
+    if not isinstance(transform, Stack):
         raise ValueError(f"Expected Stack transform, got: {type(transform)}")
+    spline_data['num_dims'] = len(transform.bijections)
+    for bij in transform.bijections:
+        if not isinstance(bij, SmoothMarginalToGaussian):
+            raise ValueError(f"Unexpected bijection type: {type(bij)}")
+        # Fully determined by (samples, num_points, prior bounds, tail_alpha).
+        spline_data['marginal'].append('smooth')
+        spline_data['samples'].append(np.array(unwrap(bij.samples)))
+        spline_data['num_points'].append(int(unwrap(bij.num_points)))
+        p_low = unwrap(bij.prior_low)
+        p_high = unwrap(bij.prior_high)
+        spline_data['prior_low'].append(float(p_low) if p_low is not None else None)
+        spline_data['prior_high'].append(float(p_high) if p_high is not None else None)
+        spline_data['tail_alpha'].append(float(unwrap(bij.tail_alpha)))
 
     return spline_data
 
 
 def _reconstruct_empirical_transforms(spline_data: dict) -> Stack:
     """
-    Reconstruct empirical transforms from saved spline data.
+    Reconstruct the marginal transforms from saved spline data.
 
     Parameters
     ----------
     spline_data : dict
-        Dictionary containing spline reconstruction data.
+        Dictionary containing spline reconstruction data, as written by
+        :func:`_extract_spline_data`.
 
     Returns
     -------
     Stack
-        Stacked empirical transforms for each parameter dimension.
+        Stacked marginal transforms for each parameter dimension.
     """
     empirical_transforms = []
 
     for i in range(spline_data['num_dims']):
         samples = spline_data['samples'][i]
-        min_eps = spline_data['min_eps'][i]
-        # Backward-compatible: default to original values for old saved files
-        num_points = spline_data.get('num_points', [200] * spline_data['num_dims'])[i]
-        tail_extension = spline_data.get('tail_extension', [False] * spline_data['num_dims'])[i]
-        prior_low = spline_data.get('prior_low', [None] * spline_data['num_dims'])[i]
-        prior_high = spline_data.get('prior_high', [None] * spline_data['num_dims'])[i]
-        tail_model = spline_data.get('tail_model', ['gaussian'] * spline_data['num_dims'])[i]
-        tail_quantile = spline_data.get('tail_quantile', [0.05] * spline_data['num_dims'])[i]
-        # Default 'pchip' so models saved before the marginal choice existed
-        # reconstruct exactly as they were trained.
-        marginal = spline_data.get('marginal', ['pchip'] * spline_data['num_dims'])[i]
+        num_points = spline_data['num_points'][i]
+        prior_low = spline_data['prior_low'][i]
+        prior_high = spline_data['prior_high'][i]
+        # Smooth files saved before tail_alpha existed used the default.
         tail_alpha = spline_data.get('tail_alpha', [0.0] * spline_data['num_dims'])[i]
 
-        if marginal == 'smooth':
-            theta_of_z, z_of_theta, log_dtheta_dz, x_clamps = make_smooth_marginal(
-                samples, num_points=num_points,
-                prior_low=prior_low, prior_high=prior_high,
-                tail_alpha=tail_alpha,
-            )
-            # mypy folds flowjax's AbstractVar shape/cond_shape into the
-            # synthesised __init__; see the ClassVar note on the class.
-            empirical_transforms.append(non_trainable(SmoothMarginalToGaussian(  # type: ignore[call-arg]
-                samples, theta_of_z, z_of_theta, log_dtheta_dz,
-                num_points=num_points,
-                prior_low=prior_low, prior_high=prior_high,
-                tail_alpha=tail_alpha,
-                x_clamp_lo=x_clamps[0], x_clamp_hi=x_clamps[1],
-            )))
-            continue
-
-        _, cdf_fn, quantile_fn, pdf_fn = make_empirical_cdf_spline(
-            samples, num_points=num_points, min_eps=min_eps,
-            tail_extension=tail_extension, prior_low=prior_low, prior_high=prior_high,
-            tail_model=tail_model, tail_quantile=tail_quantile,
-            marginal=marginal,
-        )
-
-        transform = non_trainable(EmpiricalMarginalToGaussian(  # type: ignore[call-arg]
-            samples, cdf_fn, quantile_fn, pdf_fn, min_eps=min_eps,  # type: ignore[arg-type]
-            num_points=num_points, tail_extension=tail_extension,
+        theta_of_z, z_of_theta, log_dtheta_dz, x_clamps = make_smooth_marginal(
+            samples, num_points=num_points,
             prior_low=prior_low, prior_high=prior_high,
-            tail_model=tail_model, tail_quantile=tail_quantile,
-            marginal=marginal,
-        ))
-        empirical_transforms.append(transform)
+            tail_alpha=tail_alpha,
+        )
+        # mypy folds flowjax's AbstractVar shape/cond_shape into the
+        # synthesised __init__; see the ClassVar note on the class.
+        empirical_transforms.append(non_trainable(SmoothMarginalToGaussian(  # type: ignore[call-arg]
+            samples, theta_of_z, z_of_theta, log_dtheta_dz,
+            num_points=num_points,
+            prior_low=prior_low, prior_high=prior_high,
+            tail_alpha=tail_alpha,
+            x_clamp_lo=x_clamps[0], x_clamp_hi=x_clamps[1],
+        )))
 
     return Stack(empirical_transforms)
 
@@ -654,6 +584,18 @@ def load_flow(path: Union[str, Path]) -> Transformed:
         )
 
     spline_data = save_dict['spline_data']
+    # Files written before the smooth marginal became the only one name a
+    # removed family (coppuccino 1.0.0 wrote 'rqs' or 'pchip'), or predate the
+    # 'marginal' key altogether, in which case they were PCHIP. Their
+    # marginals cannot be rebuilt by this version.
+    families = spline_data.get('marginal', ['pchip'] * spline_data['num_dims'])
+    removed = sorted({str(f) for f in families} - {'smooth'})
+    if removed:
+        raise ValueError(
+            f"{path} was fitted with the {', '.join(map(repr, removed))} "
+            "marginal, which this coppuccino no longer supports. Refit the "
+            "chain, or pin coppuccino<2 to read a file written by 1.0.0."
+        )
 
     # Deserialize the inner flow
     inner_flow_bytes = save_dict['inner_flow_bytes']

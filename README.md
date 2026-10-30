@@ -303,7 +303,7 @@ with `normalizing_flows_fit` if you need them.
 
 Key options to `normalizing_flows_fit` include `flow_layers` and `knots`
 (flow capacity), `max_epochs`, `learning_rate`, `patience` (training),
-`prior_bounds`, `tail_model`, and `marginal` (the marginal model, below). See
+`prior_bounds`, and `tail_alpha` (the marginal tails, below). See
 the docstrings for the full list. `normalizing_flows_fit_auto` fits a small
 ladder of capacities concurrently and returns the smallest model whose
 held-out fit is statistically comparable to the best.
@@ -347,34 +347,21 @@ least 40 rows.
 The empirical marginals are the heart of the method, and a few options control
 how they behave at and beyond the edges of the data.
 
-### Interpolant
+### The marginal map
 
-```python
-flow = normalizing_flows_fit(data)                      # marginal="smooth" (default)
-flow = normalizing_flows_fit(data, marginal="rqs")      # legacy PIT + inverse-normal
-flow = normalizing_flows_fit(data, marginal="pchip")    # original PCHIP interpolant
-```
-
-`marginal=None` resolves to `"smooth"`, unless a legacy tail model is
-requested (`tail_extension=True` or `tail_model="gpd"`), which pre-date it and
-resolve to `"rqs"`. `"smooth"` is a single clip-free monotone map of all of R
-onto the support — a rational-quadratic-spline bulk at the data quantiles
-joined to analytic tails — whose forward map, inverse, and derivative share
-one parameterization, so samples land strictly inside the support and the
-reported density describes the stream that `sample` actually emits. `"rqs"` is
-the legacy route: a monotone rational-quadratic spline CDF with the same
-exact-inverse property (`cdf_fn(quantile_fn(u))` returns `u` to 5.6e-17 over
-999 points spanning `u ∈ [0.001, 0.999]`, 8 seeds of 2000-row `N(0,1)`),
-composed with an inverse-normal step. The `"pchip"` path builds the CDF and its
-inverse as two independent splines that are only approximate inverses of each
-other — the same measurement gives a worst-case round-trip error of 8.3e-4 —
-and it is retained only for reproducing older fits.
+Each parameter's marginal is a single clip-free monotone map of all of R onto
+the support — a rational-quadratic-spline bulk at the data quantiles joined to
+analytic tails — whose forward map, inverse, and derivative share one
+parameterization, so samples land strictly inside the support and the
+reported density describes the stream that `sample` actually emits.
+`num_points` sets how many quantile knots the bulk uses (default 200, clamped
+to between 20 and a third of the samples).
 
 ### Prior bounds (recommended for MCMC chains)
 
 ```python
-# Extend the empirical CDF out to a known prior support: one [low, high] row
-# per parameter, and the chain must lie inside the box.
+# Anchor each marginal to a known prior support: one [low, high] row per
+# parameter, and the chain must lie inside the box.
 bounds = np.array([[-10, 10], [-8, 8], [-6, 6]])
 flow = normalizing_flows_fit(data, prior_bounds=bounds)
 ```
@@ -385,18 +372,17 @@ default; see `tail_alpha` for heavier ones). Supplying `prior_bounds` anchors
 each marginal to the known support instead, so the flow covers the full
 prior box and no more — recommended whenever the true bounds are known.
 
-### Heavy-tailed marginals (experimental)
+### Heavy tails
 
 ```python
-# EXPERIMENTAL: peaks-over-threshold Generalized Pareto tails
-flow = normalizing_flows_fit(data, tail_model="gpd", tail_quantile=0.05)
+flow = normalizing_flows_fit(data, tail_alpha=0.5)
 ```
 
-For heavy-tailed marginals, `tail_model="gpd"` fits a Generalized Pareto
-Distribution to each tail via peaks-over-threshold, modeling the extremes more
-faithfully than the default Gaussian tail. `tail_quantile` sets the fraction of
-samples in each tail (default 0.05). This feature is **experimental** — its API
-may change — and it ignores `tail_extension` and `prior_bounds`.
+On a side with no prior bound, the marginal tail beyond the outermost knot is
+linear in Gaussian space by default (`tail_alpha=0`), which gives Gaussian
+tails in the parameter. `tail_alpha > 0` (up to 10) makes `dθ/dz` grow as
+`exp(tail_alpha · |z − z_edge|)` past that knot, for progressively heavier
+tails. Bounded sides ignore it.
 
 ## Requirements
 
@@ -407,7 +393,6 @@ may change — and it ignores `tail_extension` and `prior_bounds`.
   routinely available; 1.11.2 is the first release that carries them)
 - Equinox >=0.13.2,<0.14
 - jaxtyping >=0.3.6,<0.4
-- interpax >=0.3.11,<0.4
 - FlowJAX >=17.2.1,<18
 - paramax >=0.0.3,<0.1 (pre-1.0, so the ceiling is on the minor; flowjax leaves
   it unbounded, so a paramax 0.1.0 release would make that pairing

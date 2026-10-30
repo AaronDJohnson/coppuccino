@@ -39,9 +39,8 @@ uv lock --check            # the committed lockfile must match pyproject.toml
   not a gate: adopting it would rewrite most of the hand-laid numerical code in
   one pass. `[tool.ruff.format]` in `pyproject.toml` only fixes the settings for
   anyone who chooses to run it on a file they are already rewriting.
-- One function (`make_empirical_cdf_spline`) carries a `# noqa: C901` exemption
-  from the complexity ceiling, with a comment naming the reason. New code is
-  expected to stay under it rather than add a second.
+- No function carries a `# noqa: C901` exemption from the complexity ceiling,
+  and new code is expected to stay under it rather than add one.
 
 ## Benchmarks
 

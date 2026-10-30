@@ -22,7 +22,7 @@ updates:
       interval: "weekly"
     groups:
       # One PR per week for the scientific stack: jax, jaxlib, flowjax, equinox,
-      # interpax, paramax and jaxtyping are version-coupled, so bumping them
+      # paramax and jaxtyping are version-coupled, so bumping them
       # separately produces resolutions that cannot install.
       jax-stack:
         patterns:
@@ -31,7 +31,6 @@ updates:
           - "jaxtyping"
           - "equinox"
           - "flowjax"
-          - "interpax"
           - "paramax"
           - "optax"
       rest:
@@ -43,6 +42,5 @@ updates:
           - "jaxtyping"
           - "equinox"
           - "flowjax"
-          - "interpax"
           - "paramax"
           - "optax"

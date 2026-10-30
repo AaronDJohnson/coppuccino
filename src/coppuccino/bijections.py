@@ -3,21 +3,17 @@ from typing import Any, Callable, ClassVar, NamedTuple, Optional
 import jax.numpy as jnp
 import numpy as np
 from flowjax.bijections import AbstractBijection
-from interpax._ppoly import PchipInterpolator
 from jax import Array
-from jax.scipy.special import log_ndtr, ndtr, ndtri
+from jax.scipy.special import log_ndtr, ndtri
 from jax.typing import ArrayLike
 
 __all__ = [
-    "make_empirical_cdf_spline",
     "make_smooth_marginal",
-    "EmpiricalMarginalToGaussian",
     "SmoothMarginalToGaussian",
 ]
 
 # Numerical floors, named so the intent is explicit at each use site.
 _POS_FLOOR = 1e-30    # keep quantities that sit in denominators strictly positive
-_SCALE_FLOOR = 1e-10  # keep fitted scale (sigma) parameters away from zero
 _NDTRI_FLOOR = 1e-300  # smallest ndtri argument that stays inside float64 range
 _LOG_SQRT_2PI = float(0.5 * np.log(2.0 * np.pi))
 
@@ -32,166 +28,6 @@ def _ndtri_floor(x: ArrayLike) -> float:
     docstring), and the marginals must stay finite when they do.
     """
     return max(_NDTRI_FLOOR, float(jnp.finfo(jnp.asarray(x).dtype).tiny))
-
-
-def _dtype_max(x: ArrayLike) -> float:
-    """Largest finite value in ``x``'s floating dtype.
-
-    The mirror of :func:`_ndtri_floor` at the top of the range. The Gaussian
-    tail scale factors are float64 build-time constants; on heavy-tailed data
-    they routinely exceed 1e100, and casting one to a coarser runtime dtype
-    (x64 turned back off) overflows to ``inf`` with a numpy "overflow
-    encountered in cast" warning. Clamping to the representable maximum keeps
-    the same limit for ``u / scale`` -- underflow to zero, then floored by
-    :func:`_ndtri_floor` -- without the overflow. A no-op in float64, where
-    the constants are finite by construction.
-    """
-    return float(jnp.finfo(jnp.asarray(x).dtype).max)
-
-
-def _process_array(arr: ArrayLike) -> np.ndarray:
-    """
-    Check for duplicate values in array and perturb them to ensure uniqueness.
-
-    If duplicates exist, perturbs the values slightly to make them unique
-    and resorts the array if necessary after perturbation. This is useful
-    for creating monotonic interpolators that require strictly increasing inputs.
-
-    Parameters
-    ----------
-    arr : numpy.ndarray
-        Input array (will be sorted internally).
-
-    Returns
-    -------
-    numpy.ndarray
-        Processed array with no duplicate values.
-
-    Examples
-    --------
-    >>> import numpy as np
-    >>> from coppuccino.bijections import _process_array
-    >>> arr = np.array([1.0, 2.0, 2.0, 3.0, 3.0, 3.0, 4.0])
-    >>> processed = _process_array(arr)
-    >>> len(processed) == len(np.unique(processed))
-    True
-    """
-    # Convert to float for perturbation
-    arr = np.sort(arr)
-    arr = np.asarray(arr, dtype=float)
-
-    # Check for duplicates
-    unique, counts = np.unique(arr, return_counts=True)
-    if np.all(counts <= 1):
-        return arr
-
-    # Determine epsilon for perturbation
-    max_count = np.max(counts)
-    diffs = np.diff(arr)
-    pos_diffs = diffs[diffs > 0]
-    if len(pos_diffs) > 0:
-        min_pos_diff = np.min(pos_diffs)
-        epsilon = min_pos_diff / (max_count * 2)
-    else:
-        epsilon = 1e-10
-
-    # Copy array for modification
-    new_arr = arr.copy()
-
-    # Perturb duplicates
-    i = 0
-    while i < len(new_arr):
-        val = new_arr[i]
-        j = i
-        while j < len(new_arr) and new_arr[j] == val:
-            j += 1
-        group_size = j - i
-        if group_size > 1:
-            for k in range(group_size):
-                new_arr[i + k] += k * epsilon
-        i = j
-
-    # Check if still sorted
-    is_sorted = np.all(np.diff(new_arr) >= 0)
-    if not is_sorted:
-        new_arr.sort()
-
-    return new_arr
-
-
-def _fit_gpd(excesses: ArrayLike) -> tuple[float, float]:
-    """Fit a Generalized Pareto Distribution to non-negative excesses.
-
-    Returns (xi, sigma). Falls back to a moment-based estimate when
-    scipy's MLE fails (rare, but happens on tiny or degenerate samples).
-    """
-    from scipy.stats import genpareto
-    excesses = np.asarray(excesses, dtype=float)
-    excesses = excesses[excesses > 0]
-    if len(excesses) < 5:
-        # Too few excesses for any sensible fit — exponential fallback.
-        sigma = float(np.mean(excesses)) if len(excesses) else 1.0
-        return 0.0, max(sigma, _SCALE_FLOOR)
-    try:
-        xi, _, sigma = genpareto.fit(excesses, floc=0)
-    except Exception:
-        # Method-of-moments fallback (Hosking & Wallis 1987).
-        m = float(np.mean(excesses))
-        v = float(np.var(excesses, ddof=1))
-        if v <= 0:
-            return 0.0, max(m, _SCALE_FLOOR)
-        xi = 0.5 * (1.0 - m * m / v)
-        sigma = 0.5 * m * (1.0 + m * m / v)
-    return float(xi), float(max(sigma, _SCALE_FLOOR))
-
-
-def _gpd_cdf(y: ArrayLike, xi: float, sigma: float,
-             xi_eps: float = 1e-6) -> Array:
-    """GPD CDF on excesses y ≥ 0. Handles ξ≈0 (exponential) limit."""
-    y = jnp.maximum(y, 0.0)
-    z = y / sigma
-    # For ξ<0 the support is bounded at y = -σ/ξ; clip to keep argument > 0.
-    base = 1.0 + xi * z
-    safe_arg = jnp.maximum(base, _POS_FLOOR)
-    xi_safe = jnp.where(jnp.abs(xi) < xi_eps, 1.0, xi)  # avoid /0 in unused branch
-    cdf = jnp.where(
-        jnp.abs(xi) < xi_eps,
-        1.0 - jnp.exp(-z),
-        1.0 - jnp.power(safe_arg, -1.0 / xi_safe),
-    )
-    # Past the bounded support edge (ξ<0, base≤0) all mass lies below: CDF = 1.
-    return jnp.where(base <= 0.0, 1.0, cdf)
-
-
-def _gpd_pdf(y: ArrayLike, xi: float, sigma: float,
-             xi_eps: float = 1e-6) -> Array:
-    """GPD PDF on excesses y ≥ 0. Zero beyond the bounded support when ξ<0."""
-    y = jnp.maximum(y, 0.0)
-    z = y / sigma
-    base = 1.0 + xi * z
-    safe_arg = jnp.maximum(base, _POS_FLOOR)
-    xi_safe = jnp.where(jnp.abs(xi) < xi_eps, 1.0, xi)
-    pdf = jnp.where(
-        jnp.abs(xi) < xi_eps,
-        jnp.exp(-z) / sigma,
-        jnp.power(safe_arg, -1.0 / xi_safe - 1.0) / sigma,
-    )
-    # For ξ<-1 the exponent -1/ξ-1 is negative, so the clipped safe_arg would
-    # blow up to ~1e10 past the support edge (y > -σ/ξ, base≤0). The density is
-    # actually zero there — enforce it explicitly.
-    return jnp.where(base <= 0.0, 0.0, pdf)
-
-
-def _gpd_quantile(p: ArrayLike, xi: float, sigma: float,
-                  xi_eps: float = 1e-6) -> Array:
-    """GPD inverse CDF: y(p) for p ∈ [0, 1)."""
-    p = jnp.clip(p, 0.0, 1.0 - 1e-15)
-    xi_safe = jnp.where(jnp.abs(xi) < xi_eps, 1.0, xi)
-    return jnp.where(
-        jnp.abs(xi) < xi_eps,
-        -sigma * jnp.log1p(-p),
-        sigma * (jnp.power(1.0 - p, -xi_safe) - 1.0) / xi_safe,
-    )
 
 
 # ----------------------------------------------------------------------
@@ -301,7 +137,6 @@ def _rqs_knot_derivatives(
     yk: ArrayLike,
     floor: float = _POS_FLOOR,
     edge_slope_floor: float = 0.0,
-    edge_slopes: Optional[tuple[Optional[float], Optional[float]]] = None,
 ) -> np.ndarray:
     """Monotone PCHIP knot slopes for an RQS, floored strictly positive.
 
@@ -327,10 +162,6 @@ def _rqs_knot_derivatives(
         exactly 0 there (a one-sided estimate clamped on sign change),
         which is fatal for callers that extend tails from the boundary
         slope. The default 0.0 disables it.
-    edge_slopes : tuple of (float or None, float or None), optional
-        Explicit endpoint derivatives, overriding both the PCHIP estimate
-        and ``edge_slope_floor``. Used when the caller knows the true slope
-        at an endpoint that is not a distribution endpoint.
 
     Returns
     -------
@@ -346,13 +177,6 @@ def _rqs_knot_derivatives(
         sec = np.diff(yk) / np.diff(xk)
         dk[0] = max(dk[0], edge_slope_floor * sec[0])
         dk[-1] = max(dk[-1], edge_slope_floor * sec[-1])
-    if edge_slopes is not None:
-        # caller-supplied slopes win over both the PCHIP estimate and the
-        # floor; the RQS is monotone for any strictly positive knot slopes
-        if edge_slopes[0] is not None:
-            dk[0] = max(float(edge_slopes[0]), floor)
-        if edge_slopes[1] is not None:
-            dk[-1] = max(float(edge_slopes[1]), floor)
     return dk
 
 
@@ -360,17 +184,14 @@ def _rqs_bulk(
     xg: ArrayLike,
     cdf_vals: ArrayLike,
     edge_slope_floor: float = 0.0,
-    edge_slopes: Optional[tuple[Optional[float], Optional[float]]] = None,
 ) -> tuple[Callable[[ArrayLike], Array], Callable[[ArrayLike], Array],
            Callable[[ArrayLike], Array]]:
     """Build closed-form monotone rational-quadratic spline (RQS) callables.
 
-    Returns ``(cdf, inverse, deriv)`` callables over the bulk knots, matching the
-    call interface of the interpax ``PchipInterpolator`` objects they replace in
-    :func:`make_empirical_cdf_spline`. Unlike the PCHIP pair (two independently
-    constructed splines that are only approximate inverses), the RQS forward,
-    inverse and derivative all come from a single parameterization, so the
-    transform is self-consistent to machine precision.
+    Returns ``(cdf, inverse, deriv)`` callables over the bulk knots. The
+    forward map, its inverse and its derivative all come from a single
+    parameterization, so the transform is self-consistent to machine
+    precision.
 
     Knot derivatives come from :func:`_rqs_knot_derivatives` and the three
     callables from the shared kernel (:func:`_rqs_forward`,
@@ -389,15 +210,8 @@ def _rqs_bulk(
         endpoint derivative matters for callers that extend tails from the
         boundary slope (:func:`make_smooth_marginal`): the C^1-matched tail
         rate would otherwise collapse to the generic ``_POS_FLOOR`` and the
-        tail map degenerates. The default 0.0 preserves the legacy behavior
-        exactly.
-    edge_slopes : tuple of (float or None, float or None), optional
-        Explicit endpoint knot derivatives, replacing PCHIP's one-sided
-        estimate (and any ``edge_slope_floor``) at the first / last knot.
-        Used when the caller knows the true density at a knot that is not a
-        distribution endpoint — under ``tail_model="gpd"`` the outer knots
-        are the POT thresholds, where the GPD supplies a far better slope
-        than a one-sided secant and matching it makes the join C^1.
+        tail map degenerates. The default 0.0 leaves PCHIP's endpoint slopes
+        alone.
 
     Returns
     -------
@@ -416,8 +230,7 @@ def _rqs_bulk(
     # silently tops out below it and the discarded mass reappears as an
     # exact-at-bound sampling atom
     yk[-1] = yg[-1]
-    dk = _rqs_knot_derivatives(xk, yk, edge_slope_floor=edge_slope_floor,
-                               edge_slopes=edge_slopes)
+    dk = _rqs_knot_derivatives(xk, yk, edge_slope_floor=edge_slope_floor)
 
     xk_j, yk_j, dk_j = jnp.asarray(xk), jnp.asarray(yk), jnp.asarray(dk)
 
@@ -431,669 +244,6 @@ def _rqs_bulk(
         return _rqs_inverse(u, xk_j, yk_j, dk_j)
 
     return cdf, inverse, deriv
-
-
-# noqa reason: complexity 21 against the project ceiling of 15. The branching is
-# the cross product of two build-time switches (tail_model in {none, gaussian,
-# gpd} x marginal in {rqs, pchip}) that the three returned closures must all
-# read consistently. Splitting it is tracked as an open refactor; the exemption
-# is per-function so new code stays under the ceiling.
-def make_empirical_cdf_spline(  # noqa: C901
-    samples: np.ndarray,
-    num_points: int = 200,
-    min_eps: float = 1e-7,
-    tail_extension: bool = False,
-    prior_low: Optional[float] = None,
-    prior_high: Optional[float] = None,
-    tail_model: str = "gaussian",
-    tail_quantile: float = 0.05,
-    marginal: str = "rqs",
-) -> tuple[np.ndarray, Callable, Callable, Callable]:
-    """
-    Create empirical CDF, inverse CDF (quantile), and PDF functions from samples.
-
-    This function constructs smooth monotonic spline interpolators for the empirical
-    CDF and its inverse based on input samples. The PDF is computed via automatic
-    differentiation of the CDF spline.
-
-    When ``prior_low`` / ``prior_high`` are provided, the CDF grid is extended to
-    cover the full prior support. This allows the flow to generate samples all the
-    way to the prior boundaries rather than being limited to the most extreme
-    training sample. This is the recommended mode for MCMC chains.
-
-    When ``tail_extension=True``, the CDF and quantile functions are extended
-    beyond the observed data range using a Gaussian tail model fitted to match
-    the empirical CDF at the boundaries. This allows the flow to generate
-    samples beyond the training range. Default is False (clip to data bounds),
-    which is appropriate for MCMC chains bounded by prior support.
-
-    For heavy-tailed marginals, set ``tail_model="gpd"`` to use a Generalized
-    Pareto Distribution fitted via peaks-over-threshold to the top/bottom
-    ``tail_quantile`` of samples (default 5%). Unlike the Gaussian tail model,
-    the GPD threshold lives *inside* the observed data range — the empirical
-    spline covers only the bulk, and the GPD takes over wherever it is more
-    statistically efficient. This is the recommended choice when accuracy in
-    the tails matters more than absolute simplicity.
-
-    Parameters
-    ----------
-    samples : array_like
-        Training data samples from which to construct the empirical distribution.
-    num_points : int, optional
-        Number of grid points to use for spline construction. Default is 200.
-        Automatically clamped to ``max(20, min(num_points, len(samples) // 3))``
-        to avoid degenerate grids with small sample sizes.
-    min_eps : float, optional
-        Minimum epsilon to avoid CDF values exactly 0 or 1. Default is 1e-7.
-    tail_extension : bool, optional
-        If True, extend the CDF/quantile functions beyond the observed data
-        range using a Gaussian tail model. Default is False (clip to data
-        bounds), which is appropriate for MCMC chains bounded by prior support.
-    prior_low : float, optional
-        Lower bound of the prior support for this parameter. If provided, the
-        CDF grid is extended down to this value (with CDF = min_eps), allowing
-        the flow to sample all the way to the prior edge.
-    prior_high : float, optional
-        Upper bound of the prior support for this parameter. If provided, the
-        CDF grid is extended up to this value (with CDF = 1 - min_eps).
-    tail_model : str, optional
-        ``"gaussian"`` (default, current behavior) or ``"gpd"`` (peaks-over-
-        threshold Generalized Pareto). ``"gpd"`` activates GPD tails inside
-        the data range and is appropriate for heavy-tailed marginals; it
-        ignores ``tail_extension`` and (for now) ``prior_low``/``prior_high``.
-        With ``marginal="rqs"`` the density is continuous across both GPD
-        joins (the bulk spline takes its endpoint slopes from the fitted tail).
-        With ``marginal="pchip"`` the join is continuous in CDF only: PCHIP's
-        one-sided endpoint slope cannot be overridden, leaving a density step
-        at each threshold of median 0.24 and up to 1.33 nats over 40 seeds of
-        Student-t(3) data — a kink at the 5th/95th percentile of the marginal,
-        which costs proposal efficiency but not correctness.
-    tail_quantile : float, optional
-        Fraction of samples in each GPD tail (only used when
-        ``tail_model="gpd"``). Default 0.05 (5%).
-    marginal : str, optional
-        Bulk interpolant family (default ``"rqs"``): ``"rqs"`` builds a single
-        monotone rational-quadratic spline whose forward map, inverse and
-        derivative are all closed-form and mutually exact (self-consistent to
-        machine precision). ``"pchip"`` instead builds two independent PCHIP
-        splines for the CDF and its inverse, which are only approximate inverses
-        of each other; it is retained for reproducing older fits. Both use the
-        same empirical-quantile knots and the same tail / prior-bound handling,
-        so they produce nearly identical transforms, but ``"rqs"`` guarantees an
-        exact, cheaper inverse, admits explicit endpoint knot slopes (used to
-        close the GPD join, see ``tail_model``) and is preferred.
-        (``normalizing_flows_fit``
-        defaults to the clip-free ``"smooth"`` marginal; this family is used
-        when a legacy tail model is requested.)
-
-        Neither family can carry the smooth family's wall construction, and
-        with ``prior_low`` / ``prior_high`` both still report a wall density
-        that is wrong by nats. Both are *clipped*: a prior bound is one more
-        spline knot, its CDF is pinned at ``min_eps`` / ``1 - min_eps``, and
-        so a query at a bound is handed
-        ``z = ndtri(min_eps) = -5.2`` whatever the fit. There is no analytic
-        tail object to bound that against the copula's training range the way
-        :func:`make_smooth_marginal` does -- the depth is set by a caller's
-        ``min_eps``, not by anything measured from the data. On
-        ``U(0, 1)^2``, prior [[0, 1], [0, 1]], n = 1500, 80 epochs, seeds
-        0-3, ``log_prob`` at both walls comes out +1.2 to +5.7 above the flat
-        truth, essentially all of it the copula extrapolating at that depth
-        (its excess over its own normal base there is +0.2 to +5.0). Use
-        ``marginal="smooth"`` when the density at a bound matters.
-
-    Returns
-    -------
-    cdf_vals : numpy.ndarray
-        Empirical CDF values at the grid points.
-    cdf_fn : callable
-        Function mapping x → CDF(x), with extrapolation handling.
-    quantile_fn : callable
-        Function mapping u ∈ [0,1] → x (inverse CDF).
-    pdf_fn : callable
-        Function mapping x → PDF(x) via automatic differentiation.
-
-    Examples
-    --------
-    >>> import numpy as np
-    >>> from coppuccino.bijections import make_empirical_cdf_spline
-    >>> samples = np.random.normal(0, 1, 1000)
-    >>> cdf_vals, cdf_fn, quantile_fn, pdf_fn = make_empirical_cdf_spline(samples)
-    >>> import jax.numpy as jnp
-    >>> median = float(cdf_fn(jnp.array(0.0)))   # ~0.5 for standard normal
-    >>> centre = float(quantile_fn(jnp.array(0.5)))  # ~0.0
-    >>> # With prior bounds (recommended for MCMC chains)
-    >>> cdf_vals, cdf_fn, quantile_fn, pdf_fn = make_empirical_cdf_spline(
-    ...     samples, prior_low=-5.0, prior_high=5.0)
-    """
-    use_gpd = (tail_model == "gpd")
-
-    # Tail-model parameters below are each bound only inside their guarding
-    # branch (GPD or Gaussian tail_extension). Pre-declare them so the
-    # cdf/quantile/pdf closures — which reference them under the same guards —
-    # can never raise NameError if a future edit shifts a branch boundary. The
-    # declared type is what they carry wherever they are *read*; the None
-    # sentinel is deliberately not a float, so a guard that slips still fails
-    # loudly (TypeError) instead of propagating a plausible number. mypy cannot
-    # tie "use_gpd is True" to "F_lo is not None", hence the ignores here rather
-    # than on each of the 13 reads downstream.
-    F_lo: float
-    F_hi: float
-    u_lo: float
-    u_hi: float
-    xi_lo: float
-    sigma_lo: float
-    xi_hi: float
-    sigma_hi: float
-    mu: float
-    sigma: float
-    lo_scale: float
-    hi_scale: float
-    F_lo = F_hi = u_lo = u_hi = None  # type: ignore[assignment]
-    xi_lo = sigma_lo = xi_hi = sigma_hi = None  # type: ignore[assignment]
-    mu = sigma = lo_scale = hi_scale = None  # type: ignore[assignment]
-    bulk_edge_slopes = None
-
-    # ------------------------------------------------------------------
-    # GPD branch: peaks-over-threshold model with thresholds *inside* the
-    # data range. The spline covers only the bulk [u_lo, u_hi]; the GPD
-    # takes over for x outside that interval.
-    # ------------------------------------------------------------------
-    if use_gpd:
-        F_lo = float(tail_quantile)
-        F_hi = 1.0 - F_lo
-        u_lo = float(np.quantile(samples, F_lo))
-        u_hi = float(np.quantile(samples, F_hi))
-        if u_hi <= u_lo:
-            # Degenerate: data is essentially constant. Fall back to Gaussian.
-            use_gpd = False
-        else:
-            excesses_lo = u_lo - samples[samples < u_lo]
-            excesses_hi = samples[samples > u_hi] - u_hi
-            xi_lo, sigma_lo = _fit_gpd(excesses_lo)
-            xi_hi, sigma_hi = _fit_gpd(excesses_hi)
-            # Density each tail contributes *at* its threshold: the GPD pdf at
-            # zero excess is 1/sigma, weighted by the tail's mass. Handing these
-            # to the bulk spline as its endpoint knot slopes makes the density
-            # continuous across the join. The threshold is an interior point of
-            # the distribution, so PCHIP's one-sided endpoint rule (built for a
-            # true support boundary) is the weaker of the two estimates: it sees
-            # only the last bulk secant, while the GPD scale is an MLE over the
-            # whole excess sample. Constraining the tail to the bulk instead
-            # would also close the join, but it degrades held-out tail NLL.
-            bulk_edge_slopes = (F_lo / sigma_lo, (1.0 - F_hi) / sigma_hi)
-
-            bulk = samples[(samples >= u_lo) & (samples <= u_hi)]
-            num_points_bulk = max(20, min(num_points, len(bulk) // 3))
-            xg = np.asarray(np.quantile(bulk, np.linspace(0, 1, num_points_bulk)))
-            # Anchor endpoints exactly at the thresholds so the spline
-            # joins the GPD at known CDF values.
-            xg[0], xg[-1] = u_lo, u_hi
-
-            sorted_chain = _process_array(samples)
-            counts = np.searchsorted(sorted_chain, xg, side='right')
-            cdf_vals = counts / len(sorted_chain)
-            cdf_vals[0], cdf_vals[-1] = F_lo, F_hi
-            # data_min / data_max here demark the *spline* domain, not the
-            # full sample range — outside this, the GPD branch is used.
-            data_min, data_max = u_lo, u_hi
-
-    if not use_gpd:
-        # Adaptive grid size: avoid degenerate grids with small N
-        num_points = max(20, min(num_points, len(samples) // 3))
-
-        xg = np.asarray(np.quantile(samples, np.linspace(0, 1, num_points)))
-
-        # Empirical CDF
-        sorted_chain = _process_array(samples)
-        counts = np.searchsorted(sorted_chain, xg, side='right')
-        cdf_vals = counts / len(sorted_chain)
-
-        # Data bounds (may be extended by prior bounds)
-        data_min, data_max = np.min(samples), np.max(samples)
-
-    # Extend grid to prior bounds if provided. Skipped under the GPD tail model,
-    # whose thresholds live inside the data range and supply the out-of-bulk
-    # tails directly (prior bounds would only inject spurious 0/1-clipped knots).
-    if not use_gpd:
-        # The empirical CDF is ``counts / n``, so the largest sample sits at
-        # exactly 1.0 and the interval between it and an appended prior_high
-        # would carry no mass at all: both knots clip to ``1 - min_eps``, the
-        # tie bump below separates them by ``min_eps / (10 K)``, and the
-        # boundary bin ends up with ~5e-11 of CDF where the plotting position
-        # says ``0.5 / n``. That collapses the spline slope there, and with
-        # it the reported density just inside the upper bound -- measured on
-        # U(0, 1)^2 with prior [[0, 1], [0, 1]], n = 1500, 80 epochs, seeds
-        # 0-3, log_prob at (1, 0.5) came out -14.6 to -11.6 against a truth
-        # of 0. The lower wall has no such problem -- the smallest sample
-        # sits at ``1 / n``, which already leaves the bottom bin its mass --
-        # so only the top needs holding back, to its Hazen position. With it
-        # the same four fits report +1.2 to +5.2 at (1, 0.5), matching the
-        # +1.2 to +5.7 at (0, 0.5), and no training row is mapped to the
-        # spurious z = ndtri(1 - min_eps) = 5.2 outlier any more.
-        if prior_low is not None and prior_low < xg[0]:
-            xg = np.concatenate([[prior_low], xg])
-            cdf_vals = np.concatenate([[0.0], cdf_vals])
-            data_min = prior_low
-        if prior_high is not None and prior_high > xg[-1]:
-            cdf_vals = np.minimum(cdf_vals, 1.0 - 0.5 / len(sorted_chain))
-            xg = np.concatenate([xg, [prior_high]])
-            cdf_vals = np.concatenate([cdf_vals, [1.0]])
-            data_max = prior_high
-    # Clip CDF values to avoid 0 and 1, which cause issues with inverse normal CDF
-    cdf_vals = np.clip(cdf_vals, min_eps, 1.0 - min_eps)
-    # Ensure strict monotonicity for the inverse CDF spline: prior bound
-    # extension + clipping can create duplicate CDF values (e.g. the last
-    # quantile grid point and the prior_high point both clip to 1 - min_eps).
-    # PCHIP requires strictly increasing x-values, so bump any ties.
-    eps_bump = min_eps / (len(cdf_vals) * 10)
-    for i in range(1, len(cdf_vals)):
-        if cdf_vals[i] <= cdf_vals[i - 1]:
-            cdf_vals[i] = cdf_vals[i - 1] + eps_bump
-    # Store actual CDF bounds after clipping (may differ from min_eps due to empirical CDF)
-    cdf_min, cdf_max = float(np.min(cdf_vals)), float(np.max(cdf_vals))
-
-    # Bulk interpolant. Both families share the empirical-quantile knots above
-    # and the tail / prior-bound closures below; they differ only in how the
-    # bulk CDF is interpolated, inverted and differentiated.
-    if marginal == "rqs":
-        # Single closed-form rational-quadratic spline: forward, inverse and
-        # derivative come from one parameterization (machine-precision inverse).
-        # The edge slope floor rescues PCHIP's zeroed endpoint derivative, which
-        # otherwise collapses the density at the outermost knot — with no prior
-        # bounds that knot *is* each dimension's most extreme training sample.
-        bulk_cdf, bulk_inverse, bulk_deriv = _rqs_bulk(
-            xg, cdf_vals, edge_slope_floor=0.05, edge_slopes=bulk_edge_slopes)
-    elif marginal == "pchip":
-        # Two independent PCHIP splines for CDF and inverse-CDF; the derivative
-        # is the analytic (piecewise-cubic) derivative of the CDF spline,
-        # strictly cheaper than running jax.grad through the spline per call.
-        cdf_spline = PchipInterpolator(xg, cdf_vals, extrapolate=False, check=False)
-        bulk_inverse = PchipInterpolator(cdf_vals, xg, extrapolate=False, check=False)
-        bulk_cdf = cdf_spline
-        bulk_deriv = cdf_spline.derivative()
-    else:
-        raise ValueError(f"marginal must be 'pchip' or 'rqs', got {marginal!r}")
-
-    # ------------------------------------------------------------------
-    # Gaussian tail model: fit a Gaussian to the marginal and use it for
-    # extrapolation beyond the observed data range.
-    # ------------------------------------------------------------------
-    if tail_extension:
-        mu = float(np.mean(samples))
-        sigma = float(np.std(samples, ddof=1))
-        sigma = max(sigma, _SCALE_FLOOR)  # guard against zero std
-
-        # CDF values of the Gaussian at the data boundaries. The upper one is
-        # taken as a survival function: ``1 - norm.cdf`` cancels to exactly 0.0
-        # once data_max exceeds ~8.3 fitted sigmas, which sends hi_scale to
-        # ~1e26 and destroys the right tail.
-        from scipy.stats import norm as _norm
-        gauss_cdf_lo = float(_norm.cdf(data_min, loc=mu, scale=sigma))
-        gauss_sf_hi = float(_norm.sf(data_max, loc=mu, scale=sigma))
-
-        # Empirical CDF at boundaries (from spline)
-        emp_cdf_lo = float(cdf_min)
-        emp_cdf_hi = float(cdf_max)
-
-        # Scale factors so the Gaussian tail joins the empirical CDF at
-        # the boundary.  We want:
-        #   tail_cdf(data_min) = emp_cdf_lo
-        #   tail_cdf(data_max) = emp_cdf_hi
-        # Using:  tail_cdf(x) = emp_cdf_lo * Phi_gauss(x) / Phi_gauss(data_min)   [left]
-        #         tail_cdf(x) = 1 - (1 - emp_cdf_hi) * Phi_gauss_sf(x) / Phi_gauss_sf(data_max)  [right]
-        # Floored at the float64 subnormal edge rather than at _POS_FLOOR:
-        # 1e-30 is reached by an entirely ordinary 11.5-sigma data boundary,
-        # and truncating there rescales the whole tail (both the quantile
-        # inversion below and the tail density in pdf_fn) by many decades.
-        lo_scale = emp_cdf_lo / max(gauss_cdf_lo, _NDTRI_FLOOR)
-        hi_scale = (1.0 - emp_cdf_hi) / max(gauss_sf_hi, _NDTRI_FLOOR)
-    # ------------------------------------------------------------------
-
-    def cdf_fn(x: ArrayLike) -> Array:
-        x = jnp.asarray(x)
-        x_clipped = jnp.clip(x, data_min, data_max)
-        spline_val = bulk_cdf(x_clipped)
-        if use_gpd:
-            left_tail = F_lo * (1.0 - _gpd_cdf(u_lo - x, xi_lo, sigma_lo))
-            right_tail = F_hi + (1.0 - F_hi) * _gpd_cdf(x - u_hi, xi_hi, sigma_hi)
-            y = jnp.where(
-                x <= u_lo,
-                left_tail,
-                jnp.where(x >= u_hi, right_tail, spline_val),
-            )
-        elif tail_extension:
-            gauss_cdf = ndtr((x - mu) / sigma)
-            # Clamped so the cast to x's dtype cannot overflow to inf, which
-            # turned inf * 0 into NaN below x64 (see :func:`_dtype_max`).
-            left_tail = min(lo_scale, _dtype_max(x)) * gauss_cdf
-            right_tail = 1.0 - min(hi_scale, _dtype_max(x)) * (1.0 - gauss_cdf)
-            y = jnp.where(
-                x <= data_min,
-                left_tail,
-                jnp.where(x >= data_max, right_tail, spline_val),
-            )
-        else:
-            # No tail model: clip flat to the *boundary* CDF value (cdf_min /
-            # cdf_max), not to min_eps. Using min_eps here created a jump of
-            # ~1/N at data_min/data_max — mapping each dimension's extreme
-            # sample to a spurious z≈±5.2 outlier. cdf_min == bulk_cdf(data_min)
-            # (and cdf_max == bulk_cdf(data_max)), so this join is continuous.
-            # (With prior_bounds, cdf_min/cdf_max already equal min_eps/1-min_eps,
-            # so that recommended path is unchanged.)
-            y = jnp.where(
-                x <= data_min,
-                cdf_min,
-                jnp.where(x >= data_max, cdf_max, spline_val),
-            )
-        # Final bounds check to ensure we never return exactly 0 or 1
-        return jnp.clip(y, min_eps, 1.0 - min_eps)
-
-    def quantile_fn(u: ArrayLike) -> Array:
-        u = jnp.asarray(u)
-        if use_gpd:
-            # Avoid 1-0 inside GPD quantile when u is at the endpoints.
-            safe_left = jnp.clip(1.0 - u / max(F_lo, min_eps), min_eps, 1.0 - min_eps)
-            safe_right = jnp.clip((u - F_hi) / max(1.0 - F_hi, min_eps),
-                                   min_eps, 1.0 - min_eps)
-            left_x = u_lo - _gpd_quantile(safe_left, xi_lo, sigma_lo)
-            right_x = u_hi + _gpd_quantile(safe_right, xi_hi, sigma_hi)
-            u_bulk = jnp.clip(u, cdf_min, cdf_max)
-            mid_x = bulk_inverse(u_bulk)
-            return jnp.where(
-                u <= F_lo,
-                left_x,
-                jnp.where(u >= F_hi, right_x, mid_x),
-            )
-        if tail_extension:
-            # For values below or above the empirical CDF range, invert the
-            # Gaussian tail model. Both arguments are floored at the ndtri
-            # domain limit, not at min_eps: ndtri(1e-7) is only -5.199, so a
-            # min_eps floor pins both tails at mu -/+ 5.199 sigma. Whenever the
-            # data reach past that (routine for t, lognormal, even exponential
-            # at n = 5000) the tail branch then returns a value *inside* the
-            # data range and quantile_fn goes non-monotone at the join.
-            # Left tail:  u = lo_scale * Phi((x - mu) / sigma)
-            #   => x = mu + sigma * Phi^{-1}(u / lo_scale)
-            ndtri_lo = _ndtri_floor(u)
-            # Clamped so the divisor cannot overflow the cast to u's dtype;
-            # see :func:`_dtype_max`. Both are no-ops in float64.
-            scale_lo = min(lo_scale, _dtype_max(u))
-            scale_hi = min(hi_scale, _dtype_max(u))
-            left_x = mu + sigma * ndtri(
-                jnp.clip(u / scale_lo, ndtri_lo, 1.0 - min_eps))
-            # Right tail: 1 - u = hi_scale * (1 - Phi((x - mu) / sigma))
-            #   => x = mu - sigma * Phi^{-1}((1 - u) / hi_scale), via
-            # Phi^{-1}(1 - p) = -Phi^{-1}(p) so that no 1 - x cancellation
-            # (which loses every digit of a small survival probability) enters
-            # the ndtri argument.
-            right_x = mu - sigma * ndtri(
-                jnp.clip((1.0 - u) / scale_hi, ndtri_lo, 1.0 - min_eps))
-            # A no-op wherever the join is continuous (the tail values are then
-            # already outside the data range). It only binds past ~37 sigma,
-            # where the ndtri floor above saturates, and turns what would be a
-            # fold — quantile_fn decreasing, i.e. a non-invertible marginal —
-            # into a flat extension.
-            left_x = jnp.minimum(left_x, data_min)
-            right_x = jnp.maximum(right_x, data_max)
-
-            u_clipped = jnp.clip(u, cdf_min, cdf_max)
-            mid_x = bulk_inverse(u_clipped)
-
-            y = jnp.where(
-                u < cdf_min,
-                left_x,
-                jnp.where(u > cdf_max, right_x, mid_x)
-            )
-        else:
-            u_clipped = jnp.clip(u, cdf_min, cdf_max)
-            y = bulk_inverse(u_clipped)
-            # no tail model: the map saturates at the support ends, one notch
-            # inside them (see _q_limits) so no draw lands on a wall
-            y = jnp.clip(y, *_q_limits)
-        return y
-
-    # Strictly-inside saturation points for the quantile map. Returning
-    # data_min / data_max themselves puts sample atoms exactly on the support
-    # ends, which under prior_bounds are hard walls: measured 4 draws of
-    # 20000 landing on exactly 0.0 for U(0, 1) data with prior_bounds [0, 1],
-    # marginal="rqs" and "pchip" alike. One notch inside is invisible to every
-    # density and CDF value here and removes the atom.
-    _x_inset = max(1e-15 * float(data_max - data_min),
-                   4.0 * float(np.spacing(max(abs(float(data_min)),
-                                              abs(float(data_max))))))
-    _q_limits = (float(data_min) + _x_inset, float(data_max) - _x_inset)
-
-    _inv_sqrt_2pi = 1.0 / jnp.sqrt(2.0 * jnp.pi)
-
-    def pdf_fn(x: ArrayLike) -> Array:
-        """PDF via the analytic derivative of the bulk CDF interpolant.
-
-        Mirrors the branch structure of ``cdf_fn``:
-          * middle (within data range): closed-form derivative of the bulk
-            interpolant (PCHIP or RQS), no jax.grad.
-          * left/right tail with ``tail_extension``: derivative of the
-            Gaussian-tail CDF, i.e. ``scale * φ((x-μ)/σ) / σ``.
-          * no tail extension: PDF is zero outside the data range.
-
-        Every branch is floored to ``min_eps`` on return. This is a deliberate
-        numerical guard so ``log(pdf)`` (used by the Jacobian log-det and by
-        ``log_prob``) stays finite everywhere. The consequence, by design: with
-        no tail model the density does not integrate to exactly 1 and a query
-        point outside the observed data range reports a small floor density
-        (``min_eps``) rather than a true 0. Supply ``prior_bounds`` or
-        ``tail_extension``/``tail_model`` to model beyond the data range.
-
-        Works on scalar or vector input (jax.grad previously forced
-        scalar-only).
-        """
-        x = jnp.asarray(x)
-        x_in = jnp.clip(x, data_min, data_max)
-        mid_pdf = bulk_deriv(x_in)
-
-        if use_gpd:
-            left_pdf = F_lo * _gpd_pdf(u_lo - x, xi_lo, sigma_lo)
-            right_pdf = (1.0 - F_hi) * _gpd_pdf(x - u_hi, xi_hi, sigma_hi)
-            y = jnp.where(
-                x <= u_lo,
-                left_pdf,
-                jnp.where(x >= u_hi, right_pdf, mid_pdf),
-            )
-        elif tail_extension:
-            z = (x - mu) / sigma
-            tail_normal_pdf = _inv_sqrt_2pi * jnp.exp(-0.5 * z * z) / sigma
-            left_pdf = min(lo_scale, _dtype_max(x)) * tail_normal_pdf
-            right_pdf = min(hi_scale, _dtype_max(x)) * tail_normal_pdf
-            y = jnp.where(
-                x <= data_min,
-                left_pdf,
-                jnp.where(x >= data_max, right_pdf, mid_pdf),
-            )
-        else:
-            # strict comparisons: the endpoints themselves are training rows
-            # (or, under prior bounds, the walls), and the interpolant is
-            # defined there. Testing ``<=`` / ``>=`` handed them the
-            # out-of-range 0.0 instead, so the extreme sample of each
-            # dimension reported the ``min_eps`` floor -- 1.0e-7 against a
-            # true 4.7e-4 on N(0, 1) with n = 3000, a 7.6-nat hole one ULP
-            # wide, while ``data_min + 1e-12`` was already correct.
-            y = jnp.where(
-                (x < data_min) | (x > data_max),
-                0.0,
-                mid_pdf,
-            )
-        return jnp.maximum(y, min_eps)
-
-    return cdf_vals, cdf_fn, quantile_fn, pdf_fn
-
-
-class EmpiricalMarginalToGaussian(AbstractBijection):
-    """
-    Bijection transforming empirical marginal distribution to standard Gaussian.
-
-    This bijection uses the probability integral transform (PIT) combined with
-    the inverse normal CDF to map samples from an empirical distribution to
-    a standard Gaussian distribution. It's useful for copula modeling where
-    marginals need to be transformed to Gaussian.
-
-    Attributes
-    ----------
-    samples : np.ndarray
-        Original data samples used to construct the empirical distribution.
-    cdf_fn : Callable
-        Empirical CDF function.
-    quantile_fn : Callable
-        Inverse CDF (quantile) function.
-    pdf_fn : Callable
-        Empirical PDF function (derivative of CDF).
-    min_eps : float, default=1e-7
-        Minimum epsilon to avoid CDF values of exactly 0 or 1.
-
-    The remaining attributes are reconstruction metadata: they record the
-    arguments passed to :func:`make_empirical_cdf_spline` so that
-    :func:`coppuccino.model_io.load_flow` can rebuild ``cdf_fn`` /
-    ``quantile_fn`` / ``pdf_fn`` identically from ``samples``.
-
-    num_points : int, default=200
-        Number of grid points used for the CDF spline.
-    tail_extension : bool, default=False
-        Whether a Gaussian tail model was used beyond the data range.
-    prior_low, prior_high : float or None, default=None
-        Prior support bounds the CDF grid was extended to, if any.
-    tail_model : str, default="gaussian"
-        Tail model used (``"gaussian"`` or the experimental ``"gpd"``).
-    tail_quantile : float, default=0.05
-        GPD tail fraction (only meaningful when ``tail_model="gpd"``).
-    marginal : str, default="rqs"
-        Which bulk interpolant family built ``cdf_fn``/``quantile_fn``/``pdf_fn``
-        (``"rqs"`` or ``"pchip"``). Must match the family
-        :func:`make_empirical_cdf_spline` actually used, since
-        :mod:`coppuccino.model_io` reconstructs the closures from this field;
-        the default tracks that function's own default.
-
-    Examples
-    --------
-    >>> import numpy as np
-    >>> import jax.numpy as jnp
-    >>> from coppuccino.bijections import EmpiricalMarginalToGaussian, make_empirical_cdf_spline
-    >>> # Generate samples from a non-Gaussian distribution
-    >>> samples = np.random.exponential(2.0, 1000)
-    >>> cdf_vals, cdf_fn, quantile_fn, pdf_fn = make_empirical_cdf_spline(
-    ...     samples, marginal="rqs")
-    >>> # Create bijection — pass the same ``marginal`` used to build the
-    >>> # closures, so the recorded metadata can rebuild them faithfully.
-    >>> bij = EmpiricalMarginalToGaussian(
-    ...     samples=samples, cdf_fn=cdf_fn, quantile_fn=quantile_fn,
-    ...     pdf_fn=pdf_fn, marginal="rqs"
-    ... )
-    >>> # Transform sample to Gaussian space
-    >>> x = jnp.array(2.0)
-    >>> z, log_det = bij.inverse_and_log_det(x)
-    >>> # Transform back
-    >>> x_recovered, log_det_fwd = bij.transform_and_log_det(z)
-    """
-    samples: np.ndarray
-    cdf_fn: Callable
-    quantile_fn: Callable
-    pdf_fn: Callable
-    min_eps: float = 1e-7
-    num_points: int = 200
-    tail_extension: bool = False
-    prior_low: Optional[float] = None
-    prior_high: Optional[float] = None
-    tail_model: str = "gaussian"
-    tail_quantile: float = 0.05
-    marginal: str = "rqs"
-    # flowjax declares shape/cond_shape as equinox ``AbstractVar``, which mypy
-    # reads as instance variables of the base; a concrete ``ClassVar`` is the
-    # intended implementation here (both are per-class constants).
-    cond_shape: ClassVar[None] = None  # type: ignore[misc]
-    shape: ClassVar[tuple[int, ...]] = ()  # type: ignore[misc]
-
-    def inverse_and_log_det(self, x: ArrayLike,
-                            condition: Optional[ArrayLike] = None) -> tuple[Array, Array]:
-        """
-        Transform from original space to standard Gaussian.
-
-        Applies the probability integral transform using the empirical CDF,
-        then maps the uniform variable to Gaussian via the inverse normal CDF.
-
-        Parameters
-        ----------
-        x : array_like
-            Values in the original (empirical) space.
-        condition : None
-            Not used (for API compatibility).
-
-        Returns
-        -------
-        z : jax.Array
-            Transformed values in standard Gaussian space.
-        log_det : float
-            Log absolute determinant of the Jacobian.
-
-        Examples
-        --------
-        >>> import jax.numpy as jnp
-        >>> # bij is an EmpiricalMarginalToGaussian (see the class docstring)
-        >>> z, log_det = bij.inverse_and_log_det(jnp.array([1.0, 2.0, 3.0]))  # doctest: +SKIP
-        """
-        # Get CDF value using smooth interpolation
-        u = self.cdf_fn(x)
-
-        # Transform to standard Gaussian
-        z = ndtri(u)  # JAX equivalent of norm.ppf
-
-        # Jacobian: |dz/dx| = |dz/du| * |du/dx| = (1/φ(z)) * pdf(x)
-        pdf_x = self.pdf_fn(x)
-        # JAX normal PDF
-        pdf_z = jnp.exp(-0.5 * z**2) / jnp.sqrt(2 * jnp.pi)
-        log_det = jnp.log(pdf_x) - jnp.log(pdf_z)
-
-        return z, jnp.sum(log_det)
-
-    def transform_and_log_det(self, z: ArrayLike,
-                              condition: Optional[ArrayLike] = None) -> tuple[Array, Array]:
-        """
-        Transform from standard Gaussian to original space.
-
-        Applies the normal CDF to get a uniform variable, then maps to the
-        original space using the empirical quantile function.
-
-        Parameters
-        ----------
-        z : array_like
-            Values in standard Gaussian space.
-        condition : None
-            Not used (for API compatibility).
-
-        Returns
-        -------
-        x : jax.Array
-            Transformed values in the original (empirical) space.
-        log_det : float
-            Log absolute determinant of the Jacobian.
-
-        Examples
-        --------
-        >>> import jax.numpy as jnp
-        >>> # bij is an EmpiricalMarginalToGaussian (see the class docstring)
-        >>> z = jnp.array([0.0, 1.0, -1.0])
-        >>> x, log_det = bij.transform_and_log_det(z)  # doctest: +SKIP
-        """
-        # Transform to uniform using JAX normal CDF
-        u = ndtr(z)  # JAX equivalent of norm.cdf
-        # Clip u to ensure it's in valid range for quantile function
-        u = jnp.clip(u, self.min_eps, 1.0 - self.min_eps)
-
-        x = self.quantile_fn(u)
-        # Jacobian: |dx/dz| = |dx/du| * |du/dz| = (1/pdf(x)) * φ(z)
-        pdf_x = self.pdf_fn(x)
-
-        # JAX normal PDF
-        pdf_z = jnp.exp(-0.5 * z**2) / jnp.sqrt(2 * jnp.pi)
-        log_det = jnp.log(1.0 / pdf_x) + jnp.log(pdf_z)
-
-        return x, jnp.sum(log_det)
 
 
 # ----------------------------------------------------------------------
@@ -1378,13 +528,12 @@ def make_smooth_marginal(samples: np.ndarray,
     The map is a single monotone C^1 object evaluated consistently in both
     directions (forward, inverse and log-derivative share one
     parameterization), so the flow's sample stream and its reported density
-    agree everywhere -- including arbitrarily deep in the tails. This removes
-    the legacy Gaussianized pipeline's boundary pathologies at their root:
-    there is no CDF clip, no quantile clamp (hence no boundary sample atom)
-    and no floored wall density (hence no density cliff), and the density the
-    map reports *at* a prior bound is finite and positive rather than 0 or
-    infinite (see :class:`SmoothMarginalToGaussian` for what that costs and
-    what it does not fix).
+    agree everywhere -- including arbitrarily deep in the tails. There is no
+    CDF clip, no quantile clamp (hence no boundary sample atom) and no floored
+    wall density (hence no density cliff), and the density the map reports
+    *at* a prior bound is finite and positive rather than 0 or infinite (see
+    :class:`SmoothMarginalToGaussian` for what that costs and what it does not
+    fix).
 
     Construction:
 
@@ -1403,8 +552,7 @@ def make_smooth_marginal(samples: np.ndarray,
           ``tail_alpha = 0`` gives a linear map (Gaussian tails in theta);
           ``tail_alpha > 0`` gives progressively heavier tails. Density
           queries and samples beyond the observed data range are therefore
-          honest and smooth (outlier handling), replacing the legacy
-          ``tail_extension``/GPD branches.
+          honest and smooth (outlier handling).
 
     Boundary semantics: samples sitting exactly on a prior bound (the
     documented recommended use of ``prior_bounds``, and what a reflecting or
@@ -1568,11 +716,11 @@ def make_smooth_marginal(samples: np.ndarray,
 class SmoothMarginalToGaussian(AbstractBijection):
     """Clip-free marginal bijection between data space and Gaussian space.
 
-    Wraps the closures from :func:`make_smooth_marginal`. Unlike
-    :class:`EmpiricalMarginalToGaussian` there is no probability-integral /
-    inverse-normal composition with clipped endpoints: the map ``theta(z)``
-    is one analytic monotone object (RQS bulk + analytic tails), so the
-    sampling direction and the density direction agree everywhere.
+    Wraps the closures from :func:`make_smooth_marginal`. There is no
+    probability-integral / inverse-normal composition with clipped endpoints:
+    the map ``theta(z)`` is one analytic monotone object (RQS bulk + analytic
+    tails), so the sampling direction and the density direction agree
+    everywhere.
     Consequences:
 
     * no boundary sample atoms: every finite ``z`` maps strictly inside the
@@ -1674,7 +822,6 @@ class SmoothMarginalToGaussian(AbstractBijection):
     tail_alpha: float = 0.0
     x_clamp_lo: Optional[float] = None
     x_clamp_hi: Optional[float] = None
-    marginal: str = "smooth"
     # flowjax declares shape/cond_shape as equinox ``AbstractVar``, which mypy
     # reads as instance variables of the base; a concrete ``ClassVar`` is the
     # intended implementation here (both are per-class constants).

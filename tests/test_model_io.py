@@ -322,7 +322,7 @@ class TestExtractSplineData:
 
             assert spline_data['num_dims'] == n_dims
             assert len(spline_data['samples']) == n_dims
-            assert len(spline_data['min_eps']) == n_dims
+            assert spline_data['marginal'] == ['smooth'] * n_dims
 
     def test_samples_are_preserved(self):
         """Test that sample arrays are correctly extracted."""
@@ -336,20 +336,6 @@ class TestExtractSplineData:
         for samples in spline_data['samples']:
             assert isinstance(samples, np.ndarray)
             assert len(samples.shape) == 1  # 1D array per dimension
-
-    def test_min_eps_is_float(self):
-        """min_eps metadata of the legacy (non-smooth) marginals are floats."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2,
-                                     marginal="rqs")
-
-        spline_data = _extract_spline_data(flow)
-
-        for eps in spline_data['min_eps']:
-            assert isinstance(eps, float)
-            assert eps > 0
-
 
 class TestReconstructEmpiricalTransforms:
     """Test the _reconstruct_empirical_transforms helper function."""
@@ -424,116 +410,66 @@ class TestSaveLoadWithNonDefaultParams:
         spline_data = _extract_spline_data(flow)
 
         assert 'num_points' in spline_data
-        assert 'tail_extension' in spline_data
         assert 'prior_low' in spline_data
         assert 'prior_high' in spline_data
         assert len(spline_data['num_points']) == 2
-        assert len(spline_data['tail_extension']) == 2
         # Prior bounds should be preserved
         for i in range(2):
             assert spline_data['prior_low'][i] == pytest.approx(-5.0)
             assert spline_data['prior_high'][i] == pytest.approx(5.0)
-            assert spline_data['tail_extension'][i] is False
+        assert spline_data['tail_alpha'] == [0.0, 0.0]
+        # the removed marginal families' metadata is no longer written
+        assert not {'min_eps', 'tail_extension', 'tail_model',
+                    'tail_quantile'} & spline_data.keys()
 
-    def test_round_trip_with_tail_extension(self):
-        """Test that tail_extension is preserved through save/load."""
+    def test_round_trip_preserves_tail_alpha(self):
+        """A non-default tail_alpha survives save/load and the reloaded flow
+        reproduces the original samples exactly."""
+        from paramax import unwrap
         np.random.seed(42)
         chain = np.random.randn(200, 2)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2, tail_extension=True)
+        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2,
+                                     tail_alpha=0.5)
+        assert _extract_spline_data(flow)['tail_alpha'] == [0.5, 0.5]
 
         original_samples = sample(flow, n_samples=100, rng_seed=999)
-
         with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as f:
             path = f.name
-
         try:
             save_flow(flow, path)
-
-            spline_data = _extract_spline_data(flow)
-            for i in range(2):
-                assert spline_data['tail_extension'][i] is True
-
             loaded_flow = load_flow(path)
+            assert [float(unwrap(b.tail_alpha))
+                    for b in loaded_flow.bijection.bijections] == [0.5, 0.5]
             loaded_samples = sample(loaded_flow, n_samples=100, rng_seed=999)
-
             np.testing.assert_array_almost_equal(original_samples, loaded_samples)
         finally:
             os.unlink(path)
 
-    @pytest.mark.parametrize("marginal,expected", [
-        (None, "smooth"),    # default (gaussian pipeline, v2.0)
-        ("rqs", "rqs"),
-        ("pchip", "pchip"),
+    @pytest.mark.parametrize("families, named", [
+        (None, "'pchip'"),               # predates the 'marginal' key
+        (["rqs", "smooth"], "'rqs'"),    # 1.0.0's default family
     ])
-    def test_round_trip_preserves_marginal(self, marginal, expected):
-        """The marginal family (default RQS, or explicit) survives save/load and
-        the reloaded flow reproduces the original samples exactly."""
-        from paramax import unwrap
+    def test_a_removed_marginal_family_is_refused_by_name(self, families, named):
+        """The removed families cannot be rebuilt, so their files must fail
+        naming the file and the family, not on a missing key mid-rebuild."""
         np.random.seed(42)
         chain = np.random.randn(200, 2)
-        kwargs = {} if marginal is None else {"marginal": marginal}
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2, **kwargs)
-
-        spline_data = _extract_spline_data(flow)
-        assert spline_data['marginal'] == [expected, expected]
-
-        original_samples = sample(flow, n_samples=100, rng_seed=999)
-        with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as f:
-            path = f.name
-        try:
+        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "flow.pkl"
             save_flow(flow, path)
-            loaded_flow = load_flow(path)
-            loaded_marginals = [str(unwrap(b.marginal)) for b in loaded_flow.bijection.bijections]
-            assert loaded_marginals == [expected, expected]
-            loaded_samples = sample(loaded_flow, n_samples=100, rng_seed=999)
-            np.testing.assert_array_almost_equal(original_samples, loaded_samples)
-        finally:
-            os.unlink(path)
-
-    def test_round_trip_with_gpd_tail(self):
-        """The GPD tail model survives fit -> save -> load and the reloaded flow
-        reproduces the original samples. Regression guard: tail_model /
-        tail_quantile must be preserved on reload, otherwise a gpd model would
-        silently reconstruct as a gaussian-tail one."""
-        from paramax import unwrap
-        rng = np.random.default_rng(0)
-        chain = rng.standard_t(df=3, size=(2000, 2))
-        flow = normalizing_flows_fit(
-            chain, max_epochs=5, patience=2, tail_model="gpd", tail_quantile=0.05
-        )
-
-        spline_data = _extract_spline_data(flow)
-        assert spline_data['tail_model'] == ["gpd", "gpd"]
-        assert spline_data['tail_quantile'] == pytest.approx([0.05, 0.05])
-
-        original_samples = sample(flow, n_samples=100, rng_seed=999)
-
-        with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as f:
-            path = f.name
-        try:
-            save_flow(flow, path)
-            loaded_flow = load_flow(path)
-            loaded_tail_models = [
-                str(unwrap(b.tail_model)) for b in loaded_flow.bijection.bijections
-            ]
-            assert loaded_tail_models == ["gpd", "gpd"]
-            loaded_samples = sample(loaded_flow, n_samples=100, rng_seed=999)
-            np.testing.assert_array_almost_equal(original_samples, loaded_samples)
-        finally:
-            os.unlink(path)
-
-    def test_old_saved_file_without_marginal_defaults_to_pchip(self):
-        """A saved file predating the 'marginal' field reconstructs as PCHIP
-        (what such models were always built with), not the new RQS default."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2, marginal="pchip")
-        spline_data = _extract_spline_data(flow)
-        # Simulate an older save that never stored the marginal key.
-        del spline_data['marginal']
-        transform = _reconstruct_empirical_transforms(spline_data)
-        from paramax import unwrap
-        assert all(str(unwrap(b.marginal)) == "pchip" for b in transform.bijections)
+            with open(path, "rb") as f:
+                payload = cloudpickle.load(f)
+            if families is None:
+                del payload['spline_data']['marginal']
+            else:
+                payload['spline_data']['marginal'] = families
+            with open(path, "wb") as f:
+                cloudpickle.dump(payload, f)
+            with pytest.raises(ValueError, match=f"{named} marginal") as exc:
+                load_flow(path)
+            assert str(path) in str(exc.value)
+            assert "coppuccino<2" in str(exc.value)
 
 
 class TestEdgeCases:

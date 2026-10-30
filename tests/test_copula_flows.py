@@ -4,7 +4,6 @@ import numpy as np
 import pytest
 from equinox import filter_jit
 from flowjax.distributions import Transformed
-from paramax import unwrap
 
 from coppuccino.copula_flows import (
     _MIN_SAMPLES_PER_DIM,
@@ -17,11 +16,6 @@ from coppuccino.copula_flows import (
     sample,
     sample_and_log_prob,
 )
-
-
-def _marginal_families(flow):
-    """The marginal family recorded on each empirical transform of a flow."""
-    return [str(unwrap(b.marginal)) for b in flow.bijection.bijections]
 
 
 def largest_value_multiplicity(samples: np.ndarray) -> int:
@@ -55,56 +49,25 @@ def largest_value_multiplicity(samples: np.ndarray) -> int:
     )
 
 
-class TestMarginalSelection:
-    """Test the marginal='rqs'|'pchip' choice on normalizing_flows_fit."""
+class TestMarginalOptions:
+    """The removed marginal options fail loudly rather than being ignored."""
 
-    def test_default_marginal_is_smooth(self):
-        """normalizing_flows_fit defaults to the gaussian pipeline's smooth marginal."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 3)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
-        assert _marginal_families(flow) == ["smooth", "smooth", "smooth"]
+    @pytest.mark.parametrize("option", [
+        {"marginal": "rqs"}, {"marginal": "pchip"}, {"tail_extension": True},
+        {"tail_model": "gpd"}, {"tail_quantile": 0.05},
+    ])
+    def test_a_removed_option_is_rejected_by_name(self, option):
+        chain = np.random.default_rng(0).standard_normal((200, 2))
+        with pytest.raises(TypeError, match=next(iter(option))):
+            normalizing_flows_fit(chain, max_epochs=1, show_progress=False,
+                                  **option)
 
-    def test_legacy_tail_model_resolves_marginal_to_rqs(self):
-        """A legacy tail model pre-dates 'smooth', so the default resolves to RQS."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 3)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2,
-                                     tail_extension=True)
-        assert _marginal_families(flow) == ["rqs", "rqs", "rqs"]
-
-    def test_pchip_marginal_is_selectable(self):
-        """Passing marginal='pchip' uses the PCHIP marginal on every dimension."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 3)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2, marginal="pchip")
-        assert isinstance(flow, Transformed)
-        assert _marginal_families(flow) == ["pchip", "pchip", "pchip"]
-
-    def test_both_marginals_fit_and_sample(self):
-        """Both marginal families fit and produce finite samples/log-probs."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-        for marginal in ("rqs", "pchip"):
-            flow = normalizing_flows_fit(chain, max_epochs=5, patience=2, marginal=marginal)
-            s = sample(flow, n_samples=100, rng_seed=0)
-            lp = log_prob(flow, chain)
-            assert s.shape == (100, 2) and np.all(np.isfinite(s))
-            assert np.all(np.isfinite(lp))
-
-    def test_invalid_marginal_raises(self):
-        """An unknown marginal family raises a clear error."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-        with pytest.raises(ValueError, match="marginal must be"):
-            normalizing_flows_fit(chain, max_epochs=5, patience=2, marginal="bogus")
-
-    def test_create_empirical_transforms_default_rqs(self):
-        """_create_empirical_transforms defaults to RQS marginals."""
-        np.random.seed(42)
-        samples = np.random.randn(200, 2)
-        transform, _ = _create_empirical_transforms(samples)
-        assert all(str(unwrap(b.marginal)) == "rqs" for b in transform.bijections)
+    def test_options_are_keyword_only(self):
+        """1.0.0 took every option positionally, in an order that no longer
+        exists; a positional call has to raise rather than shift silently."""
+        chain = np.random.default_rng(0).standard_normal((200, 2))
+        with pytest.raises(TypeError, match="positional"):
+            normalizing_flows_fit(chain, 999)
 
 
 class TestCreateEmpiricalTransforms:
@@ -160,17 +123,6 @@ class TestCreateEmpiricalTransforms:
         samples = np.random.randn(100, 5)
 
         transform, inverse_log_det = _create_empirical_transforms(samples)
-
-        assert transform is not None
-        assert inverse_log_det is not None
-
-    def test_custom_min_eps(self):
-        """Test with custom min_eps parameter."""
-        np.random.seed(42)
-        samples = np.random.randn(100, 2)
-        min_eps = 1e-5
-
-        transform, inverse_log_det = _create_empirical_transforms(samples, min_eps=min_eps)
 
         assert transform is not None
         assert inverse_log_det is not None
@@ -482,14 +434,12 @@ class TestPriorBoundsValidation:
                                   prior_bounds=np.array([[-9.0, 9.0], [np.nan, 9.0]]),
                                   max_epochs=1, show_progress=False)
 
-    @pytest.mark.parametrize("marginal", ["smooth", "rqs", "pchip"])
-    def test_chain_outside_box_raises_for_every_marginal(self, bounded_chain, marginal):
-        """The families used to disagree; now all three reject the same input."""
+    def test_chain_outside_box_raises(self, bounded_chain):
+        """A box narrower than the data is an error, not a silent fold."""
         with pytest.raises(ValueError, match="outside prior_bounds") as exc:
             normalizing_flows_fit(bounded_chain,
                                   prior_bounds=np.array([[-1.0, 1.0], [-1.0, 1.0]]),
-                                  marginal=marginal, max_epochs=1,
-                                  show_progress=False)
+                                  max_epochs=1, show_progress=False)
         # names the offending column and the interval it actually spans, at
         # full float precision (see test_a_sub_ulp_violation_is_readable)
         assert "parameter (column) 0" in str(exc.value)
@@ -565,15 +515,14 @@ class TestChainValidation:
                                      show_progress=False)
         assert np.all(np.isfinite(log_prob(flow, bounded_chain[:20])))
 
-    @pytest.mark.parametrize("marginal", ["smooth", "pchip"])
-    def test_infinite_rows_are_dropped_not_fitted(self, bounded_chain, marginal):
-        """``pchip`` used to accept +-inf silently and return an all-NaN flow;
-        ``smooth`` used to die inside scipy naming neither column nor argument."""
+    def test_infinite_rows_are_dropped_not_fitted(self, bounded_chain):
+        """+-inf rows used to die inside scipy, naming neither column nor
+        argument."""
         dirty = bounded_chain.copy()
         dirty[3, 1] = np.inf
         dirty[7, 0] = -np.inf
         with pytest.warns(UserWarning, match="2 of 600 rows containing non-finite"):
-            flow = normalizing_flows_fit(dirty, marginal=marginal, max_epochs=1,
+            flow = normalizing_flows_fit(dirty, max_epochs=1,
                                          show_progress=False)
         assert np.all(np.isfinite(sample(flow, 100, rng_seed=0)))
         assert np.all(np.isfinite(log_prob(flow, bounded_chain[:20])))
@@ -723,16 +672,14 @@ class TestDivergenceGuard:
          {"learning_rate": 1e-1},
          {"knots": 2, "flow_layers": 2, "tanh_max_val": 2.0},
          {"knots": 8, "flow_layers": 8},
-         {"marginal": "rqs"},
          {"weight_decay": 1e-2}],
     )
     def test_ordinary_fits_over_the_knob_range_still_succeed(
             self, bounded_chain, kwargs):
         """The other direction: the guard must not have narrowed the API.
 
-        ``learning_rate`` spans three decades, the architecture spans the
-        smallest to the largest default rung, and both marginal families are
-        included -- every axis the guard's
+        ``learning_rate`` spans three decades and the architecture spans the
+        smallest to the largest default rung -- every axis the guard's
         baseline (the flow's own untrained initialization) is built from.
         """
         flow = normalizing_flows_fit(bounded_chain, max_epochs=8, rng_seed=0,
@@ -820,20 +767,14 @@ class TestArgumentCoercion:
 class TestDegenerateColumnDiagnostics:
     """A failed marginal build names the column it came from."""
 
-    @pytest.mark.parametrize(
-        "marginal, inner",
-        [("smooth", "two distinct sample values"),
-         ("rqs", "at least 2 elements")],
-    )
-    def test_constant_column_error_names_the_column(self, marginal, inner):
+    def test_constant_column_error_names_the_column(self):
         rng = np.random.default_rng(0)
         chain = np.column_stack([rng.standard_normal(400),
                                  rng.standard_normal(400),
                                  np.ones(400)])
         with pytest.raises(ValueError, match=r"parameter \(column\) 2:") as exc:
-            normalizing_flows_fit(chain, marginal=marginal, max_epochs=1,
-                                  show_progress=False)
-        assert inner in str(exc.value)
+            normalizing_flows_fit(chain, max_epochs=1, show_progress=False)
+        assert "two distinct sample values" in str(exc.value)
 
     def test_minimum_samples_threshold_matches_the_documented_boundary(self):
         """Exactly ``_MIN_SAMPLES_PER_DIM`` rows raise; one more is enough."""

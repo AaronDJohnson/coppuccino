@@ -323,17 +323,21 @@ def test_auto_rejects_a_non_two_dimensional_chain(data):
         normalizing_flows_fit_auto(data[:, 0], refit_best=False)
 
 
-def test_parameter_count_is_independent_of_the_marginal_family(data):
-    """``smallest_comparable`` ranks by trainable parameter count, so that count
+def test_parameter_count_is_independent_of_the_marginal_options(data):
+    """The selection rule ranks by trainable parameter count, so that count
     must measure the copula architecture only. The marginal transforms are
-    frozen, so the family must not move it -- otherwise a candidate list mixing
-    families would be ranked by family rather than by capacity."""
-    kw = {"prior_bounds": BOUNDS, "max_epochs": 1, "show_progress": False,
-          "knots": 4, "flow_layers": 6}
+    frozen, so their options must not move it -- otherwise a candidate list
+    varying ``num_points`` would be ranked by marginal resolution rather than
+    by capacity."""
+    kw = {"max_epochs": 1, "show_progress": False, "knots": 4, "flow_layers": 6}
+    marginal_options = {
+        "default": {"prior_bounds": BOUNDS},
+        "coarse": {"prior_bounds": BOUNDS, "num_points": 40},
+        "unbounded heavy": {"tail_alpha": 0.5},
+    }
     sizes = {
-        marginal: _n_trainable_params(
-            normalizing_flows_fit(data, marginal=marginal, **kw))
-        for marginal in ("smooth", "rqs", "pchip")
+        name: _n_trainable_params(normalizing_flows_fit(data, **kw, **extra))
+        for name, extra in marginal_options.items()
     }
     assert len(set(sizes.values())) == 1, sizes
     assert all(size > 0 for size in sizes.values())
@@ -341,7 +345,7 @@ def test_parameter_count_is_independent_of_the_marginal_family(data):
     smaller = _n_trainable_params(normalizing_flows_fit(
         data, prior_bounds=BOUNDS, max_epochs=1, show_progress=False,
         knots=2, flow_layers=2))
-    assert smaller < sizes["smooth"]
+    assert smaller < sizes["default"]
 
 
 def test_a_diverged_candidate_is_reported_as_failed_not_ok(data):

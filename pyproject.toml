@@ -35,7 +35,6 @@ dependencies = [
     "scipy>=1.10,<2.0.0; python_version < '3.12'",
     "scipy>=1.11.3,<2.0.0; python_version >= '3.12'",
     "equinox>=0.13.2,<0.14.0",
-    "interpax>=0.3.11,<0.4.0",
     "flowjax>=17.2.1,<18.0.0",
     # jaxtyping >=0.3.6 carries the Python 3.12 `issubclass` typing fix.
     "jaxtyping>=0.3.6,<0.4.0",
@@ -163,7 +162,7 @@ quote-style = "preserve"
 
 [tool.mypy]
 files = ["src/coppuccino"]
-# The scientific stack (jax, flowjax, equinox, interpax, paramax) ships partial
+# The scientific stack (jax, flowjax, equinox, paramax) ships partial
 # or no type information, so the third-party half of the graph is unresolvable.
 # Our own half is checked in full: `check_untyped_defs` is on, so the body of an
 # unannotated numerical helper is analysed too. Measured against the pre-change
@@ -174,14 +173,10 @@ files = ["src/coppuccino"]
 # fully-unannotated function for that probe to land in, which is the point.
 ignore_missing_imports = true
 check_untyped_defs = true
-# There are no module-wide `disable_error_code` overrides. Thirteen per-line
+# There are no module-wide `disable_error_code` overrides. Four per-line
 # `# type: ignore[<code>]` remain, so a real error of the same code anywhere
-# else in the same module still fails the build. Ten are equinox's
+# else in the same module still fails the build. All four are equinox's
 # AbstractVar/ClassVar shape fields and the __init__ signature it synthesises
-# from them (bijections.py, and the four marginal-bijection construction sites
-# in copula_flows.py / model_io.py). The other three are the
-# tail-constant
-# pre-declaration at the top of `make_empirical_cdf_spline`, which has its own
-# comment there; it is the load-bearing one -- replacing it with the truthful
-# `Optional[float]` and dropping the ignores takes mypy from clean to 54 errors
-# in bijections.py.
+# from them: the two ClassVar fields of `SmoothMarginalToGaussian` in
+# bijections.py, and its two construction sites in copula_flows.py /
+# model_io.py.

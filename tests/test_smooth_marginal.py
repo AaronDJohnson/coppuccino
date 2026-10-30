@@ -1,12 +1,11 @@
-"""Tests for the smooth-tail marginal (the ``normalizing_flows_fit`` default).
+"""Tests for the smooth-tail marginal (every ``normalizing_flows_fit`` marginal).
 
-``marginal="smooth"`` replaces the legacy clipped PIT/ndtri marginal with a
-single clip-free diffeomorphism ``theta(z)``: R onto the support (RQS bulk on
-(z, theta) knots + analytic tails). Sampling and density directions share one
-parameterization, so the boundary defects of the legacy Gaussianized pipeline
-(exact-bound sample atoms, wall density cliffs/floors) are removed at the
-root, and out-of-data-range queries get honest smoothly-decaying densities
-(``tail_alpha`` controls heaviness on unbounded sides).
+The marginal is a single clip-free diffeomorphism ``theta(z)``: R onto the
+support (RQS bulk on (z, theta) knots + analytic tails). Sampling and density
+directions share one parameterization, so a clipped PIT/ndtri marginal's
+boundary defects (exact-bound sample atoms, wall density cliffs/floors) do
+not arise, and out-of-data-range queries get honest smoothly-decaying
+densities (``tail_alpha`` controls heaviness on unbounded sides).
 
 The tests pin:
 
@@ -21,12 +20,11 @@ The tests pin:
 * the sample_and_log_prob contract: the sampling layer redraws rows whose
   bounded tails saturated at the float64 wall-resolution limit, so the
   reported density is exactly log_prob for every emitted row;
-* guards, default marginal resolution, and save/load round trip.
+* guards and save/load round trip.
 """
 
 import os
 import tempfile
-import warnings
 
 import jax.numpy as jnp
 import numpy as np
@@ -136,7 +134,8 @@ def test_marginal_exact_shell_occupancy():
     """s == q at any wall depth: draw z from the *known* N(0,1) base, push
     through theta(z), and compare shell counts against the analytic mass
     Phi(z(edge_hi)) - Phi(z(edge_lo)). This is exact -- no fitted copula in
-    the way -- and is the test the legacy marginal fails (atom over cliff)."""
+    the way -- and is the test a clipped PIT/ndtri marginal fails (atom over
+    cliff)."""
     rng = np.random.default_rng(1)
     x = rng.beta(0.5, 3.0, 5000)
     theta_of_z, z_of_theta, _, _ = make_smooth_marginal(
@@ -220,53 +219,19 @@ def test_marginal_handles_ties_and_spikes_both_walls():
 # API: defaults and guards
 # ---------------------------------------------------------------------------
 
-def test_gaussian_default_resolves_to_smooth(smooth_flow):
+def test_every_fitted_marginal_is_smooth(smooth_flow):
     from paramax import unwrap
     flow, _ = smooth_flow
     for bij in flow.bijection.bijections:
-        m = unwrap(bij)
-        assert isinstance(m, SmoothMarginalToGaussian)
-        assert m.marginal == "smooth"
+        assert isinstance(unwrap(bij), SmoothMarginalToGaussian)
 
 
 def test_guards():
+    """An out-of-range tail_alpha is refused at fit time, naming the column."""
     chain = _testbed_chain(600)
-    with pytest.raises(ValueError, match="tail_alpha"):
-        normalizing_flows_fit(chain, marginal="smooth",
-                              tail_extension=True, max_epochs=1)
-    with pytest.raises(ValueError, match="tail_alpha"):
-        normalizing_flows_fit(chain, marginal="smooth",
-                              tail_model="gpd", max_epochs=1)
-    with pytest.raises(ValueError, match="marginal"):
-        normalizing_flows_fit(chain, marginal="nope", max_epochs=1)
-
-
-def test_default_marginal_warns_when_it_discards_tail_alpha():
-    """``tail_alpha`` is consumed only by ``marginal="smooth"``. Requesting a
-    legacy tail model *explicitly* alongside it raises (see ``test_guards``),
-    but leaving ``marginal`` at its default silently resolved to ``"rqs"`` and
-    dropped ``tail_alpha`` on the floor."""
-    chain = _testbed_chain(600)
-    with pytest.warns(UserWarning, match="tail_alpha=2.0 is ignored"):
-        flow = normalizing_flows_fit(chain, tail_extension=True, tail_alpha=2.0,
-                                     max_epochs=1, show_progress=False)
-    from paramax import unwrap
-    assert all(str(unwrap(b.marginal)) == "rqs" for b in flow.bijection.bijections)
-
-    # the default tail_alpha is not "discarded" in any meaningful sense
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", UserWarning)
-        normalizing_flows_fit(chain, tail_extension=True, max_epochs=1,
+    with pytest.raises(ValueError, match=r"parameter \(column\) 0: tail_alpha must be in"):
+        normalizing_flows_fit(chain, tail_alpha=-0.5, max_epochs=1,
                               show_progress=False)
-
-
-def test_legacy_marginals_still_available():
-    chain = _testbed_chain(1500)
-    finite = np.array([[0., 1.], [-6., 6.], [-6., 6.], [-2., 2.]])
-    flow = normalizing_flows_fit(chain, prior_bounds=finite,
-                                 marginal="rqs",
-                                 max_epochs=2, show_progress=False)
-    assert np.all(np.isfinite(log_prob(flow, chain[:50])))
 
 
 # ---------------------------------------------------------------------------
