@@ -330,21 +330,17 @@ hdr = compute_injection_hdr(posterior_samples, true_params)
 # 2D batch of injections. Injections outside the sample support return 1.0.
 ```
 
-**For P-P plots, pass `reference="held_out"`.** The default,
-`reference="flow"`, ranks the injection against fresh draws from the *fitted*
-density, so any error in the fit shows up as a bias in the credibility on top of
-whatever miscalibration you are trying to measure — and it biases upward. On the
-most benign case there is (1-D standard normal: `samples` of n rows and then
-8000 injections drawn in turn from `default_rng(s)`, `num_samples=40000`,
-`rng_seed=s`, s = 0–3) the mean credibility is 0.569–0.576 at n=1500
-instead of 0.5, falling to 0.518–0.530 at n=6000. With `reference="held_out"`
-the flow is fitted on half the rows and the injection is ranked against the
-other half; both sides are then posterior draws, their ranks are uniform for
-*any* fitted density, and the same measurement gives 0.499–0.526 and
-0.495–0.502. The cost is a reference set of `n_samples // 2` points rather than
-`num_samples`, so a single call is noisier — that noise averages away over the
-events of a calibration study, and the `"flow"` offset does not. The full
-protocol and a KS-distance table are in `compute_injection_hdr`'s Notes.
+The flow is fitted on a random half of the samples and the injection is ranked
+against the other half. Those reference points are posterior draws the fit
+never saw, so for calibrated inference the injection's rank is uniform for
+*any* fitted density, and only genuine miscalibration bends a P-P plot. Ranking
+against fresh draws from the fitted flow instead, as coppuccino 1.0.0 did, lets
+error in the fit bias the credibility upward: on a 1-D standard normal with
+n=1500 samples (seeds 0–3) the mean credibility was 0.569–0.576 instead of 0.5,
+against 0.499–0.526 for the held-out reference. The cost is a noisier single
+call — the flow sees half the rows and ranks against the other half — and that
+noise averages away over the events of a calibration study. `samples` needs at
+least 40 rows.
 
 ## Marginal transforms
 

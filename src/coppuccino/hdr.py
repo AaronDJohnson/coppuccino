@@ -2,7 +2,7 @@ import numpy as np
 import numpy.typing as npt
 from flowjax.distributions import Transformed
 
-from coppuccino.copula_flows import log_prob, normalizing_flows_fit, sample_and_log_prob
+from coppuccino.copula_flows import log_prob, normalizing_flows_fit
 
 __all__ = ["compute_injection_hdr", "check_in_support"]
 
@@ -132,32 +132,18 @@ def check_in_support(samples: npt.ArrayLike, injection_params: npt.ArrayLike) ->
 
 
 def _reference_log_probs(
-    samples: np.ndarray,
-    num_samples: int,
-    rng_seed: int,
-    reference: str,
-    nf_kwargs: dict,
+    samples: np.ndarray, rng_seed: int, nf_kwargs: dict
 ) -> tuple[Transformed, np.ndarray]:
-    """Fit the flow and return it with the sorted reference log-density sample.
+    """Fit the flow on half the rows; score and sort the other half.
 
-    ``reference="flow"`` ranks against draws from the fitted density itself;
-    ``reference="held_out"`` fits on half the posterior rows and ranks against
-    the other half, which is what makes the credibility unbiased (see the
-    ``compute_injection_hdr`` Notes).
+    Ranking against the half the fit never saw is what makes the credibility
+    unbiased (see the ``compute_injection_hdr`` Notes).
     """
-    if reference == "flow":
-        flow = normalizing_flows_fit(samples, rng_seed=rng_seed, **nf_kwargs)
-        _, reference_log_probs = sample_and_log_prob(
-            flow, n_samples=num_samples, rng_seed=rng_seed
-        )
-        return flow, np.sort(np.asarray(reference_log_probs, dtype=float))
-
     if len(samples) < 2 * _MIN_CROSS_FIT_HALF:
         raise ValueError(
-            "reference='held_out' splits samples into a fit half and a reference "
+            "compute_injection_hdr splits samples into a fit half and a reference "
             f"half, so it needs at least {2 * _MIN_CROSS_FIT_HALF} rows; samples "
-            f"has {len(samples)}. Pass more posterior samples or use "
-            "reference='flow'."
+            f"has {len(samples)}."
         )
     order = np.random.default_rng(rng_seed).permutation(len(samples))
     fit_rows, held_out_rows = np.split(samples[order], [len(samples) // 2])
@@ -165,42 +151,35 @@ def _reference_log_probs(
     return flow, np.sort(np.asarray(log_prob(flow, held_out_rows), dtype=float))
 
 
-def compute_injection_hdr(samples: npt.ArrayLike, injection_params: npt.ArrayLike, num_samples: int = 100_000, rng_seed: int = 999, return_flow: bool = False, reference: str = "flow", **nf_kwargs):
+def compute_injection_hdr(samples: npt.ArrayLike, injection_params: npt.ArrayLike, *, rng_seed: int = 999, return_flow: bool = False, **nf_kwargs):
     """
     Compute Highest Density Region (HDR) credibility for injection parameters.
 
-    The HDR credibility is the fraction of a reference set of points that have
-    equal or higher probability density, under the fitted flow, than the
-    injection parameters (so a point at the mode scores near 0 and a point in
-    the tails near 1). This metric is used to validate Bayesian inference: if
-    the inference is well-calibrated, HDR values should be uniformly
-    distributed between 0 and 1.
+    The flow is fitted on a random half of ``samples``, and the HDR
+    credibility is the fraction of the *other* half that has equal or higher
+    probability density, under that flow, than the injection parameters (so a
+    point at the mode scores near 0 and a point in the tails near 1). This
+    metric is used to validate Bayesian inference: if the inference is
+    well-calibrated, HDR values should be uniformly distributed between 0 and
+    1.
 
     Parameters
     ----------
     samples : array_like
-        Posterior samples from inference, shape (n_samples, n_params).
+        Posterior samples from inference, shape (n_samples, n_params), with
+        at least 40 rows.
     injection_params : array_like
         True parameter values to evaluate. Can be:
         - 1D array of shape (n_params,) for a single injection
         - 2D array of shape (n_injections, n_params) for multiple injections
-    num_samples : int, optional
-        Number of samples to draw from fitted flow for HDR computation.
-        Default is 100,000. Used only by ``reference="flow"``.
     rng_seed : int, optional
-        Seed used for *both* fitting the flow and building the reference set
-        (the Monte Carlo draw, or the cross-fit split). Default is 999. Vary it
-        to assess the Monte Carlo error of the HDR estimate, or to decouple a
-        calibration study from a single fixed seed.
+        Keyword-only. Seed for *both* the split into fit and reference halves
+        and the flow fit. Default is 999. Vary it to assess the Monte Carlo
+        error of the HDR estimate, or to decouple a calibration study from a
+        single fixed seed.
     return_flow : bool, optional
-        If True, return the fitted flow along with HDR values. Default is False.
-    reference : {"flow", "held_out"}, optional
-        Which reference set the injection's density is ranked against.
-        ``"flow"`` (default) draws ``num_samples`` points from the fitted flow.
-        ``"held_out"`` fits the flow on a random half of ``samples`` and ranks
-        against the other half; this is the unbiased estimator (see Notes), at
-        the cost of a reference set of ``n_samples // 2`` points instead of
-        ``num_samples``. The split is a deterministic function of ``rng_seed``.
+        Keyword-only. If True, return the fitted flow along with HDR values.
+        Default is False.
     **nf_kwargs : dict, optional
         Additional keyword arguments passed to `normalizing_flows_fit`.
         Common options include:
@@ -214,23 +193,24 @@ def compute_injection_hdr(samples: npt.ArrayLike, injection_params: npt.ArrayLik
     -------
     hdrs : np.ndarray
         HDR credibility values. Shape (1,) for single injection or
-        (n_injections,) for multiple injections. Values range from 0 to 1.
-        Any injection lying outside the coordinate-wise support of ``samples``
-        is assigned exactly ``1.0`` without evaluating the flow (see Notes).
+        (n_injections,) for multiple injections. Values range from 0 to 1 in
+        steps of ``1 / (n_samples - n_samples // 2)``, the size of the
+        reference half. Any injection lying outside the coordinate-wise
+        support of ``samples`` is assigned exactly ``1.0`` without evaluating
+        the flow (see Notes).
     flow : Transformed, optional
-        Fitted copula flow (only returned if return_flow=True). With
-        ``reference="held_out"`` this is the flow fitted on half of ``samples``.
+        The flow fitted on the fit half of ``samples`` (only returned if
+        return_flow=True).
 
     Raises
     ------
     ValueError
         If ``samples`` or ``injection_params`` contain NaN or Inf values, if
-        ``samples`` is not 2D, if ``injection_params`` is a scalar or has more
-        than two dimensions, if its parameter count does not match ``samples``,
-        if ``num_samples`` is not a positive integer, or if ``reference`` is
-        not one of the two supported values.
+        ``samples`` is not 2D or has fewer than 40 rows, if
+        ``injection_params`` is a scalar or has more than two dimensions, or
+        if its parameter count does not match ``samples``.
     RuntimeError
-        If the fitted flow scores its own reference set, or any in-support
+        If the fitted flow scores the reference half, or any in-support
         injection, non-finitely, which is what a diverged fit looks like (see
         Notes).
 
@@ -242,20 +222,18 @@ def compute_injection_hdr(samples: npt.ArrayLike, injection_params: npt.ArrayLik
     >>> true_params = np.array([1.0, 2.0])
     >>> posterior = np.random.randn(1000, 2) + true_params
     >>> # Compute HDR for true parameters
-    >>> hdr = compute_injection_hdr(posterior, true_params, num_samples=50000)
+    >>> hdr = compute_injection_hdr(posterior, true_params)
     >>> # hdr[0] is a single value in [0, 1]; for an injection near the
     >>> # posterior peak it is small (close to 0), approaching 1 in the tails.
 
     >>> # Multiple injections
     >>> injections = np.array([[1.0, 2.0], [1.5, 2.5], [0.5, 1.5]])
-    >>> hdrs = compute_injection_hdr(posterior, injections, num_samples=50000)
+    >>> hdrs = compute_injection_hdr(posterior, injections)
     >>> hdrs.shape
     (3,)
 
     >>> # Return fitted flow for reuse
-    >>> hdrs, flow = compute_injection_hdr(
-    ...     posterior, true_params, num_samples=50000, return_flow=True
-    ... )
+    >>> hdrs, flow = compute_injection_hdr(posterior, true_params, return_flow=True)
 
     Notes
     -----
@@ -265,74 +243,34 @@ def compute_injection_hdr(samples: npt.ArrayLike, injection_params: npt.ArrayLik
               / (# of reference points)
 
     For well-calibrated Bayesian inference, HDR values should follow a uniform
-    distribution U(0, 1). Deviations indicate miscalibration or model
-    misspecification -- *and*, with the default ``reference="flow"``, error in
-    the fitted density itself.
+    distribution U(0, 1), and deviations indicate miscalibration. Because the
+    reference points are posterior draws the fit never saw, an injection drawn
+    from the posterior is exchangeable with them, so its rank is uniform for
+    *any* fitted density: error in the fit costs resolution but does not bend
+    a P-P plot. Ranking against fresh draws from the fitted flow instead, as
+    coppuccino 1.0.0 did, compares draws from two different laws whenever the
+    fit is imperfect, and biases HDR upward. On a 1-D standard normal with
+    n = 1500 samples that bias gave a mean HDR of 0.569-0.576 over seeds 0-3,
+    against 0.499-0.526 for the held-out reference.
 
-    That last term is a real bias, not Monte Carlo noise. ``reference="flow"``
-    ranks an injection drawn from the true law against draws from the *fitted*
-    law, so the two sides of the comparison come from different distributions
-    whenever the fit is imperfect, and the mismatch pushes HDR up. Measured on
-    the most benign case available -- 1-D standard normal, ``samples`` of n
-    rows and then 8000 injections, both drawn in turn from
-    ``default_rng(seed)``, ``num_samples=40000``, ``rng_seed`` equal to the
-    data seed, otherwise default fit settings, over seeds 0-3 -- the mean HDR
-    (0.5 if unbiased) and the KS distance from U(0, 1) were:
+    The price is a noisier single call: the flow is fitted on only half the
+    rows, and the reference half holds only ``n_samples // 2`` points (one more
+    for odd ``n_samples``). That noise averages away over the events of a
+    calibration study, and a fit bias does not.
 
-    - n = 1500, ``reference="flow"``: mean 0.569-0.576, KS 0.113-0.121;
-      ``reference="held_out"``: mean 0.499-0.526, KS 0.024-0.058.
-    - n = 6000, ``reference="flow"``: mean 0.518-0.530, KS 0.041-0.056;
-      ``reference="held_out"``: mean 0.495-0.502, KS 0.011-0.020.
-
-    A control that ranks the same injections by their *true* density against
-    40000 further draws of that generator -- the same ranking machinery with no
-    fitted density anywhere -- scores mean 0.503-0.508 (KS 0.009-0.016) over
-    those same four seeds at n=1500, confirming the machinery itself is sound
-    and that the offset belongs to the fit. The residual spread of the held-out column is
-    Monte Carlo from its own reference draw: that set holds only n/2 points,
-    and the seed-to-seed spread of its mean was 0.027 at n=1500 against 0.007
-    at n=6000. It averages away over the events of a calibration study,
-    whereas the ``"flow"`` offset does not. The bias shrinks as the fit
-    improves, so it is worst exactly where posteriors are thinnest; n=1500 is
-    the scale of this package's own examples. Prefer ``reference="held_out"``
-    when the output is a P-P plot: both the injection and the reference points
-    are then draws from the posterior, so their ranks are uniform for *any*
-    fitted density, and only genuine miscalibration bends the curve.
-
-    Injections outside the coordinate-wise min/max hull of ``samples`` are a
-    special case: they are short-circuited to HDR = 1.0 by convention, using
-    the same test as ``check_in_support`` and without evaluating the flow at
-    that point (the flow itself is still fitted). Under the default smooth-tail
-    marginals the flow assigns finite, smoothly decaying density beyond the
-    data hull, so the flow-based HDR of such a point is *not* generally close
-    to 1.0. What sets the gap is the shape the fitted marginal happens to take
-    at its outermost knot, not how far outside the point lies. Measured on
-    ``default_rng(s).standard_normal((300, 2))`` for s in 0-3, fitted with
-    default settings and ranked against the same 40000 draws the call itself
-    uses (``num_samples=40000``, ``rng_seed=s``): probes placed 1e-3 outside
-    the dimension-0 hull, with the other coordinate swept over the 1st-99th
-    percentile of its own column, fell short of 1.0 by a median of 0.018,
-    0.025, 0.348 and 0.478 on the four seeds, the worst single probe by 0.98.
-    The two large seeds are the two whose top two order statistics nearly
-    coincide -- gaps of 0.005 and 0.018 there, against 0.65 and 0.68 on the
-    other two. The fitted marginal packs the mass of that near-tie into a very
-    short interval, so the density just past the sample maximum stays
-    comparable to the bulk: on those two seeds the probe's log-density sits
-    0.33 above and 0.28 below the median log-density of the flow's own 40000
-    draws, against 5.3 and 3.0 nats below it on the other two, which is why it
-    ranks near the middle of them (median HDR 0.52 and 0.65). The feature is
-    local rather than a plateau: moving outward along dimension 0, the density
-    drops 5 nats below its value at the sample maximum within a further
-    0.019-0.084 on those two seeds, at each of the 1st, 25th, 50th, 75th and
-    99th percentiles of the other coordinate. Nor is it a global peak -- that
-    same conditional density still peaks near the mode, 2.4-3.1 below the
-    sample maximum. Undertraining makes the whole picture worse: the same
-    probes at ``max_epochs=5, patience=2`` fell short by a median of 0.079 to
-    0.967 across those seeds. So the sentinel is
-    not a close approximation to what the flow would have said; when building
-    a calibration (P-P) plot, treat these exact-1.0 values as conservative
-    sentinels rather than density-based results, and count how many of them
-    you have.
+    Injections outside the coordinate-wise min/max hull of ``samples`` (all of
+    it, not only the fit half) are a special case: they are short-circuited to
+    HDR = 1.0 by convention, using the same test as ``check_in_support`` and
+    without evaluating the flow at that point (the flow itself is still
+    fitted). This is a sentinel, not an approximation of what the flow would
+    have said. The default smooth-tail marginals assign finite, smoothly
+    decaying density beyond the data hull, and where a coordinate's largest
+    order statistics nearly coincide the fitted marginal packs their mass into
+    a very short interval, so the density just past the sample maximum can stay
+    comparable to the bulk and such a point would rank near the middle. When
+    building a calibration (P-P) plot, treat these exact-1.0 values as
+    conservative sentinels rather than density-based results, and count how
+    many of them you have.
 
     A diverged fit (typically an over-large ``learning_rate``) produces NaN
     log-densities, and both sides of the ranking are guarded because NaN fails
@@ -348,7 +286,7 @@ def compute_injection_hdr(samples: npt.ArrayLike, injection_params: npt.ArrayLik
     Adjust them based on your data characteristics:
     - Increase `flow_layers` for more complex dependencies
     - Increase `max_epochs` if training hasn't converged
-    - Increase `knots` for more flexible marginal transformations
+    - Increase `knots` for a more flexible copula
     """
     samples = _as_sample_matrix(samples)
     injection_params = np.asarray(injection_params, dtype=float)
@@ -367,14 +305,7 @@ def compute_injection_hdr(samples: npt.ArrayLike, injection_params: npt.ArrayLik
     # laundered into the out-of-support sentinel and read as a valid 1.0.
     _require_finite(injection_params, "injection_params")
 
-    if not isinstance(num_samples, (int, np.integer)) or num_samples < 1:
-        raise ValueError(f"num_samples must be a positive integer; got {num_samples!r}.")
-    if reference not in ("flow", "held_out"):
-        raise ValueError(f"reference must be 'flow' or 'held_out'; got {reference!r}.")
-
-    flow, sorted_reference_log_probs = _reference_log_probs(
-        samples, num_samples, rng_seed, reference, nf_kwargs
-    )
+    flow, sorted_reference_log_probs = _reference_log_probs(samples, rng_seed, nf_kwargs)
     n_reference = len(sorted_reference_log_probs)
     non_finite_reference = int((~np.isfinite(sorted_reference_log_probs)).sum())
     if non_finite_reference:

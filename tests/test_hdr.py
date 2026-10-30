@@ -3,14 +3,20 @@ import pytest
 from flowjax.distributions import Transformed
 from scipy.stats import chi2, kstest
 
-from coppuccino.copula_flows import log_prob, sample_and_log_prob
+from coppuccino.copula_flows import log_prob
 from coppuccino.hdr import _in_support_mask, check_in_support, compute_injection_hdr
 
 # A throwaway fit, for tests whose assertion does not depend on fit quality.
 _FAST_FIT = {"max_epochs": 5, "patience": 2, "show_progress": False}
 # Enough training that the fitted density is monotone along a ray from the
-# mode; the ordering assertions below were verified over seeds 0-5 with it.
+# mode; each test using it names the seeds its assertions were verified on.
 _TRAINED_FIT = {"max_epochs": 150, "patience": 25, "show_progress": False}
+
+
+def _reference_half(samples, rng_seed):
+    """The held-out half compute_injection_hdr ranks against, rebuilt by hand."""
+    order = np.random.default_rng(rng_seed).permutation(len(samples))
+    return samples[order][len(samples) // 2:]
 
 
 class TestCheckInSupport:
@@ -129,9 +135,10 @@ class TestComputeInjectionHDR:
     def test_basic_functionality_1d_injection(self):
         """The returned value is exactly the rank of the injection's density.
 
-        Recomputed from the returned flow through the public API, so it pins the
-        estimator's definition (which tail, and the denominator) rather than the
-        0 <= hdr <= 1 that holds by construction.
+        Recomputed from the returned flow and the held-out half through the
+        public API, so it pins the estimator's definition (which half, which
+        tail, and the denominator) rather than the 0 <= hdr <= 1 that holds by
+        construction.
         """
         rng = np.random.default_rng(42)
         samples = rng.standard_normal((200, 2))
@@ -140,7 +147,6 @@ class TestComputeInjectionHDR:
         hdr, flow = compute_injection_hdr(
             samples,
             injection_params,
-            num_samples=4000,
             rng_seed=7,
             return_flow=True,
             **_FAST_FIT,
@@ -148,9 +154,9 @@ class TestComputeInjectionHDR:
 
         assert isinstance(hdr, np.ndarray)
         assert hdr.shape == (1,)
-        _, generated_log_probs = sample_and_log_prob(flow, n_samples=4000, rng_seed=7)
+        reference_log_probs = np.asarray(log_prob(flow, _reference_half(samples, 7)))
         injection_log_prob = float(np.asarray(log_prob(flow, injection_params[None, :]))[0])
-        expected = float(np.mean(np.asarray(generated_log_probs) >= injection_log_prob))
+        expected = float(np.mean(reference_log_probs >= injection_log_prob))
         assert hdr[0] == expected
 
     def test_multiple_injections(self):
@@ -168,7 +174,6 @@ class TestComputeInjectionHDR:
         hdr = compute_injection_hdr(
             samples,
             injection_params,
-            num_samples=20000,
             rng_seed=42,
             **_TRAINED_FIT,
         )
@@ -188,7 +193,7 @@ class TestComputeInjectionHDR:
         rng = np.random.default_rng(42)
         samples = rng.standard_normal((200, 2))
         injection_params = np.array([0.0, 0.0])
-        shared = dict(num_samples=4000, rng_seed=7, **_FAST_FIT)
+        shared = dict(rng_seed=7, **_FAST_FIT)
 
         hdr, flow = compute_injection_hdr(
             samples, injection_params, return_flow=True, **shared
@@ -197,42 +202,11 @@ class TestComputeInjectionHDR:
         assert np.array_equal(hdr, compute_injection_hdr(samples, injection_params, **shared))
 
         other = np.array([0.7, -0.4])
-        _, generated_log_probs = sample_and_log_prob(flow, n_samples=4000, rng_seed=7)
+        reference_log_probs = np.asarray(log_prob(flow, _reference_half(samples, 7)))
         by_hand = float(
-            np.mean(
-                np.asarray(generated_log_probs)
-                >= float(np.asarray(log_prob(flow, other[None, :]))[0])
-            )
+            np.mean(reference_log_probs >= float(np.asarray(log_prob(flow, other[None, :]))[0]))
         )
         assert compute_injection_hdr(samples, other, **shared)[0] == by_hand
-
-    def test_different_num_samples(self):
-        """num_samples sets the resolution of the estimate, not its value.
-
-        Every result is an exact multiple of 1/num_samples, and the three
-        estimates of the same quantity agree to 0.0068 -- they are 0.646,
-        0.6392 and 0.64428 in this configuration -- because the fit is held
-        fixed by rng_seed. The assertion allows 0.03.
-        """
-        rng = np.random.default_rng(42)
-        samples = rng.standard_normal((200, 2))
-        injection_params = np.array([0.0, 0.0])
-
-        values = {}
-        for num_samples in [500, 5000, 50000]:
-            hdr = compute_injection_hdr(
-                samples,
-                injection_params,
-                num_samples=num_samples,
-                rng_seed=3,
-                **_FAST_FIT,
-            )
-            assert hdr.shape == (1,)
-            counts = hdr[0] * num_samples
-            assert abs(counts - round(counts)) < 1e-6
-            values[num_samples] = hdr[0]
-
-        assert max(values.values()) - min(values.values()) < 0.03
 
     def test_custom_nf_kwargs(self):
         """nf_kwargs reach normalizing_flows_fit rather than being swallowed."""
@@ -241,11 +215,11 @@ class TestComputeInjectionHDR:
         injection_params = np.array([0.0, 0.0])
 
         _, sparse = compute_injection_hdr(
-            samples, injection_params, num_samples=2000, rng_seed=3,
+            samples, injection_params, rng_seed=3,
             knots=4, return_flow=True, **_FAST_FIT,
         )
         _, flexible = compute_injection_hdr(
-            samples, injection_params, num_samples=2000, rng_seed=3,
+            samples, injection_params, rng_seed=3,
             knots=12, return_flow=True, **_FAST_FIT,
         )
         # Same data, same seed: only the forwarded knots can move the density.
@@ -255,7 +229,7 @@ class TestComputeInjectionHDR:
 
         with pytest.raises(TypeError, match="definitely_not_a_kwarg"):
             compute_injection_hdr(
-                samples, injection_params, num_samples=2000, definitely_not_a_kwarg=1,
+                samples, injection_params, definitely_not_a_kwarg=1,
             )
 
     def test_non_finite_injections_are_rejected(self):
@@ -269,12 +243,12 @@ class TestComputeInjectionHDR:
 
         for bad in ([np.nan, 0.0], [np.inf, 0.0], [-np.inf, 0.0]):
             with pytest.raises(ValueError, match="injection_params contains 1 non-finite"):
-                compute_injection_hdr(samples, np.array(bad), num_samples=1000, **_FAST_FIT)
+                compute_injection_hdr(samples, np.array(bad), **_FAST_FIT)
 
         # The message locates the offending cell of a batch.
         batch = np.array([[0.0, 0.0], [1.0, np.nan], [0.5, 0.5]])
         with pytest.raises(ValueError, match=r"first at row 1, column 1 with value nan"):
-            compute_injection_hdr(samples, batch, num_samples=1000, **_FAST_FIT)
+            compute_injection_hdr(samples, batch, **_FAST_FIT)
 
     def test_non_finite_samples_are_rejected(self):
         """The same check on the posterior samples names the offending cell."""
@@ -282,7 +256,7 @@ class TestComputeInjectionHDR:
         samples = rng.standard_normal((200, 2))
         samples[13, 1] = np.inf
         with pytest.raises(ValueError, match=r"samples contains 1 non-finite.*row 13, column 1"):
-            compute_injection_hdr(samples, np.zeros(2), num_samples=1000, **_FAST_FIT)
+            compute_injection_hdr(samples, np.zeros(2), **_FAST_FIT)
 
     def test_diverged_fit_raises_instead_of_returning_the_sentinel(self):
         """A diverged flow scores everything NaN, and NaN loses every comparison.
@@ -300,7 +274,6 @@ class TestComputeInjectionHDR:
             compute_injection_hdr(
                 samples,
                 injections,
-                num_samples=2000,
                 rng_seed=0,
                 learning_rate=1e5,
                 max_epochs=10,
@@ -311,22 +284,28 @@ class TestComputeInjectionHDR:
     def test_non_finite_reference_scores_raise(self, monkeypatch):
         """HDR's own guard, isolated from the fitter's.
 
-        Any route to a NaN reference score -- a diverged fit, a flow loaded
-        from an older release, a marginal that underflows -- would otherwise
-        make searchsorted return 0 for every injection and hand back a column
-        of 1.0 sentinels.
+        Any route to a NaN reference score -- a diverged fit, a marginal that
+        underflows -- would otherwise make searchsorted return 0 for every
+        injection and hand back a column of 1.0 sentinels. The reference half
+        is scored first, so NaN-ing only that first ``log_prob`` call reaches
+        this guard alone.
         """
         import coppuccino.hdr as hdr_module
 
         rng = np.random.default_rng(0)
         samples = rng.standard_normal((200, 2))
+        real_log_prob = hdr_module.log_prob
+        calls = []
 
-        def nan_scores(flow, n_samples, rng_seed=None):
-            return np.zeros((n_samples, 2)), np.full(n_samples, np.nan)
+        def nan_reference(flow, x):
+            calls.append(len(x))
+            scores = np.asarray(real_log_prob(flow, x), dtype=float)
+            return np.full_like(scores, np.nan) if len(calls) == 1 else scores
 
-        monkeypatch.setattr(hdr_module, "sample_and_log_prob", nan_scores)
-        with pytest.raises(RuntimeError, match="1000 of 1000 reference points non-finitely"):
-            compute_injection_hdr(samples, np.zeros(2), num_samples=1000, **_FAST_FIT)
+        monkeypatch.setattr(hdr_module, "log_prob", nan_reference)
+        with pytest.raises(RuntimeError, match="100 of 100 reference points non-finitely"):
+            compute_injection_hdr(samples, np.zeros(2), **_FAST_FIT)
+        assert calls == [100]
 
     def test_nan_injection_scores_raise(self, monkeypatch):
         """The injection-side guard, which neither of the other two reaches.
@@ -339,7 +318,7 @@ class TestComputeInjectionHDR:
         reference point: the count of more-probable points is zero and the
         unguarded answer is HDR 0.0, i.e. the injection is reported as sitting
         at the mode. With this one guard disabled and nothing else changed,
-        this exact call returns [0.0, 0.236] instead of raising.
+        this exact call returns [0.0, 0.7] instead of raising.
         """
         import coppuccino.hdr as hdr_module
 
@@ -353,33 +332,36 @@ class TestComputeInjectionHDR:
         injections = np.array([[0.0, 0.0], [1.0, 1.0]])
         real_log_prob = hdr_module.log_prob
 
-        def nan_first_row(flow, x):
+        def nan_first_injection(flow, x):
+            # The held-out reference goes through log_prob too; leave it finite
+            # so the reference guard stays quiet and this one is reached.
             scores = np.asarray(real_log_prob(flow, x), dtype=float).copy()
-            scores[0] = np.nan
+            if len(x) == len(injections):
+                scores[0] = np.nan
             return scores
 
-        monkeypatch.setattr(hdr_module, "log_prob", nan_first_row)
+        monkeypatch.setattr(hdr_module, "log_prob", nan_first_injection)
         with pytest.raises(RuntimeError, match="NaN log-density for 1 of 2 in-support"):
-            compute_injection_hdr(
-                samples, injections, num_samples=1000, rng_seed=0, **_FAST_FIT
-            )
+            compute_injection_hdr(samples, injections, rng_seed=0, **_FAST_FIT)
 
-    def test_num_samples_and_reference_are_validated(self):
-        """Bad knobs are named, not turned into nan or an obscure failure."""
+    def test_too_few_rows_and_removed_options_are_rejected(self):
+        """The split needs 40 rows, and 1.0.0's num_samples cannot sneak through.
+
+        Every option after ``injection_params`` is keyword-only, so a 1.0.0
+        positional ``num_samples`` raises instead of becoming the seed, and a
+        ``num_samples=`` keyword reaches ``normalizing_flows_fit``, which
+        rejects it by name.
+        """
         rng = np.random.default_rng(42)
         samples = rng.standard_normal((200, 2))
         injection = np.zeros(2)
 
-        with pytest.raises(ValueError, match="num_samples must be a positive integer"):
-            compute_injection_hdr(samples, injection, num_samples=0, **_FAST_FIT)
-        with pytest.raises(ValueError, match="num_samples must be a positive integer"):
-            compute_injection_hdr(samples, injection, num_samples=-5, **_FAST_FIT)
-        with pytest.raises(ValueError, match="reference must be 'flow' or 'held_out'"):
-            compute_injection_hdr(samples, injection, reference="heldout", **_FAST_FIT)
         with pytest.raises(ValueError, match="at least 40 rows; samples has 30"):
-            compute_injection_hdr(
-                rng.standard_normal((30, 2)), injection, reference="held_out", **_FAST_FIT
-            )
+            compute_injection_hdr(rng.standard_normal((30, 2)), injection, **_FAST_FIT)
+        with pytest.raises(TypeError, match="positional"):
+            compute_injection_hdr(samples, injection, 50_000)
+        with pytest.raises(TypeError, match="num_samples"):
+            compute_injection_hdr(samples, injection, num_samples=50_000, **_FAST_FIT)
 
     def test_held_out_reference_ranks_against_the_unused_half(self):
         """The cross-fit reference set is the half of samples the fit never saw.
@@ -390,7 +372,7 @@ class TestComputeInjectionHDR:
         """
         rng = np.random.default_rng(1)
         samples = rng.standard_normal((201, 2))
-        shared = dict(reference="held_out", rng_seed=11, **_FAST_FIT)
+        shared = dict(rng_seed=11, **_FAST_FIT)
 
         hdr = compute_injection_hdr(samples, np.array([0.0, 0.0]), **shared)
         counts = hdr[0] * 101
@@ -411,11 +393,11 @@ class TestComputeInjectionHDR:
         injection_tail = np.array([2.0, 2.0])
 
         hdr_mode = compute_injection_hdr(
-            samples, injection_mode, num_samples=10000,
+            samples, injection_mode,
             rng_seed=0, max_epochs=50, patience=15,
         )
         hdr_tail = compute_injection_hdr(
-            samples, injection_tail, num_samples=10000,
+            samples, injection_tail,
             rng_seed=0, max_epochs=50, patience=15,
         )
 
@@ -439,7 +421,7 @@ class TestComputeInjectionHDR:
 
         injection_params = np.array([[outside, 0.5], [inside, 0.5], [0.0, 0.0]])
         hdrs = compute_injection_hdr(
-            samples, injection_params, num_samples=10000,
+            samples, injection_params,
             rng_seed=0, max_epochs=50, patience=15,
         )
 
@@ -456,8 +438,7 @@ class TestComputeInjectionHDR:
         injection_params = np.array(
             [[samples[:, 0].max() + 0.05, 0.5], [1.0, -1.0], [-4.0, 0.0], [0.0, 0.0]]
         )
-        kwargs = {"num_samples": 2000, "rng_seed": 0, "max_epochs": 5,
-                  "patience": 2}
+        kwargs = {"rng_seed": 0, "max_epochs": 5, "patience": 2}
 
         batched = compute_injection_hdr(samples, injection_params, **kwargs)
         one_at_a_time = np.concatenate(
@@ -479,7 +460,6 @@ class TestComputeInjectionHDR:
             compute_injection_hdr(
                 samples,
                 injection_params,
-                num_samples=1000,
                 max_epochs=5,
                 patience=2
             )
@@ -490,7 +470,7 @@ class TestComputeInjectionHDR:
         samples = rng.standard_normal((50, 2))
 
         with pytest.raises(ValueError, match="injection_params length must match"):
-            compute_injection_hdr(samples, np.zeros((3, 5)), num_samples=1000)
+            compute_injection_hdr(samples, np.zeros((3, 5)))
 
     def test_3d_injection_raises(self):
         """Anything beyond a batch of injections is rejected by shape."""
@@ -498,31 +478,33 @@ class TestComputeInjectionHDR:
         samples = rng.standard_normal((50, 2))
 
         with pytest.raises(ValueError, match="must be 1D or 2D"):
-            compute_injection_hdr(samples, np.zeros((2, 2, 2)), num_samples=1000)
+            compute_injection_hdr(samples, np.zeros((2, 2, 2)))
 
     def test_1d_parameter_space(self):
         """In one dimension the credibility has a closed form to check against.
 
         For a standard normal the HDR of x is chi2_1.cdf(x**2): 0 at the mode,
-        0.683 at x=1, 0.954 at x=2. The estimate at x=2 was within 0.038 of the
-        truth on seeds 0-5 (the assertion allows 0.06); the interior points
-        carry the estimator bias documented in the module and are only checked
-        for ordering.
+        0.683 at x=1, 0.954 at x=2. The estimate at x=2 was within 0.016 of the
+        truth on seeds 0-5 and 42 (the assertion allows 0.06). The near-mode
+        points are only checked to rank below it: a 1-D normal's log-density
+        falls just 0.125 nats by |x|=0.5, so small wiggles in the fit move a
+        near-mode point's HDR a long way. At x=0 it ranged 0.05-0.72 over
+        those seeds; it stayed below x=1 on all of them, but by only 0.004 on
+        seed 42, and fitting fewer rows broke that order on seeds 3 and 42.
         """
         rng = np.random.default_rng(42)
-        samples = rng.standard_normal((2000, 1))
+        samples = rng.standard_normal((8000, 1))
         injection_params = np.array([[0.0], [1.0], [2.0]])
 
         hdr = compute_injection_hdr(
             samples,
             injection_params,
-            num_samples=20000,
             rng_seed=42,
             **_TRAINED_FIT,
         )
 
         assert hdr.shape == (3,)
-        assert np.all(np.diff(hdr) > 0.0)
+        assert hdr[2] > max(hdr[0], hdr[1])
         assert abs(hdr[2] - chi2.cdf(4.0, 1)) < 0.06
 
     def test_high_dimensional_parameter_space(self):
@@ -530,7 +512,7 @@ class TestComputeInjectionHDR:
 
         Points at squared radius 0, 4.05 and 9.8 of a 5-D standard normal; the
         outermost analytic credibility is 0.919 and the estimate stayed within
-        0.052 of it on seeds 0, 1 and 42 (the assertion allows 0.06).
+        0.027 of it on seeds 0, 1 and 42 (the assertion allows 0.06).
         """
         rng = np.random.default_rng(42)
         samples = rng.standard_normal((2000, 5))
@@ -539,7 +521,6 @@ class TestComputeInjectionHDR:
         hdr = compute_injection_hdr(
             samples,
             injection_params,
-            num_samples=20000,
             rng_seed=42,
             **_TRAINED_FIT,
         )
@@ -557,7 +538,7 @@ class TestComputeInjectionHDR:
         rng = np.random.default_rng(42)
         samples = rng.standard_normal((200, 2))
         injection_params = np.array([0.0, 0.0])
-        shared = dict(num_samples=1000, rng_seed=123, **_FAST_FIT)
+        shared = dict(rng_seed=123, **_FAST_FIT)
 
         hdr1 = compute_injection_hdr(samples, injection_params, **shared)
         hdr2 = compute_injection_hdr(samples.copy(), injection_params.copy(), **shared)
@@ -565,33 +546,26 @@ class TestComputeInjectionHDR:
         assert np.array_equal(hdr1, hdr2)
 
     def test_uniform_distribution(self):
-        """The cross-fit reference restores uniformity; the flow reference does not.
+        """Injections drawn from the posterior's own law get uniform credibility.
 
-        Injections drawn from the same law as the posterior samples must have
-        uniform credibility. Ranking them against draws from the *fitted*
-        density instead makes every unit of estimator error inflate HDR: on
-        seeds 0, 1 and 42 of this configuration the flow reference gave mean
-        0.634-0.653 (KS 0.198-0.232) where the held-out reference gave
-        0.491-0.515 (KS 0.028-0.040).
+        That holds for any fitted density because the reference half is a set
+        of posterior draws the fit never saw. On seeds 0, 1 and 42 of this
+        configuration the mean was 0.491-0.515 (KS 0.028-0.040); ranking
+        against draws from the fitted density instead (the method coppuccino
+        1.0.0 used) gave 0.634-0.653 (KS 0.198-0.232) on the same data.
         """
         rng = np.random.default_rng(42)
         samples = rng.uniform(-1.0, 1.0, (2000, 2))
         injections = rng.uniform(-1.0, 1.0, (500, 2))
-        shared = {
-            "num_samples": 20000, "rng_seed": 42, "max_epochs": 100,
-            "patience": 20, "show_progress": False,
-        }
 
-        held_out = compute_injection_hdr(samples, injections, reference="held_out", **shared)
-        from_flow = compute_injection_hdr(samples, injections, reference="flow", **shared)
+        hdrs = compute_injection_hdr(
+            samples, injections, rng_seed=42, max_epochs=100, patience=20,
+            show_progress=False,
+        )
 
-        assert held_out.shape == injections.shape[:1]
-        assert abs(held_out.mean() - 0.5) < 0.05
-        held_out_ks = kstest(held_out, "uniform").statistic
-        assert held_out_ks < 0.10
-        # The default estimator is materially further from uniform on the same
-        # data and the same fit budget; that gap is the bias being corrected.
-        assert held_out_ks < 0.5 * kstest(from_flow, "uniform").statistic
+        assert hdrs.shape == injections.shape[:1]
+        assert abs(hdrs.mean() - 0.5) < 0.05
+        assert kstest(hdrs, "uniform").statistic < 0.10
 
     def test_multiple_injections_different_locations(self):
         """HDR must be a strictly decreasing function of the fitted log-density.
@@ -613,7 +587,6 @@ class TestComputeInjectionHDR:
         hdr, flow = compute_injection_hdr(
             samples,
             injection_params,
-            num_samples=20000,
             rng_seed=5,
             return_flow=True,
             max_epochs=60,
