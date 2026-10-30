@@ -301,6 +301,10 @@ with `normalizing_flows_fit` if you need them.
 > deserializing it. Only load model files you produced yourself or obtained
 > from a source you trust.
 
+`load_flow` refuses files written by coppuccino 1.0.0. They recorded the
+training columns, not the marginal maps, and the marginals 1.0.0 built from
+them no longer exist. Refit the chain, or read the file under `coppuccino<2`.
+
 Key options to `normalizing_flows_fit` include `flow_layers` and `knots`
 (flow capacity), `max_epochs`, `learning_rate`, `patience` (training),
 `prior_bounds`, and `tail_alpha` (the marginal tails, below). See

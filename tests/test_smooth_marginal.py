@@ -462,20 +462,6 @@ def test_save_load_round_trip(smooth_flow):
     assert m.tail_alpha == 0.0 and m.prior_low == 0.0 and m.prior_high == 1.0
 
 
-def test_load_predates_tail_alpha_key():
-    """Files saved before tail_alpha existed reconstruct with the default."""
-    from coppuccino.model_io import _extract_spline_data, _reconstruct_empirical_transforms
-    chain = _testbed_chain(1500)
-    flow = normalizing_flows_fit(chain, prior_bounds=BOUNDS,
-                                 max_epochs=2,
-                                 show_progress=False)
-    data = _extract_spline_data(flow)
-    data.pop('tail_alpha')
-    stack = _reconstruct_empirical_transforms(data)
-    from paramax import unwrap
-    assert all(unwrap(b).tail_alpha == 0.0 for b in stack.bijections)
-
-
 def test_bounds_far_from_the_origin_with_a_wall_atom():
     """A bound whose magnitude dwarfs the span still builds a usable map.
 

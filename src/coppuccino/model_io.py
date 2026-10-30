@@ -30,7 +30,21 @@ __all__ = ["save_flow", "load_flow"]
 # read back through ``dict.get(key, <legacy default>)``, so an older writer's
 # file still loads correctly. Bump only when an older coppuccino would
 # silently MISREAD a newer file.
-FORMAT_VERSION = 1
+#
+# A copula-flow file stores its training columns, and load_flow rebuilds the
+# marginals from them with the current builder, so a change to that builder
+# silently changes every reloaded flow (a file from one pre-release build,
+# reloaded by a later one, moved its near-wall log_prob by 58 to 217 nats with
+# no warning).
+# Bump this whenever such a change lands, and raise _MIN_FLOW_FORMAT_VERSION
+# with it.
+FORMAT_VERSION = 2
+
+# Oldest copula-flow format load_flow rebuilds. Version 2 is the first written
+# by the smooth-only marginal builder; everything older came from coppuccino
+# 1.0.0 (whose 'rqs' / 'pchip' marginals no longer exist) or from a
+# pre-release build. Fleet files keep their own rule (see FleetFlow.load).
+_MIN_FLOW_FORMAT_VERSION = 2
 
 # ``kind`` tags. The two writers in this package store disjoint key sets, so a
 # cross-kind load can never succeed; tagging lets it fail by name instead of on
@@ -357,8 +371,7 @@ def _reconstruct_empirical_transforms(spline_data: dict) -> Stack:
         num_points = spline_data['num_points'][i]
         prior_low = spline_data['prior_low'][i]
         prior_high = spline_data['prior_high'][i]
-        # Smooth files saved before tail_alpha existed used the default.
-        tail_alpha = spline_data.get('tail_alpha', [0.0] * spline_data['num_dims'])[i]
+        tail_alpha = spline_data['tail_alpha'][i]
 
         theta_of_z, z_of_theta, log_dtheta_dz, x_clamps = make_smooth_marginal(
             samples, num_points=num_points,
@@ -532,8 +545,10 @@ def load_flow(path: Union[str, Path]) -> Transformed:
         If the file cannot be deserialized at all (truncated, or not a pickle),
         holds a different kind of coppuccino model (for example a fleet, saved
         by `FleetFlow.save`), was written in a newer save format than this
-        install understands, or is missing keys `save_flow` always writes.
-        Every message quotes `path`.
+        install understands, was written by coppuccino 1.0.0 or a pre-release
+        build (save format below 2: refit the chain, or pin coppuccino<2), or
+        is missing keys `save_flow` always writes. Every message quotes
+        `path`.
 
     Examples
     --------
@@ -563,11 +578,15 @@ def load_flow(path: Union[str, Path]) -> Transformed:
 
     _check_payload(save_dict, path, FLOW_KIND)
 
-    if 'inner_arch' in save_dict:
+    # _check_payload has already parsed the stamp, so this cast cannot fail.
+    version = int(save_dict.get('format_version', 1))
+    if version < _MIN_FLOW_FORMAT_VERSION:
         raise ValueError(
-            f"{path} holds a unit-cube ('uniform') copula flow, a pipeline "
-            "removed in coppuccino 3.0.0. Refit the chain with the current "
-            "Gaussian pipeline, or pin coppuccino<3 to read this file."
+            f"{path} was written in save format version {version}, by "
+            "coppuccino 1.0.0 or a pre-release build. Its marginals were built "
+            "by code this coppuccino no longer has, so reloading it would not "
+            "reproduce the fitted density. Refit the chain, or pin "
+            "coppuccino<2 to read a file written by 1.0.0."
         )
 
     # Every save_flow payload since the first release carries all three, so a
@@ -584,18 +603,6 @@ def load_flow(path: Union[str, Path]) -> Transformed:
         )
 
     spline_data = save_dict['spline_data']
-    # Files written before the smooth marginal became the only one name a
-    # removed family (coppuccino 1.0.0 wrote 'rqs' or 'pchip'), or predate the
-    # 'marginal' key altogether, in which case they were PCHIP. Their
-    # marginals cannot be rebuilt by this version.
-    families = spline_data.get('marginal', ['pchip'] * spline_data['num_dims'])
-    removed = sorted({str(f) for f in families} - {'smooth'})
-    if removed:
-        raise ValueError(
-            f"{path} was fitted with the {', '.join(map(repr, removed))} "
-            "marginal, which this coppuccino no longer supports. Refit the "
-            "chain, or pin coppuccino<2 to read a file written by 1.0.0."
-        )
 
     # Deserialize the inner flow
     inner_flow_bytes = save_dict['inner_flow_bytes']

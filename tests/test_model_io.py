@@ -445,33 +445,6 @@ class TestSaveLoadWithNonDefaultParams:
         finally:
             os.unlink(path)
 
-    @pytest.mark.parametrize("families, named", [
-        (None, "'pchip'"),               # predates the 'marginal' key
-        (["rqs", "smooth"], "'rqs'"),    # 1.0.0's default family
-    ])
-    def test_a_removed_marginal_family_is_refused_by_name(self, families, named):
-        """The removed families cannot be rebuilt, so their files must fail
-        naming the file and the family, not on a missing key mid-rebuild."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "flow.pkl"
-            save_flow(flow, path)
-            with open(path, "rb") as f:
-                payload = cloudpickle.load(f)
-            if families is None:
-                del payload['spline_data']['marginal']
-            else:
-                payload['spline_data']['marginal'] = families
-            with open(path, "wb") as f:
-                cloudpickle.dump(payload, f)
-            with pytest.raises(ValueError, match=f"{named} marginal") as exc:
-                load_flow(path)
-            assert str(path) in str(exc.value)
-            assert "coppuccino<2" in str(exc.value)
-
-
 class TestEdgeCases:
     """Test edge cases and error handling."""
 
@@ -564,44 +537,75 @@ class TestEdgeCases:
             os.unlink(path)
 
 
-class TestRemovedUniformPipeline:
-    """The unit-cube pipeline was removed in 3.0.0; its files must fail clearly."""
+class TestOldFormatFilesAreRefused:
+    """Copula-flow files below save format 2 are refused, naming the way out.
 
-    def test_loading_a_uniform_mode_file_raises(self):
-        """A v2 uniform-mode payload is detected by its 'inner_arch' key."""
-        import cloudpickle
+    load_flow rebuilds the marginals from the saved training columns with the
+    current builder, so an older file would reload as a different density
+    rather than fail. The real 1.0.0 file (no stamps, 'rqs' marginals) was
+    checked by hand to unpickle and reach this refusal.
+    """
 
-        # A v2 uniform save_flow payload: architecture spec instead of a
-        # pickled inner-flow skeleton. Only the marker key matters here.
+    @staticmethod
+    def _rewrite(path, edit):
+        with open(path, "rb") as f:
+            payload = cloudpickle.load(f)
+        edit(payload)
+        with open(path, "wb") as f:
+            cloudpickle.dump(payload, f)
+
+    def _assert_refused(self, path, version):
+        with pytest.raises(ValueError, match=f"save format version {version}") as exc:
+            load_flow(path)
+        assert str(path) in str(exc.value)
+        assert "coppuccino<2" in str(exc.value)
+
+    def test_an_unstamped_file_is_refused_as_version_1(self, small_flow):
+        """1.0.0 wrote neither stamp; a missing version reads as 1."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "flow.pkl"
+            save_flow(small_flow, path)
+
+            def strip_stamps(payload):
+                for key in ("format_version", "kind", "writer_version"):
+                    del payload[key]
+
+            self._rewrite(path, strip_stamps)
+            self._assert_refused(path, 1)
+
+    def test_a_version_1_file_is_refused_even_with_smooth_marginals(self, small_flow):
+        """Pre-release builds wrote version 1 with smooth marginals whose
+        builder has since changed; they are refused too, not rebuilt."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "flow.pkl"
+            save_flow(small_flow, path)
+            self._rewrite(path, lambda p: p.update(format_version=1))
+            self._assert_refused(path, 1)
+
+    def test_a_unit_cube_file_is_refused(self):
+        """The pre-release unit-cube pipeline's files are version 1 too."""
         payload = {
             'spline_data': {'num_dims': 0},
             'inner_flow_bytes': b'',
             'inner_arch': ('uniform', 2, 4, 6),
         }
-        with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as f:
-            path = f.name
-        try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "flow.pkl"
             with open(path, 'wb') as f:
                 cloudpickle.dump(payload, f)
-            with pytest.raises(ValueError, match="removed in coppuccino 3.0.0"):
-                load_flow(path)
-        finally:
-            os.unlink(path)
+            self._assert_refused(path, 1)
 
-    def test_current_files_do_not_carry_the_marker(self):
-        """A flow saved today reconstructs without tripping the guard."""
+    def test_a_current_file_reloads_exactly(self):
+        """A flow saved today reconstructs to the same density."""
         np.random.seed(42)
         chain = np.random.randn(200, 2)
         flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
 
-        with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as f:
-            path = f.name
-        try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "flow.pkl"
             save_flow(flow, path)
             reloaded = load_flow(path)
             assert np.allclose(log_prob(reloaded, chain), log_prob(flow, chain))
-        finally:
-            os.unlink(path)
 
 
 @pytest.fixture(scope="module")
@@ -840,6 +844,8 @@ class TestLoadFlowFailureMessages:
             # a flow-shaped payload with one key removed: used to raise a bare
             # KeyError: 'inner_flow_like'
             path = self._write(tmpdir, cloudpickle.dumps({
+                "format_version": FORMAT_VERSION,
+                "kind": FLOW_KIND,
                 "spline_data": {"num_dims": 0},
                 "inner_flow_bytes": b"",
             }))
@@ -908,26 +914,6 @@ class TestFormatStamps:
             with open(path, "wb") as f:
                 cloudpickle.dump(payload, f)
             assert isinstance(load_flow(path), Transformed)
-
-    def test_unstamped_legacy_file_loads_as_version_1(self, small_flow):
-        """Every .pkl written before the stamps existed lacks both keys, so a
-        missing version must read as 1 and a missing kind must be inferred."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "flow.pkl"
-            save_flow(small_flow, path)
-            with open(path, "rb") as f:
-                payload = cloudpickle.load(f)
-            legacy = {k: v for k, v in payload.items()
-                      if k not in ("format_version", "kind")}
-            with open(path, "wb") as f:
-                cloudpickle.dump(legacy, f)
-
-            reloaded = load_flow(path)
-
-            chain = np.random.randn(20, 2)
-            np.testing.assert_allclose(
-                log_prob(reloaded, chain), log_prob(small_flow, chain), rtol=1e-6
-            )
 
     def test_fleet_file_points_at_the_fleet_loader(self):
         """A fleet payload used to die on `KeyError: 'spline_data'`."""
