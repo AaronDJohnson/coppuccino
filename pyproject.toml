@@ -1,6 +1,6 @@
 [project]
 name = "coppuccino"
-version = "3.0.0"
+version = "2.0.0"
 description = "Fit distributions with normalizing flows + copulas with JAX"
 authors = [
     {name = "Aaron D. Johnson", email = "aaron9035@gmail.com"}

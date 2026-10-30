@@ -37,30 +37,31 @@
 
 \begin{framed}
 \noindent
-\textbf{Status: tutorial derivation, not the shipped default.}
+\textbf{Status: tutorial derivation of the 1.0.0 marginal, not the shipped one.}
 These notes derive the copula--flow construction using the
 \emph{monotone piecewise--cubic (PCHIP) double--spline} marginal, which is the
-model coppuccino shipped in 1.0.0 and which survives today only as
-\texttt{normalizing\_flows\_fit(marginal="pchip")}, retained for reproducing
-older fits. What the notes \emph{do} describe, and what remains accurate:
+model coppuccino shipped in 1.0.0. coppuccino~2.0.0 removed it, together with
+the Gaussian tail extension of Sec.~\ref{sec:tail} (\texttt{tail\_extension=True}),
+so the marginal sections (Secs.~\ref{sec:pchip}--\ref{sec:tail}) describe code
+that no longer exists. What remains accurate:
 Sklar's theorem and the copula factorization (Sec.~\ref{sec:copula}), the
 change--of--variables identity and the marginal Jacobian
-(Secs.~\ref{sec:problem}, \ref{sec:gaussianization}), monotone Hermite interpolation
-(Sec.~\ref{sec:pchip}), the Gaussian tail extension available as
-\texttt{tail\_extension=True} (Sec.~\ref{sec:tail}), the triangular spline
-copula flow (Sec.~\ref{sec:copula-flow}), and the assembled model density and
-sampling procedure (Secs.~\ref{sec:master}, \ref{sec:algorithms}).
+(Secs.~\ref{sec:problem}, \ref{sec:gaussianization}), monotone Hermite
+interpolation as such (Sec.~\ref{sec:pchip}; the shipped marginal still uses
+PCHIP slopes at its knots), the triangular spline copula flow
+(Sec.~\ref{sec:copula-flow}), and the assembled model density and sampling
+procedure (Secs.~\ref{sec:master}, \ref{sec:algorithms}).
 
 \medskip\noindent
-What they do \emph{not} describe: the default marginal since 2.0.0,
-\texttt{marginal="smooth"} --- a single clip--free monotone map of all of
+What they do \emph{not} describe: the only marginal since 2.0.0, the
+smooth--tail map --- a single clip--free monotone map of all of
 $\R$ onto the support (a rational--quadratic--spline bulk at the data quantiles
 joined to analytic tails), whose forward map, inverse and derivative share one
 parameterization rather than being two independently fitted splines. That
 family is what the boundary discussion of Sec.~\ref{sec:why} should be read
 against; the caveat stated there is the PCHIP--era one. The notes were written
-against coppuccino~1.x and revised for 3.0.0 only to remove references to API
-that 3.0.0 deleted. \texttt{coppuccino\_notes.pdf} in this directory is a build
+against coppuccino~1.x; for 2.0.0 only this box was revised.
+\texttt{coppuccino\_notes.pdf} in this directory is a build
 artifact of an \emph{earlier} revision of this source: it predates this box and
 is not rebuilt automatically, so where the two disagree the \texttt{.tex} is
 authoritative. Rebuild it with
@@ -78,7 +79,7 @@ terms. If you are comfortable with calculus and probability but have never taken
 a machine--learning course, this is written for you. The target is the
 Gaussianized--marginal pipeline with monotone piecewise--cubic (PCHIP)
 marginals --- see the status box above for how that relates to what the library
-fits by default today.
+fits today.
 \end{abstract}
 
 \tableofcontents
@@ -638,7 +639,7 @@ Section~\ref{sec:tail} are needed; when the density at the wall itself is the
 quantity of interest, the cube--native fleet pipeline never leaves $[0,1]^d$ and
 does not have this failure mode. Note also that the double--spline construction
 of Section~\ref{sec:pchip} inverts only up to interpolation error; the
-\texttt{marginal="smooth"} default named in the status box replaces it with a
+smooth--tail marginal named in the status box replaces it with a
 single parameterization whose inverse is exact.
 \end{itemize}
 

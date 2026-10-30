@@ -613,7 +613,7 @@ def normalizing_flows_fit(chain: np.ndarray, *, rng_seed: int = 999,
         inside the box -- a box narrower than the data raises rather than
         being silently folded onto the wall or ignored.
 
-        .. versionchanged:: 3.0
+        .. versionchanged:: 2.0
             Malformed or too-narrow ``prior_bounds`` now raise ValueError.
             Previously a narrower-than-data box was accepted and handled
             differently by each marginal family.
@@ -662,15 +662,12 @@ def normalizing_flows_fit(chain: np.ndarray, *, rng_seed: int = 999,
         merely mediocre fit passes and is left to
         :func:`normalizing_flows_fit_auto` to rank.
 
-        .. versionadded:: 3.0
+        .. versionadded:: 2.0
             Out-of-range training knobs and diverged fits used to be accepted
-            silently.
-
-        .. versionchanged:: 3.0
-            The check was parameter-finiteness only, which left a wide band of
-            learning rates -- 1 to 100 on 800 rows of correlated Gaussian data
-            at ``max_epochs=30`` -- returning a finite-parameter flow whose
-            every density was nonsense.
+            silently. A parameter-finiteness check alone would not be enough:
+            learning rates from 1 to 100 on 800 rows of correlated Gaussian
+            data at ``max_epochs=30`` return a flow with finite parameters
+            whose every density is nonsense, which the density arm catches.
 
     Examples
     --------

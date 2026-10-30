@@ -273,7 +273,7 @@ wrapper around it: it builds clipped rational-quadratic marginals onto the unit
 cube and learns the copula there over a uniform base, where the single-flow path
 Gaussianizes. That is why it is the better choice at a hard wall (see
 [How it works](#how-it-works)) and why it takes `batch_size`/`val_prop` instead
-of `marginal`/`tail_alpha`. Its input contract is also stricter than
+of `tail_alpha`. Its input contract is also stricter than
 the single-flow one, deliberately: `prior_bounds` must be finite and ordered on
 every row, `chains` must contain no NaN or infinity, and a column that is
 constant within a source is an error rather than a silently meaningless fit.
@@ -358,6 +358,11 @@ the support — a rational-quadratic-spline bulk at the data quantiles joined to
 analytic tails — whose forward map, inverse, and derivative share one
 parameterization, so samples land strictly inside the support and the
 reported density describes the stream that `sample` actually emits.
+The exception is a bound that the training chain itself touches. There `sample`
+redraws any row that saturates at the wall, so a thin sliver next to the wall
+still has mass under `log_prob` but is never emitted. The sliver is empty for a
+chain strictly inside its box, and it grows with the share of rows sitting on
+the wall (the `sample` docstring gives measured rates).
 `num_points` sets how many quantile knots the bulk uses (default 200, clamped
 to between 20 and a third of the samples).
 
@@ -412,7 +417,7 @@ which is what the CI "highest" jobs exercise there.
 The JAX upper bound is set by the flowjax 17.2.1 pairing, not by choice.
 flowjax declares no ceiling of its own (`jax>=0.4.16`), so the real cap is
 measured rather than declared. On Python 3.11 with flowjax 17.2.1, equinox
-0.13.8, interpax 0.3.14, jaxtyping 0.3.11 and paramax 0.0.5, jax+jaxlib
+0.13.8, jaxtyping 0.3.11 and paramax 0.0.5, jax+jaxlib
 **0.8.2 and above** (0.8.2, 0.8.3 and 0.9.2 tested) fail at fit time, not in a
 corner, inside flowjax's own `arraylike_to_array` input check: it rejects the
 `BatchTracer` these versions pass through `vmap`. `normalizing_flows_fit` fails
@@ -440,7 +445,7 @@ If you use coppuccino in your research, please cite it:
   author  = {Johnson, Aaron D.},
   title   = {coppuccino: copula normalizing flows in JAX},
   year    = {2026},
-  version = {3.0.0},
+  version = {2.0.0},
   url     = {https://github.com/AaronDJohnson/coppuccino}
 }
 ```
