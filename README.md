@@ -278,9 +278,9 @@ the single-flow one, deliberately: `prior_bounds` must be finite and ordered on
 every row, `chains` must contain no NaN or infinity, and a column that is
 constant within a source is an error rather than a silently meaningless fit.
 `FleetFlow.log_prob` returns `-inf` for a row containing NaN. Note also that
-`calibrate_edge_bins`, `normalizing_flows_fit_auto` and `compute_injection_hdr`
-take a single `Transformed` flow and cannot be pointed at a fleet source; refit
-that source with `normalizing_flows_fit` if you need them.
+`normalizing_flows_fit_auto` and `compute_injection_hdr` take a single
+`Transformed` flow and cannot be pointed at a fleet source; refit that source
+with `normalizing_flows_fit` if you need them.
 
 ## API
 
@@ -292,7 +292,6 @@ that source with `normalizing_flows_fit` if you need them.
 | `sample(flow, n_samples, rng_seed=...)` | Draw samples from a fitted flow. |
 | `log_prob(flow, samples)` | Evaluate the log density at given points. |
 | `sample_and_log_prob(flow, n_samples, ...)` | Draw samples and their log densities together (for importance sampling). |
-| `calibrate_edge_bins(flow, samples, bin_edges, ...)` | Post-fit marginal edge calibration for a smooth Gaussian-space flow. |
 | `save_flow(flow, path)` / `load_flow(path)` | Serialize / deserialize a fitted flow. |
 | `compute_injection_hdr(samples, injection_params, ...)` | HDR credibility of injected/true parameters (calibration). |
 | `check_in_support(samples, injection_params)` | Whether a point lies within the sample support. |
@@ -487,66 +486,6 @@ number of draws. Two separate calls with `bins=40` can choose different ranges,
 and `density=True` renormalizes away finite-crop underflow/overflow. Edge bins
 with only a handful of effective MCMC samples are not estimable faithfully;
 aggregate them before treating a visual difference as a model defect.
-
-### Gaussian edge-bin calibration (experimental)
-
-A trained Gaussian-space copula can retain a good joint fit while drifting
-slightly from the intended one-dimensional marginal masses in its sparse tails.
-`calibrate_edge_bins` adds a fixed, coordinatewise monotone correction after
-training. It preserves ranks and the fitted copula, includes its Jacobian in
-`log_prob`, and is exactly the identity through a central region.
-
-```python
-import numpy as np
-from scipy import stats
-from coppuccino import normalizing_flows_fit, calibrate_edge_bins
-
-# A bounded posterior that actually fills its box: Beta(2, 2) marginals with a
-# Gaussian-copula dependence, on the unit cube.
-rng = np.random.default_rng(0)
-corr = np.array([[1.0, 0.6, 0.3], [0.6, 1.0, 0.4], [0.3, 0.4, 1.0]])
-data = stats.beta.ppf(
-    stats.norm.cdf(rng.multivariate_normal(np.zeros(3), corr, size=4000)), 2.0, 2.0
-)
-bounds = np.array([[0.0, 1.0]] * 3)
-
-flow = normalizing_flows_fit(data, prior_bounds=bounds, max_epochs=200)
-
-# 10 bins per axis. With 4000 rows the outermost bin of each dimension holds
-# 89-134 samples here, comfortably above min_reference_bin_count (20 effective).
-shared_edges = [np.linspace(low, high, 11) for low, high in bounds]
-
-flow, report = calibrate_edge_bins(
-    flow, data, shared_edges, edge_bins=1, return_report=True,
-)
-```
-
-This currently requires the Gaussian pipeline's default `marginal="smooth"`.
-With prior bounds as the outer histogram edges, `edge_bins=1` calibrates the
-first and last bin masses. By default it makes only the minimum correction needed
-to enter a 95% Wilson interval and leaves statistically compatible tails exactly
-unchanged. `reference_ess` should contain per-dimension effective sample sizes for
-MCMC input. Under-resolved reference bins or calibration tails raise instead of
-silently fitting noise; use coarser shared edges, more calibration draws, or the
-explicit `force=True` escape hatch.
-
-**Choose the edges from the data, not from the prior box.** The calibration
-targets are empirical CDF values at the inner edge of the first and last bin, so
-each of those bins has to contain samples. An edge whose empirical CDF is 0 or
-1 raises *"Dimension d has a requested edge boundary with empirical probability
-0 or 1"*, and a bin holding fewer than `min_reference_bin_count` effective rows
-raises the under-resolved error. A prior box much wider than the posterior hits
-the first of these however coarse the binning gets: 4000 standard-normal rows in
-3-D with `prior_bounds=[[-5, 5]] * 3` and edges spanning the box raise at 41, 21
-*and* 11 edges, because the sample range is about ±3.9 and the first bin is
-empty even when it is a full unit wide. In that situation either bin over the region the chain occupies
-rather than over the box, or accept that there is no marginal edge mass to
-calibrate.
-
-On an unbounded/cropped axis the function calibrates tail-inclusive cumulative
-masses instead, so underflow and overflow should be reported separately. The
-correction is marginal only and does not repair multivariate corner or tail-
-dependence errors. Periodic coordinates must be recentered or unwrapped first.
 
 ## Requirements
 

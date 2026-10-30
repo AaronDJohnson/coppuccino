@@ -174,12 +174,12 @@ files = ["src/coppuccino"]
 # fully-unannotated function for that probe to land in, which is the point.
 ignore_missing_imports = true
 check_untyped_defs = true
-# There are no module-wide `disable_error_code` overrides. Fifteen per-line
+# There are no module-wide `disable_error_code` overrides. Thirteen per-line
 # `# type: ignore[<code>]` remain, so a real error of the same code anywhere
-# else in the same module still fails the build. Twelve are equinox's
+# else in the same module still fails the build. Ten are equinox's
 # AbstractVar/ClassVar shape fields and the __init__ signature it synthesises
-# from them (bijections.py, calibration.py, and the four marginal-bijection
-# construction sites in copula_flows.py / model_io.py). The other three are the
+# from them (bijections.py, and the four marginal-bijection construction sites
+# in copula_flows.py / model_io.py). The other three are the
 # tail-constant
 # pre-declaration at the top of `make_empirical_cdf_spline`, which has its own
 # comment there; it is the load-bearing one -- replacing it with the truthful

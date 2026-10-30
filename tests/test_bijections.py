@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from coppuccino import bijections, calibration, fleet
+from coppuccino import bijections, fleet
 from coppuccino.bijections import (
     _POS_FLOOR,
     EmpiricalMarginalToGaussian,
@@ -1063,41 +1063,35 @@ class TestWallShapeJoinPin:
 
 
 class TestSharedRQSKernel:
-    """One rational-quadratic-spline kernel, used by all three RQS call sites.
+    """One rational-quadratic-spline kernel, used by every RQS call site.
 
-    The marginal splines here, the fleet's stacked marginals and the edge
-    calibration windows used to carry three transcriptions of the same
-    Gregory-Delbourgo algebra with three different out-of-range policies.
+    The marginal splines here and the fleet's stacked marginals used to carry
+    separate transcriptions of the same Gregory-Delbourgo algebra with
+    different out-of-range policies.
     """
 
     @staticmethod
     def _shared_knots(seed=0, n=12):
-        """Knots the three call sites can all be evaluated on."""
+        """Knots both call sites can be evaluated on."""
         rng = np.random.default_rng(seed)
         xk = np.sort(rng.normal(size=n))
         yk = np.sort(rng.uniform(size=n))
         yk = (yk - yk[0]) / (yk[-1] - yk[0])
         return xk, yk
 
-    def test_the_three_call_sites_hold_one_kernel(self):
+    def test_the_call_sites_hold_one_kernel(self):
         """A re-fork must be caught here, not by luck of a differing guard."""
         assert fleet._rqs_forward is bijections._rqs_forward
         assert fleet._rqs_inverse is bijections._rqs_inverse
         assert fleet._rqs_derivative is bijections._rqs_derivative
-        assert calibration._rqs_forward is bijections._rqs_forward
-        assert calibration._rqs_inverse is bijections._rqs_inverse
-        assert calibration._rqs_derivative is bijections._rqs_derivative
-        assert calibration._POS_FLOOR is bijections._POS_FLOOR
         assert fleet._POS_FLOOR is bijections._POS_FLOOR
-        # calibration used to restate the same 1e-30 under its own name
-        assert not hasattr(calibration, "_POSITIVE_FLOOR")
 
-    def test_bulk_fleet_and_calibration_paths_agree_bitwise(self):
+    def test_bulk_and_fleet_paths_agree_bitwise(self):
         """Forward, inverse and log-derivative agree to exactly 0.0.
 
-        Each module is driven through its own entry point, on knots shared by
-        all three, and including queries outside the knot range — where the
-        three copies used to disagree by construction.
+        Each module is driven through its own entry point, on shared knots,
+        and including queries outside the knot range — where the copies used
+        to disagree by construction.
         """
         xk, yk = self._shared_knots()
         cdf, inverse, deriv = _rqs_bulk(xk, yk)
@@ -1116,21 +1110,15 @@ class TestSharedRQSKernel:
 
         for x in (inside, outside):
             assert jnp.all(cdf(x) == fleet_forward(x))
-            assert jnp.all(cdf(x) == calibration._rqs_forward_and_log_det(
-                x, xk_j, yk_j, dk_j)[0])
 
         # the log-det is only comparable where the fleet reports one: outside
         # the prior box it deliberately returns -inf (a support test)
         log_deriv = jnp.log(jnp.maximum(deriv(inside), _POS_FLOOR))
         assert jnp.all(log_deriv == fleet._u_and_logdet(
             inside[:, None], xk_j[None], yk_j[None], dk_j[None])[1])
-        assert jnp.all(log_deriv == calibration._rqs_forward_and_log_det(
-            inside, xk_j, yk_j, dk_j)[1])
 
         assert jnp.all(inverse(u) == fleet._x_from_u(
             u[:, None], xk_j[None], yk_j[None], dk_j[None])[:, 0])
-        assert jnp.all(inverse(u) == calibration._rqs_inverse_and_log_det(
-            u, xk_j, yk_j, dk_j)[0])
 
     def test_out_of_range_queries_saturate(self):
         """Extrapolating the rational quadratic turns it over: the CDF falls
@@ -1175,14 +1163,6 @@ class TestSharedRQSKernel:
         assert _rqs_knot_derivatives(xk, steepening)[0] == _POS_FLOOR
         floored = _rqs_knot_derivatives(xk, steepening, edge_slope_floor=0.05)
         assert floored[0] == 0.05 * (steepening[1] - steepening[0]) / (xk[1] - xk[0])
-
-    def test_calibration_window_keeps_its_own_floor_policy(self):
-        """Sharing the builder must not move calibration to the generic floor."""
-        xk = np.array([0.0, 1.0, 2.0, 3.0])
-        yk = np.array([0.0, 0.5, 0.5 + 1e-14, 1.0])
-        derivatives = calibration._window_derivatives(xk, yk)
-        assert derivatives[0] == 1.0 and derivatives[-1] == 1.0
-        assert np.all(derivatives >= 1e-8)
 
 
 class TestFloat32Path:

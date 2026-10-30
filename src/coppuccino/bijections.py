@@ -197,10 +197,9 @@ def _gpd_quantile(p: ArrayLike, xi: float, sigma: float,
 # ----------------------------------------------------------------------
 # Monotone rational-quadratic spline kernel (Gregory & Delbourgo 1982;
 # Durkan et al. 2019), shared by every RQS in the package: the bulk
-# marginal splines below, the fleet's stacked marginals
-# (:mod:`coppuccino.fleet`) and the post-fit edge-calibration windows
-# (:mod:`coppuccino.calibration`). This module is the dependency leaf, so
-# both of those import the kernel from here rather than restating it.
+# marginal splines below and the fleet's stacked marginals
+# (:mod:`coppuccino.fleet`). This module is the dependency leaf, so the fleet
+# imports the kernel from here rather than restating it.
 # ----------------------------------------------------------------------
 
 
@@ -246,9 +245,8 @@ def _rqs_forward(x: ArrayLike, xk: Array, yk: Array, dk: Array) -> Array:
     moves further out — and, in :func:`_rqs_derivative`, a negative density.
     Saturating instead is what the fleet's stacked marginals have always
     done (:mod:`coppuccino.fleet` layers its own out-of-box support test on
-    top); the marginal and calibration call sites clip their own inputs
-    first, so for them the clamp is a no-op that closes the mode off for
-    good.
+    top); the marginal call sites clip their own inputs first, so for them
+    the clamp is a no-op that closes the mode off for good.
     """
     x = jnp.clip(jnp.asarray(x), xk[0], xk[-1])
     x0, w, y0, dy, s, d0, d1 = _rqs_bin(xk, x, xk, yk, dk)
@@ -320,9 +318,9 @@ def _rqs_knot_derivatives(
     floor : float, optional
         Lower clamp on every knot derivative. Slopes sit in RQS
         denominators, so this must stay strictly positive; the default
-        ``_POS_FLOOR`` is the generic "not exactly zero" guard, while a
-        caller whose map must stay resolvably invertible (the calibration
-        windows) wants something far larger.
+        ``_POS_FLOOR`` is the generic "not exactly zero" guard; a caller
+        whose map must stay resolvably invertible wants something far
+        larger.
     edge_slope_floor : float, optional
         If positive, floor the two *endpoint* derivatives at this fraction
         of their end-bin secant slope. PCHIP's endpoint rule can return
