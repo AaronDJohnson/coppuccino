@@ -287,7 +287,7 @@ with `normalizing_flows_fit` if you need them.
 | Function | Purpose |
 | --- | --- |
 | `normalizing_flows_fit(chain, ...)` | Fit a copula flow to data; returns the fitted model. |
-| `normalizing_flows_fit_auto(chain, ...)` | Fit candidate architectures concurrently; select by held-out fit, parsimony, or marginal fidelity. |
+| `normalizing_flows_fit_auto(chain, ...)` | Fit candidate architectures concurrently; return the smallest whose held-out fit is comparable to the best. |
 | `normalizing_flows_fit_fleet(chains, prior_bounds, ...)` | Fit many per-source flows simultaneously (vmapped); returns a `FleetFlow` with batched `sample`/`log_prob`. |
 | `sample(flow, n_samples, rng_seed=...)` | Draw samples from a fitted flow. |
 | `log_prob(flow, samples)` | Evaluate the log density at given points. |
@@ -305,9 +305,8 @@ Key options to `normalizing_flows_fit` include `flow_layers` and `knots`
 (flow capacity), `max_epochs`, `learning_rate`, `patience` (training),
 `prior_bounds`, `tail_model`, and `marginal` (the marginal model, below). See
 the docstrings for the full list. `normalizing_flows_fit_auto` fits a small
-ladder of capacities concurrently and can return either the smallest model
-whose held-out fit is statistically comparable to the best, or the most
-marginal-faithful member of that comparable set.
+ladder of capacities concurrently and returns the smallest model whose
+held-out fit is statistically comparable to the best.
 
 ### HDR credibility (inference validation)
 
@@ -402,90 +401,6 @@ Distribution to each tail via peaks-over-threshold, modeling the extremes more
 faithfully than the default Gaussian tail. `tail_quantile` sets the fraction of
 samples in each tail (default 0.05). This feature is **experimental** — its API
 may change — and it ignores `tail_extension` and `prior_bounds`.
-
-### Marginal-fidelity model selection
-
-Before applying a post-fit correction, try selecting a Gaussian flow whose
-capacity does not distort the empirical marginals. The marginal-fidelity mode
-of `normalizing_flows_fit_auto` first keeps only candidates that are
-statistically comparable in held-out joint log likelihood, then selects the
-smallest candidate with the best edge behavior:
-
-```python
-from coppuccino import normalizing_flows_fit_auto
-
-# The coordinate whose edge bins you are unhappy with, and the range to score
-# it over -- physical edges, chosen from the data, not from the prior box.
-# Keep them strictly inside the data range: the first and last cells score the
-# mass that falls *outside* the edges, so edges at the data extremes leave
-# those two cells structurally empty and nothing to compare.
-problem_dim = 0
-low, high = np.percentile(data[:, problem_dim], [1.0, 99.0])
-
-# `data` here is i.i.d., so its effective sample size is just its length. For a
-# real MCMC chain pass your own measured ESS -- it is smaller, which widens
-# every cell's Wilson interval. If the cells are then too thin to resolve, the
-# fit warns and says so rather than scoring noise; either coarsen the edges or
-# accept that only large discrepancies will move the ranking.
-ess_per_dimension = np.full(data.shape[1], float(len(data)))
-
-# Use exactly these same arrays for both histograms. None skips a coordinate.
-shared_edges = [None] * data.shape[1]
-shared_edges[problem_dim] = np.linspace(low, high, 11)
-
-flow, table = normalizing_flows_fit_auto(
-    data,
-    selection="marginal_fidelity",
-    marginal_bin_edges=shared_edges,
-    marginal_ess=ess_per_dimension,  # pass your measured ESS for MCMC input
-    max_marginal_error=0.01,         # at most 1 percentage point per cell
-    candidates=[                     # two fits: targeted model + old default
-        {"knots": 4, "flow_layers": 4, "tanh_max_val": 2.0},
-        {"knots": 4, "flow_layers": 6},
-    ],
-    return_table=True,
-)
-```
-
-With `return_table=True` every row of `table` now carries every key, whichever
-selection mode ran and whether or not the row was the one selected, so
-`pandas.DataFrame(table)` and `row["refit_used"]` are both safe. The row schema
-is documented key by key in `normalizing_flows_fit_auto`'s `Returns` section.
-
-Unlike edge calibration, this does not change the likelihood target or add a
-runtime transform. With explicit edges it scores the literal first and last
-finite intervals plus underflow and overflow, so a cropped-axis CDF improvement
-cannot hide a worse visible bar. Each of those four cells has its own ESS and
-resolution decision; sparse cells drive selection only when the candidate and
-reference Wilson intervals are disjoint (the explicit raw-error budget still
-applies). For MCMC input, `marginal_ess` can be
-one value per parameter or a `(n_parameters, 4)` array in underflow, first-bin,
-last-bin, overflow order.
-
-This is a model-selection remedy, not an exact correction: without
-`max_marginal_error` it returns the relatively best likelihood-compatible
-candidate even if every candidate is poor. With a budget, candidates that meet
-it are preferred and a warning is emitted if none do. `table[i]["marginal_details"]`
-reports the target, estimate, error, and resolution status for every parameter
-and cell. If all requested cells are under-resolved and statistically tied,
-parsimony wins; explicit edges are not silently replaced by a different metric.
-If no edges are supplied, the selector instead checks canonical tail quantiles
-in the copula space.
-
-The default search costs three fits: two lower-distortion Gaussian candidates
-(2/2 and 4/4 knots/layers with `tanh_max_val=2`) and the package's existing 4/6,
-`tanh_max_val=3` fit as a baseline. The example above cuts that to two. A
-full-data refit adds at most one fit and is checked with a fresh componentwise
-edge audit; a numerical/joint-regression sanity failure returns the validated
-split fit. Since the full-data refit has seen the validation rows, set
-`refit_best=False` when retaining a strictly held-out-validated flow matters
-more than recovering the final 15% of training samples.
-
-Histogram comparisons must use shared edges and raw counts divided by the total
-number of draws. Two separate calls with `bins=40` can choose different ranges,
-and `density=True` renormalizes away finite-crop underflow/overflow. Edge bins
-with only a handful of effective MCMC samples are not estimable faithfully;
-aggregate them before treating a visual difference as a model defect.
 
 ## Requirements
 
