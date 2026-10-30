@@ -86,22 +86,6 @@ def test_zero_tolerance_degenerates_to_best(data):
     assert table[int(np.argmax(scores))]["selected"]
 
 
-def test_zero_parameter_candidate_is_comparable(data):
-    """A flow_layers=0 rung competes on the same held-out scale as a trained one."""
-    flow, table = normalizing_flows_fit_auto(
-        data, prior_bounds=BOUNDS, max_epochs=40,
-        candidates=[{"flow_layers": 0, "whiten": True},
-                    {"knots": 4, "flow_layers": 3}],
-        return_table=True,
-    )
-    # scores comparable in theta space across capacities; one candidate selected
-    assert sum(r["selected"] for r in table) == 1
-    assert np.all(np.isfinite([r["val_logp"] for r in table]))
-    # the frozen whitening affine is not a fitted degree of freedom
-    assert table[0]["n_params"] == 0
-    assert table[1]["n_params"] > 0
-
-
 def test_reproducible_selection(data):
     _, t1 = normalizing_flows_fit_auto(
         data, prior_bounds=BOUNDS, max_epochs=30,

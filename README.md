@@ -125,20 +125,13 @@ but it is not a pointwise density you should read off. Prefer
 `sample_and_log_prob` over evaluating `log_prob` on the walls themselves, and
 see `SmoothMarginalToGaussian` for the mechanism.
 
-> **Changed in v3.0:** the unit-cube pipeline (`copula_space="uniform"`), the
-> `CopulaFlow` class and the `unit_range` marginal mode were removed. Passing
-> `copula_space` now raises with an explanatory message, and `load_flow`
-> rejects a cube-mode file rather than failing obscurely. The Gaussian
-> pipeline with smooth-tail marginals covers the same ground *except at a wall
-> itself*: on the $U[0,1]^2$ fit above it reports +0.53 to +4.52 nats on the
-> bound where the cube marginals that live on in `normalizing_flows_fit_fleet`
-> report −2.36 to +1.47 on the same data and the same seeds (truth 0). The cube pipeline
-> is the more accurate of the two there, but by a couple of nats rather than by
-> the order of magnitude earlier releases of this file claimed; if the density
-> on the boundary is the quantity you need — weakly-constrained,
-> flat-to-the-wall marginals — it is worth fitting with
-> `normalizing_flows_fit_fleet`, which keeps those unit-cube internals, and a
-> one-source fleet is a legitimate way to use it.
+> **At a wall itself** the Gaussian pipeline is not the most accurate choice:
+> on the $U[0,1]^2$ fit above it reports +0.53 to +4.52 nats on the bound where
+> the unit-cube marginals of `normalizing_flows_fit_fleet` report −2.36 to
+> +1.47 on the same data and the same seeds (truth 0). If the density on the
+> boundary is the quantity you need — weakly-constrained, flat-to-the-wall
+> marginals — fit with `normalizing_flows_fit_fleet`; a one-source fleet is a
+> legitimate way to use it.
 
 ### Why this design
 
@@ -280,7 +273,7 @@ wrapper around it: it builds clipped rational-quadratic marginals onto the unit
 cube and learns the copula there over a uniform base, where the single-flow path
 Gaussianizes. That is why it is the better choice at a hard wall (see
 [How it works](#how-it-works)) and why it takes `batch_size`/`val_prop` instead
-of `marginal`/`tail_alpha`/`whiten`. Its input contract is also stricter than
+of `marginal`/`tail_alpha`. Its input contract is also stricter than
 the single-flow one, deliberately: `prior_bounds` must be finite and ordered on
 every row, `chains` must contain no NaN or infinity, and a column that is
 constant within a source is an error rather than a silently meaningless fit.

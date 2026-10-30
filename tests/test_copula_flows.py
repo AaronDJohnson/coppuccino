@@ -73,13 +73,6 @@ class TestMarginalSelection:
                                      tail_extension=True)
         assert _marginal_families(flow) == ["rqs", "rqs", "rqs"]
 
-    def test_removed_uniform_pipeline_raises(self):
-        """copula_space='uniform' was removed in 3.0.0 and must fail loudly."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 3)
-        with pytest.raises(ValueError, match="removed in coppuccino 3.0.0"):
-            normalizing_flows_fit(chain, max_epochs=1, copula_space="uniform")
-
     def test_pchip_marginal_is_selectable(self):
         """Passing marginal='pchip' uses the PCHIP marginal on every dimension."""
         np.random.seed(42)
@@ -614,7 +607,8 @@ class TestTrainingKnobValidation:
          ({"tanh_max_val": -1.0}, "tanh_max_val"),
          ({"tanh_max_val": 0.0}, "tanh_max_val"),
          ({"weight_decay": -5.0}, "weight_decay"),
-         ({"flow_layers": -1}, "flow_layers")],
+         ({"flow_layers": -1}, "flow_layers"),
+         ({"flow_layers": 0}, "flow_layers")],
     )
     def test_out_of_range_knob_names_itself_and_its_value(
             self, bounded_chain, kwargs, parameter):
@@ -648,7 +642,7 @@ class TestTrainingKnobValidation:
     def test_the_documented_defaults_all_pass(self, bounded_chain):
         """The guard must not have narrowed the working range."""
         flow = normalizing_flows_fit(bounded_chain, max_epochs=1, knots=2,
-                                     patience=1, num_points=2, flow_layers=0,
+                                     patience=1, num_points=2, flow_layers=1,
                                      weight_decay=0.0, rng_seed=0,
                                      show_progress=False)
         assert np.all(np.isfinite(log_prob(flow, bounded_chain[:20])))
@@ -729,8 +723,6 @@ class TestDivergenceGuard:
          {"learning_rate": 1e-1},
          {"knots": 2, "flow_layers": 2, "tanh_max_val": 2.0},
          {"knots": 8, "flow_layers": 8},
-         {"flow_layers": 0, "whiten": True},
-         {"whiten": True, "learning_rate": 1e-2},
          {"marginal": "rqs"},
          {"weight_decay": 1e-2}],
     )
@@ -739,8 +731,8 @@ class TestDivergenceGuard:
         """The other direction: the guard must not have narrowed the API.
 
         ``learning_rate`` spans three decades, the architecture spans the
-        zero-parameter rung to the largest default rung, and both marginal
-        families and the whitened path are included -- every axis the guard's
+        smallest to the largest default rung, and both marginal families are
+        included -- every axis the guard's
         baseline (the flow's own untrained initialization) is built from.
         """
         flow = normalizing_flows_fit(bounded_chain, max_epochs=8, rng_seed=0,

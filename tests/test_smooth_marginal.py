@@ -231,9 +231,6 @@ def test_gaussian_default_resolves_to_smooth(smooth_flow):
 
 def test_guards():
     chain = _testbed_chain(600)
-    with pytest.raises(ValueError, match="removed in coppuccino 3.0.0"):
-        normalizing_flows_fit(chain, copula_space="uniform", marginal="smooth",
-                              max_epochs=1)
     with pytest.raises(ValueError, match="tail_alpha"):
         normalizing_flows_fit(chain, marginal="smooth",
                               tail_extension=True, max_epochs=1)

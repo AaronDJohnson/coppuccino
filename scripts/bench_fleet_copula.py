@@ -7,7 +7,7 @@ copula-space correlation of the training rows -- closed form, no training at all
 
 Holding the marginals fixed isolates the copula model. Both are scored by mean
 held-out log-density in the original parameter space, so the numbers are directly
-comparable to each other and to scripts/bench_whitening.py.
+comparable to each other.
 """
 from __future__ import annotations
 

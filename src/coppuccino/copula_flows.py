@@ -8,7 +8,7 @@ import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 from equinox import filter_jit
-from flowjax.bijections import Stack, TriangularAffine
+from flowjax.bijections import Stack
 from flowjax.distributions import Normal, Transformed
 from flowjax.flows import triangular_spline_flow
 from flowjax.train import fit_to_data
@@ -27,49 +27,6 @@ __all__ = [
     "normalizing_flows_fit", "normalizing_flows_fit_auto",
     "sample", "log_prob", "sample_and_log_prob",
 ]
-
-
-def _reject_uniform_pipeline(copula_space) -> None:
-    """Fail loudly for the unit-cube pipeline removed in v3.0.0.
-
-    ``copula_space`` was a documented v2 argument and reaches this function
-    both directly and through ``normalizing_flows_fit_auto``'s candidate dicts,
-    so a bare TypeError would surface far from the call the user wrote.
-    """
-    if copula_space is not None and copula_space != "gaussian":
-        raise ValueError(
-            f"copula_space={copula_space!r} is not available: the unit-cube "
-            "('uniform') copula pipeline was removed in coppuccino 3.0.0. The "
-            "Gaussian pipeline with the default marginal='smooth' is "
-            "boundary-safe by construction — drop the argument. For "
-            "many-source bounded fits see normalizing_flows_fit_fleet."
-        )
-
-
-def _whitening_affine(z: np.ndarray, jitter: float = 1e-8) -> TriangularAffine:
-    """A frozen affine carrying the copula-space mean and Cholesky factor.
-
-    ``z`` is the training chain already mapped through the marginal transforms,
-    so its coordinates are (by construction) standard normal and the only
-    structure left is the dependence. ``TriangularAffine(mu, L)`` with
-    ``L = chol(cov(z))`` maps a standard normal draw onto exactly that
-    correlation, i.e. it *is* the Gaussian copula of the data.
-
-    Placing it (frozen) at the end of the copula flow means the flow starts
-    from the Gaussian copula and only has to learn the departure from it,
-    rather than rediscovering correlation the empirical covariance already
-    knows. It contributes no trainable parameters.
-
-    ``jitter`` is added to the diagonal so a rank-deficient copula-space
-    covariance (perfectly degenerate parameters) still factorises.
-    """
-    z = np.asarray(z, dtype=float)
-    mu = z.mean(axis=0)
-    cov = np.cov(z, rowvar=False)
-    cov = np.atleast_2d(cov)
-    scale = float(np.mean(np.diag(cov))) or 1.0
-    L = np.linalg.cholesky(cov + jitter * scale * np.eye(cov.shape[0]))
-    return non_trainable(TriangularAffine(jnp.asarray(mu), jnp.asarray(L)))
 
 
 # Minimum samples per dimension needed to build a usable empirical CDF.
@@ -244,7 +201,7 @@ def _validate_fit_hyperparameters(
     _require_positive_int("patience", patience, 1)
     _require_positive_int("max_epochs", max_epochs, 1)
     _require_positive_int("num_points", num_points, 2)
-    _require_positive_int("flow_layers", flow_layers, 0)
+    _require_positive_int("flow_layers", flow_layers, 1)
     _require_finite_float("learning_rate", learning_rate, 0.0)
     _require_finite_float("tanh_max_val", tanh_max_val, 0.0)
     _require_finite_float("weight_decay", weight_decay, 0.0, strict=False)
@@ -289,9 +246,8 @@ def _assert_fit_converged(flow: Transformed, initial_copula,
     flow : Transformed
         The just-fitted flow.
     initial_copula : flowjax distribution
-        The *untrained* copula ``_fit_chain_entry`` was handed, including the
-        frozen whitening affine when ``whiten=True``. It is the baseline the
-        density check measures against.
+        The *untrained* copula ``_fit_chain_entry`` was handed. It is the
+        baseline the density check measures against.
     z_train : jnp.ndarray
         Training rows in copula space, i.e. after the frozen marginal maps.
     learning_rate, max_epochs :
@@ -336,11 +292,12 @@ def _assert_fit_converged(flow: Transformed, initial_copula,
     "rqs" x seeds 0 and 7 x three architectures) produced no positive deficit
     at all: every fit beat its own initialization, the closest by -0.0395. A
     second envelope of 48 fits covering the axes that grid omits
-    (``prior_bounds`` including a Beta(0.5, 3) spike on [0, 1], ``whiten``,
-    ``weight_decay``, ``tail_alpha``, ``patience=1``, ``marginal="pchip"``,
-    dimensions up to 8, ``n`` from 200 to 8,000, ``max_epochs=200``) ran from
-    -2.21 to 0.0 -- the 0.0 being the ``flow_layers=0`` rung, which has
-    nothing to train and so is exactly its own baseline.
+    (``prior_bounds`` including a Beta(0.5, 3) spike on [0, 1], the since-removed
+    ``whiten`` option, ``weight_decay``, ``tail_alpha``, ``patience=1``,
+    ``marginal="pchip"``, dimensions up to 8, ``n`` from 200 to 8,000,
+    ``max_epochs=200``) ran from -2.21 to 0.0 -- the 0.0 being a since-removed
+    zero-layer rung, which had nothing to train and so was exactly its own
+    baseline.
 
     Against that, a 252-fit divergence grid over the same 9 laws with
     ``learning_rate`` in 0.5, 1, 3, 10, 30, 60, 100: 18 (all at rate 100)
@@ -605,12 +562,6 @@ def _fit_chain_entry(
     key = jr.key(rng_seed)
     x_train, _ = inverse_log_det(chain_entry)
 
-    if _n_trainable_params(Transformed(input_flow, transform)) == 0:
-        # Nothing to optimise (flow_layers=0: the copula is the frozen
-        # whitening affine, or the identity). fit_to_data would build an
-        # empty optimizer state; skip straight to assembly.
-        return Transformed(input_flow, transform)
-
     kwargs: dict[str, Any] = {
         'max_epochs': max_epochs,
         'max_patience': patience,
@@ -643,9 +594,7 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
                           marginal: Optional[str] = None,
                           tail_alpha: float = 0.0,
                           weight_decay: float = 0.0,
-                          whiten: bool = False,
-                          show_progress: bool = True,
-                          copula_space: Optional[str] = None) -> Transformed:
+                          show_progress: bool = True) -> Transformed:
     """
     Fit a copula normalizing flow to multivariate data.
 
@@ -692,11 +641,8 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
         Maximum number of training epochs. Must be an integer >= 1. Default is
         400.
     flow_layers : int, optional
-        Number of coupling layers in the triangular spline flow. Default is 6.
-        ``flow_layers=0`` builds no trainable copula at all: with
-        ``whiten=True`` that is exactly the Gaussian copula of the data, a
-        zero-parameter baseline that says how much the flow is buying over
-        plain correlation; with ``whiten=False`` it is the independence copula.
+        Number of coupling layers in the triangular spline flow. Must be an
+        integer >= 1. Default is 6.
     num_points : int, optional
         Number of grid points for each marginal CDF spline. Must be an integer
         >= 2. Default is 200. Automatically clamped based on sample size.
@@ -760,17 +706,6 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
         prior bound given): 0.0 (default) gives Gaussian tails; larger values
         give progressively heavier tails. Bounded sides always use the
         exponential wall-approach tails. Ignored by other marginals.
-    copula_space : str, optional
-        **Removed in 3.0.0.** Passing anything other than ``"gaussian"``
-        raises. The unit-cube (``"uniform"``) pipeline no longer exists; the
-        Gaussian pipeline with ``marginal="smooth"`` is boundary-safe by
-        construction and covers the same use case. Kept in the signature only
-        so v2 code fails with an actionable message rather than a bare
-        ``TypeError``.
-
-        .. versionchanged:: 3.0
-            The ``"uniform"`` pipeline, the ``CopulaFlow`` class and the
-            ``unit_range`` marginal mode were removed.
     weight_decay : float, optional
         AdamW weight decay on the trainable flow parameters. Must be finite
         and non-negative. Default 0.0
@@ -782,16 +717,6 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
         (choosing few ``knots`` imposes smoothness structurally and works
         better; decay >= ~10 over-regularizes). Treat it as a supplementary
         knob, not a substitute for architecture choice.
-    whiten : bool, optional
-        **Experimental.** If True, freeze a Gaussian-copula affine into the
-        copula flow: the copula-space training data's mean and Cholesky factor
-        are baked in as a non-trainable ``TriangularAffine`` applied after the
-        trained flow. Because the marginals have already been mapped to
-        standard normal, that factor *is* the data's Gaussian copula, so the
-        flow starts at the correct linear dependence and only has to learn the
-        departure from it. Contributes zero trainable parameters. Gaussian
-        pipeline only (an affine does not preserve the unit cube). Default
-        False.
     show_progress : bool, optional
         Show the training progress bar. Default True. Set False for quiet
         fits (e.g. candidate fits inside ``normalizing_flows_fit_auto``).
@@ -808,7 +733,7 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
         malformed or narrower than the chain, if ``marginal``/``tail_model``
         name an unknown family, or if any training knob is out of range
         (``rng_seed >= 0``, ``knots >= 2``, ``patience >= 1``,
-        ``max_epochs >= 1``, ``num_points >= 2``, ``flow_layers >= 0``,
+        ``max_epochs >= 1``, ``num_points >= 2``, ``flow_layers >= 1``,
         ``learning_rate > 0``, ``tanh_max_val > 0``, ``weight_decay >= 0``).
     RuntimeError
         If the optimizer diverged. Two forms: the trained flow ends up with
@@ -855,7 +780,6 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
     The triangular spline flow uses autoregressive transformations that are
     particularly efficient for capturing dependencies in high-dimensional data.
     """
-    _reject_uniform_pipeline(copula_space)
     if tail_model not in ("gaussian", "gpd"):
         raise ValueError(
             f"tail_model must be 'gaussian' or 'gpd', got {tail_model!r}")
@@ -920,31 +844,21 @@ def normalizing_flows_fit(chain:np.ndarray, rng_seed: int = 999,
 
     # The training chain in copula space. inverse_log_det is the jitted
     # marginal map; _fit_chain_entry calls the same compiled function, so this
-    # is a cache hit rather than a second trace. Both the whitening affine and
-    # the post-fit divergence check need it.
+    # is a cache hit rather than a second trace. The post-fit divergence check
+    # needs it.
     z_train, _ = inverse_log_det(clean_chain)
     z_train = jnp.asarray(z_train)
 
     n_params = clean_chain.shape[1]
     # Gaussianized copula: triangular spline flow on unbounded space.
-    if flow_layers > 0:
-        flow = triangular_spline_flow(
-            key,
-            base_dist=Normal(jnp.zeros(n_params)),
-            knots=knots,
-            flow_layers=flow_layers,
-            tanh_max_val=tanh_max_val,
-            invert=True
-        )
-    else:
-        # No trainable copula: the base distribution alone, frozen so the rung
-        # is a genuine zero-parameter baseline rather than a fitted diagonal
-        # Gaussian.
-        flow = non_trainable(Normal(jnp.zeros(n_params)))
-    if whiten:
-        # Frozen Gaussian copula of the copula-space data, applied after the
-        # trained flow, so the flow only has to learn the departure from it.
-        flow = Transformed(flow, _whitening_affine(np.asarray(z_train)))
+    flow = triangular_spline_flow(
+        key,
+        base_dist=Normal(jnp.zeros(n_params)),
+        knots=knots,
+        flow_layers=flow_layers,
+        tanh_max_val=tanh_max_val,
+        invert=True
+    )
 
     # Keep the untrained copula: it is the baseline the divergence check
     # compares the fitted density against.
@@ -972,9 +886,7 @@ def _n_trainable_params(flow: Transformed) -> int:
 
     ``paramax.NonTrainable`` subtrees are excluded too: flowjax's training loop
     partitions them out of the optimizer, so they carry no fitted degrees of
-    freedom and must not count toward "model size". Without this, the frozen
-    whitening affine added by ``whiten=True`` would inflate a candidate's
-    reported size by ``d(d+1)/2 + d`` and distort the parsimony ranking.
+    freedom and must not count toward "model size".
     """
     leaves = jax.tree_util.tree_leaves(flow.base_dist, is_leaf=_is_frozen)
     return int(sum(leaf.size for leaf in leaves
@@ -2301,10 +2213,10 @@ def normalizing_flows_fit_auto(chain: np.ndarray,
     >>> from coppuccino import normalizing_flows_fit_auto
     >>> data = np.random.randn(2000, 2)
     >>> flow = normalizing_flows_fit_auto(data, max_epochs=100)   # doctest: +SKIP
-    >>> # an explicit capacity ladder, including a zero-parameter baseline:
+    >>> # an explicit capacity ladder:
     >>> flow = normalizing_flows_fit_auto(                        # doctest: +SKIP
     ...     data, prior_bounds=np.array([[-5, 5], [-5, 5]]),
-    ...     candidates=[{"flow_layers": 0, "whiten": True},
+    ...     candidates=[{"knots": 2, "flow_layers": 4},
     ...                 {"knots": 4, "flow_layers": 6},
     ...                 {"knots": 8, "flow_layers": 8}])
     """

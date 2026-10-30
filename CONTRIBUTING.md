@@ -49,7 +49,7 @@ uv lock --check            # the committed lockfile must match pyproject.toml
 the test suite. They need the optional `bench` group:
 
 ```bash
-uv run --group bench python scripts/bench_whitening.py --seeds 3
+uv run --group bench python scripts/bench_fleet_copula.py
 ```
 
 ## Reporting bugs
