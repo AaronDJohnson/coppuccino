@@ -181,10 +181,10 @@ files = ["src/coppuccino"]
 # fully-unannotated function for that probe to land in, which is the point.
 ignore_missing_imports = true
 check_untyped_defs = true
-# There are no module-wide `disable_error_code` overrides. Four per-line
+# There are no module-wide `disable_error_code` overrides. Three per-line
 # `# type: ignore[<code>]` remain, so a real error of the same code anywhere
-# else in the same module still fails the build. All four are equinox's
+# else in the same module still fails the build. All three are equinox's
 # AbstractVar/ClassVar shape fields and the __init__ signature it synthesises
-# from them: the two ClassVar fields of `SmoothMarginalToGaussian` in
-# bijections.py, and its two construction sites in copula_flows.py /
-# model_io.py.
+# from them, all in bijections.py: the two ClassVar fields of
+# `SmoothMarginalToGaussian`, and its one construction site,
+# `_smooth_marginal_bijection`.

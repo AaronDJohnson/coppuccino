@@ -1,5 +1,6 @@
 from typing import Any, Callable, ClassVar, NamedTuple, Optional
 
+import equinox as eqx
 import jax.numpy as jnp
 import numpy as np
 from flowjax.bijections import AbstractBijection
@@ -16,6 +17,11 @@ __all__ = [
 _POS_FLOOR = 1e-30    # keep quantities that sit in denominators strictly positive
 _NDTRI_FLOOR = 1e-300  # smallest ndtri argument that stays inside float64 range
 _LOG_SQRT_2PI = float(0.5 * np.log(2.0 * np.pi))
+
+
+def _float64_or_none(value: Any) -> Any:
+    """``value`` as a NumPy float64, or None (no bound or clamp on that side)."""
+    return None if value is None else np.float64(value)
 
 
 def _ndtri_floor(x: ArrayLike) -> float:
@@ -219,6 +225,29 @@ def _rqs_bulk(
         ``cdf(x)`` maps x -> CDF, ``inverse(u)`` maps CDF -> x, ``deriv(x)``
         is the closed-form CDF derivative (density). All are jnp-vectorized.
     """
+    xk_j, yk_j, dk_j = _rqs_bulk_knots(xg, cdf_vals,
+                                       edge_slope_floor=edge_slope_floor)
+
+    def cdf(x: ArrayLike) -> Array:
+        return _rqs_forward(x, xk_j, yk_j, dk_j)
+
+    def deriv(x: ArrayLike) -> Array:
+        return _rqs_derivative(x, xk_j, yk_j, dk_j)
+
+    def inverse(u: ArrayLike) -> Array:
+        return _rqs_inverse(u, xk_j, yk_j, dk_j)
+
+    return cdf, inverse, deriv
+
+
+def _rqs_bulk_knots(xg: ArrayLike, cdf_vals: ArrayLike,
+                    edge_slope_floor: float = 0.0) -> tuple[Array, Array, Array]:
+    """The knots ``(xk, yk, dk)`` behind :func:`_rqs_bulk`'s callables.
+
+    Same parameters as :func:`_rqs_bulk`; the three arrays are what
+    :func:`_rqs_forward`, :func:`_rqs_inverse` and :func:`_rqs_derivative`
+    take.
+    """
     xg = np.asarray(xg, dtype=float)
     yg = np.asarray(cdf_vals, dtype=float)
     # RQS needs strictly increasing x knots; drop any ties (cdf_vals is already
@@ -232,18 +261,7 @@ def _rqs_bulk(
     yk[-1] = yg[-1]
     dk = _rqs_knot_derivatives(xk, yk, edge_slope_floor=edge_slope_floor)
 
-    xk_j, yk_j, dk_j = jnp.asarray(xk), jnp.asarray(yk), jnp.asarray(dk)
-
-    def cdf(x: ArrayLike) -> Array:
-        return _rqs_forward(x, xk_j, yk_j, dk_j)
-
-    def deriv(x: ArrayLike) -> Array:
-        return _rqs_derivative(x, xk_j, yk_j, dk_j)
-
-    def inverse(u: ArrayLike) -> Array:
-        return _rqs_inverse(u, xk_j, yk_j, dk_j)
-
-    return cdf, inverse, deriv
+    return jnp.asarray(xk), jnp.asarray(yk), jnp.asarray(dk)
 
 
 # ----------------------------------------------------------------------
@@ -366,6 +384,31 @@ class _MarginalTail(NamedTuple):
     shape_x: jnp.ndarray
     shape_y: jnp.ndarray
     shape_d: jnp.ndarray
+    # Filled in by _tail_as_arrays, which is what every evaluated tail has
+    # been through; _make_tail leaves them unset.
+    log_slope: Any = None
+    log_gap: Any = None
+
+
+def _tail_as_arrays(t: _MarginalTail) -> _MarginalTail:
+    """``t`` with its numbers as float64 arrays, so jit traces them.
+
+    A Python float in a jitted function is compiled into the program, so a
+    map built from Python floats compiled afresh for every chain. ``wall`` and
+    ``alpha`` stay Python values because they choose which branch of
+    :func:`_tail_y` and friends is traced: they are part of the program, and
+    both come from the caller's settings rather than the data. ``log_slope``
+    and ``log_gap`` are the two logs :func:`_tail_log_deriv` needs, taken
+    here on the host as they always were (``log_gap`` only on a wall side,
+    the one place ``gap`` is positive).
+    """
+    f64 = np.float64
+    return t._replace(
+        u_edge=f64(t.u_edge), y_edge=f64(t.y_edge), slope=f64(t.slope),
+        y_min=f64(t.y_min), y_bound=f64(t.y_bound), gap=f64(t.gap),
+        beta=f64(t.beta), log_p_edge=f64(t.log_p_edge), r_floor=f64(t.r_floor),
+        log_slope=f64(np.log(t.slope)),
+        log_gap=f64(np.log(t.gap) if t.wall else 0.0))
 
 
 def _inset_wall_atoms(y: np.ndarray, bound: float, eps0: float,
@@ -500,10 +543,10 @@ def _tail_u(y: Array, t: _MarginalTail) -> Array:
 def _tail_log_deriv(u: Array, t: _MarginalTail) -> Array:
     """``log |dtheta/dz|`` on the tail; orientation-free, so it needs no sign."""
     if not t.wall:
-        return np.log(t.slope) - t.alpha * jnp.minimum(u - t.u_edge, 0.0)
+        return t.log_slope - t.alpha * jnp.minimum(u - t.u_edge, 0.0)
     # dtheta/dz = phi(u) / f(y), with f = p_edge S'(r) / gap the tail density
     s_deriv = _rqs_derivative(_tail_r(u, t), t.shape_x, t.shape_y, t.shape_d)
-    return (_log_phi(u) - t.log_p_edge + np.log(t.gap)
+    return (_log_phi(u) - t.log_p_edge + t.log_gap
             - jnp.log(jnp.maximum(s_deriv, _POS_FLOOR)))
 
 
@@ -512,16 +555,9 @@ def make_smooth_marginal(samples: np.ndarray,
                          prior_low: Optional[float] = None,
                          prior_high: Optional[float] = None,
                          tail_alpha: float = 0.0,
-                         # The three closures are ``Any`` rather than
-                         # ``Callable`` on purpose. Both callers splat this
-                         # tuple into ``SmoothMarginalToGaussian(...)``, whose
-                         # synthesised ``__init__`` mypy reads as starting
-                         # with flowjax's ``AbstractVar`` shape/cond_shape
-                         # (see the ClassVar note on that class); typing them
-                         # turns that existing positional mismatch into four
-                         # new arg-type errors in copula_flows and model_io,
-                         # which already carry a call-arg ignore for it.
-                         ) -> tuple[Any, Any, Any,
+                         ) -> tuple[Callable[[ArrayLike], Array],
+                                    Callable[[ArrayLike], Array],
+                                    Callable[[ArrayLike], Array],
                                     tuple[Optional[float], Optional[float]]]:
     """Build a clip-free marginal map ``theta(z)``: all of R onto the support.
 
@@ -581,6 +617,96 @@ def make_smooth_marginal(samples: np.ndarray,
         clamp; the sampling layer
         redraws such rows (see ``coppuccino.copula_flows.sample``) so the
         emitted stream matches the reported density everywhere.
+    """
+    marginal, x_clamps = _smooth_marginal_map(
+        samples, num_points=num_points, prior_low=prior_low,
+        prior_high=prior_high, tail_alpha=tail_alpha)
+
+    def theta_of_z(z: ArrayLike) -> Array:
+        return _marginal_theta(z, marginal)
+
+    def z_of_theta(theta: ArrayLike) -> Array:
+        return _marginal_z(theta, marginal)
+
+    def log_dtheta_dz(z: ArrayLike) -> Array:
+        return _marginal_log_dtheta_dz(z, marginal)
+
+    return theta_of_z, z_of_theta, log_dtheta_dz, x_clamps
+
+
+class _SmoothMarginalMap(NamedTuple):
+    """Every number one smooth marginal map evaluates, held as arrays.
+
+    Built by :func:`_smooth_marginal_map` and read by :func:`_marginal_theta`,
+    :func:`_marginal_z` and :func:`_marginal_log_dtheta_dz`. Holding them as
+    arrays rather than inside closures is what lets one compiled program
+    serve every chain of the same shape: jit traces arrays, but bakes a
+    closure's constants into the program it compiles.
+
+    ``knot_z`` / ``knot_theta`` / ``knot_slope`` are the bulk RQS knots
+    (z, theta and dtheta/dz). ``z1``, ``zK``, ``th1``, ``thK`` are the
+    outermost knots, where the tails take over, and ``z_clamp_lo`` /
+    ``z_clamp_hi`` are the z at which a bounded tail saturates (``-inf`` /
+    ``+inf`` on an unbounded side).
+    """
+    knot_z: Array
+    knot_theta: Array
+    knot_slope: Array
+    z1: Any
+    zK: Any
+    th1: Any
+    thK: Any
+    z_clamp_lo: Any
+    z_clamp_hi: Any
+    tail_lo: _MarginalTail
+    tail_hi: _MarginalTail
+
+
+def _marginal_theta(z: ArrayLike, m: _SmoothMarginalMap) -> Array:
+    """``theta(z)``: Gaussian space -> data space."""
+    z = jnp.asarray(z)
+    bulk = _rqs_forward(jnp.clip(z, m.z1, m.zK),
+                        m.knot_z, m.knot_theta, m.knot_slope)
+    return jnp.where(z < m.z1, _tail_y(z, m.tail_lo),
+                     jnp.where(z > m.zK, -_tail_y(-z, m.tail_hi), bulk))
+
+
+def _marginal_log_dtheta_dz(z: ArrayLike, m: _SmoothMarginalMap) -> Array:
+    """``log dtheta/dz``, evaluated at the clamp for z beyond it.
+
+    Beyond the clamp the forward map is constant, so the log-derivative is
+    taken at the clamp: a function of the *output point*, matching what
+    :func:`_marginal_z` reconstructs there.
+    """
+    z = jnp.clip(jnp.asarray(z), m.z_clamp_lo, m.z_clamp_hi)
+    bulk = jnp.log(jnp.maximum(
+        _rqs_derivative(jnp.clip(z, m.z1, m.zK),
+                        m.knot_z, m.knot_theta, m.knot_slope),
+        _POS_FLOOR))
+    return jnp.where(z < m.z1, _tail_log_deriv(z, m.tail_lo),
+                     jnp.where(z > m.zK, _tail_log_deriv(-z, m.tail_hi), bulk))
+
+
+def _marginal_z(theta: ArrayLike, m: _SmoothMarginalMap) -> Array:
+    """``z(theta)``: data space -> Gaussian space."""
+    theta = jnp.asarray(theta)
+    bulk = _rqs_inverse(jnp.clip(theta, m.th1, m.thK),
+                        m.knot_z, m.knot_theta, m.knot_slope)
+    return jnp.where(theta < m.th1, _tail_u(theta, m.tail_lo),
+                     jnp.where(theta > m.thK, -_tail_u(-theta, m.tail_hi), bulk))
+
+
+def _smooth_marginal_map(samples: np.ndarray, num_points: int = 200,
+                         prior_low: Optional[float] = None,
+                         prior_high: Optional[float] = None,
+                         tail_alpha: float = 0.0
+                         ) -> tuple[_SmoothMarginalMap,
+                                    tuple[Optional[float], Optional[float]]]:
+    """Build the map :func:`make_smooth_marginal` describes, as arrays.
+
+    Returns the :class:`_SmoothMarginalMap` and the ``(x_clamp_lo,
+    x_clamp_hi)`` pair; see :func:`make_smooth_marginal` for the
+    construction, the parameters and what the clamps mean.
     """
     from scipy.special import ndtri as _ndtri
 
@@ -664,12 +790,14 @@ def make_smooth_marginal(samples: np.ndarray,
     # parameterization supplies forward, inverse and derivative. The edge
     # slope floor keeps the join slopes m1/mK (and hence the tail rates)
     # non-degenerate when PCHIP's endpoint rule returns 0.
-    bulk_theta, bulk_z, bulk_deriv = _rqs_bulk(zq, thq, edge_slope_floor=0.05)
+    knots = _rqs_bulk_knots(zq, thq, edge_slope_floor=0.05)
 
     z1, zK = float(zq[0]), float(zq[-1])
     th1, thK = float(thq[0]), float(thq[-1])
-    m1 = float(np.maximum(np.asarray(bulk_deriv(jnp.asarray(z1))), _POS_FLOOR))
-    mK = float(np.maximum(np.asarray(bulk_deriv(jnp.asarray(zK))), _POS_FLOOR))
+    m1 = float(np.maximum(np.asarray(_rqs_derivative(jnp.asarray(z1), *knots)),
+                          _POS_FLOOR))
+    mK = float(np.maximum(np.asarray(_rqs_derivative(jnp.asarray(zK), *knots)),
+                          _POS_FLOOR))
 
     # Analytic tails beyond the outermost knots, each built in its own side's
     # outward coordinates (see :class:`_MarginalTail`), so the right tail is
@@ -692,31 +820,21 @@ def make_smooth_marginal(samples: np.ndarray,
     z_clamp_hi = (-float(_tail_u(jnp.asarray(tail_hi.y_min), tail_hi))
                   if prior_high is not None else np.inf)
 
-    def theta_of_z(z: ArrayLike) -> Array:
-        z = jnp.asarray(z)
-        bulk = bulk_theta(jnp.clip(z, z1, zK))
-        return jnp.where(z < z1, _tail_y(z, tail_lo),
-                         jnp.where(z > zK, -_tail_y(-z, tail_hi), bulk))
-
-    def log_dtheta_dz(z: ArrayLike) -> Array:
-        z = jnp.clip(jnp.asarray(z), z_clamp_lo, z_clamp_hi)
-        bulk = jnp.log(jnp.maximum(bulk_deriv(jnp.clip(z, z1, zK)), _POS_FLOOR))
-        return jnp.where(z < z1, _tail_log_deriv(z, tail_lo),
-                         jnp.where(z > zK, _tail_log_deriv(-z, tail_hi), bulk))
-
-    def z_of_theta(theta: ArrayLike) -> Array:
-        theta = jnp.asarray(theta)
-        bulk = bulk_z(jnp.clip(theta, th1, thK))
-        return jnp.where(theta < th1, _tail_u(theta, tail_lo),
-                         jnp.where(theta > thK, -_tail_u(-theta, tail_hi), bulk))
-
-    return theta_of_z, z_of_theta, log_dtheta_dz, (x_clamp_lo, x_clamp_hi)
+    marginal = _SmoothMarginalMap(
+        *knots,
+        z1=np.float64(z1), zK=np.float64(zK),
+        th1=np.float64(th1), thK=np.float64(thK),
+        z_clamp_lo=np.float64(z_clamp_lo), z_clamp_hi=np.float64(z_clamp_hi),
+        tail_lo=_tail_as_arrays(tail_lo), tail_hi=_tail_as_arrays(tail_hi))
+    return marginal, (x_clamp_lo, x_clamp_hi)
 
 
 class SmoothMarginalToGaussian(AbstractBijection):
     """Clip-free marginal bijection between data space and Gaussian space.
 
-    Wraps the closures from :func:`make_smooth_marginal`. There is no
+    Evaluates the map :func:`make_smooth_marginal` describes, from the
+    arrays in ``marginal`` (build one with :func:`_smooth_marginal_bijection`).
+    There is no
     probability-integral / inverse-normal composition with clipped endpoints:
     the map ``theta(z)`` is one analytic monotone object (RQS bulk + analytic
     tails), so the sampling direction and the density direction agree
@@ -810,18 +928,20 @@ class SmoothMarginalToGaussian(AbstractBijection):
     needs a change to the copula, not to this map.
 
     Trailing attributes are reconstruction metadata for
-    :mod:`coppuccino.model_io`.
+    :mod:`coppuccino.model_io`. Every number that depends on the data, the
+    map's own and the clamp and bound metadata alike, is held as a float64
+    array rather than a Python float: jit traces arrays but compiles Python
+    floats into the program, so this is what lets one compiled program serve
+    every chain of the same shape and settings.
     """
     samples: np.ndarray
-    theta_of_z: Callable
-    z_of_theta: Callable
-    log_dtheta_dz_fn: Callable
+    marginal: _SmoothMarginalMap
     num_points: int = 200
-    prior_low: Optional[float] = None
-    prior_high: Optional[float] = None
+    prior_low: Optional[float] = eqx.field(default=None, converter=_float64_or_none)
+    prior_high: Optional[float] = eqx.field(default=None, converter=_float64_or_none)
     tail_alpha: float = 0.0
-    x_clamp_lo: Optional[float] = None
-    x_clamp_hi: Optional[float] = None
+    x_clamp_lo: Optional[float] = eqx.field(default=None, converter=_float64_or_none)
+    x_clamp_hi: Optional[float] = eqx.field(default=None, converter=_float64_or_none)
     # flowjax declares shape/cond_shape as equinox ``AbstractVar``, which mypy
     # reads as instance variables of the base; a concrete ``ClassVar`` is the
     # intended implementation here (both are per-class constants).
@@ -831,11 +951,33 @@ class SmoothMarginalToGaussian(AbstractBijection):
     def transform_and_log_det(self, z: ArrayLike,
                               condition: Optional[ArrayLike] = None) -> tuple[Array, Array]:
         """Gaussian space -> data space (sampling direction)."""
-        x = self.theta_of_z(z)
-        return x, jnp.sum(self.log_dtheta_dz_fn(z))
+        x = _marginal_theta(z, self.marginal)
+        return x, jnp.sum(_marginal_log_dtheta_dz(z, self.marginal))
 
     def inverse_and_log_det(self, x: ArrayLike,
                             condition: Optional[ArrayLike] = None) -> tuple[Array, Array]:
         """Data space -> Gaussian space (training/density direction)."""
-        z = self.z_of_theta(x)
-        return z, -jnp.sum(self.log_dtheta_dz_fn(z))
+        z = _marginal_z(x, self.marginal)
+        return z, -jnp.sum(_marginal_log_dtheta_dz(z, self.marginal))
+
+
+def _smooth_marginal_bijection(samples: np.ndarray, num_points: int = 200,
+                               prior_low: Optional[float] = None,
+                               prior_high: Optional[float] = None,
+                               tail_alpha: float = 0.0
+                               ) -> SmoothMarginalToGaussian:
+    """The :class:`SmoothMarginalToGaussian` for one column of samples.
+
+    Parameters are those of :func:`make_smooth_marginal`; the bijection
+    keeps them, with the fitted clamps, as its reconstruction metadata.
+    """
+    marginal, (x_clamp_lo, x_clamp_hi) = _smooth_marginal_map(
+        samples, num_points=num_points, prior_low=prior_low,
+        prior_high=prior_high, tail_alpha=tail_alpha)
+    # mypy folds flowjax's AbstractVar shape/cond_shape into the synthesised
+    # __init__ as its first two parameters and so reports them missing. See
+    # the ClassVar note on the class.
+    return SmoothMarginalToGaussian(  # type: ignore[call-arg]
+        samples=samples, marginal=marginal, num_points=num_points,
+        prior_low=prior_low, prior_high=prior_high, tail_alpha=tail_alpha,
+        x_clamp_lo=x_clamp_lo, x_clamp_hi=x_clamp_hi)

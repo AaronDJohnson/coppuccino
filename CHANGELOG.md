@@ -80,7 +80,7 @@ density.
 - `normalizing_flows_fit` and `normalizing_flows_fit_auto` warn, with a count,
   when they drop rows that contain NaN or ±inf. 1.0.0 dropped NaN rows without
   saying so and let infinities through.
-- Saved files carry `format_version` (now 2), `kind`, and, for `save_flow`,
+- Saved files carry `format_version` (now 3), `kind`, and, for `save_flow`,
   `writer_version`. A load error can then name the file, what kind of model
   it holds, and the right loader.
 

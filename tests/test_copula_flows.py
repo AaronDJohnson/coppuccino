@@ -524,18 +524,24 @@ _TRAINING_STEP_COMPILE = re.compile(r"Compiling (?:jit\()?step\b")
 _DENSITY_PASS_COMPILE = re.compile(r"Compiling (?:jit\()?\w*log_prob\b")
 
 
-class TestTrainingCompilesOnce:
-    """A fit compiles flowjax's training step once, not once per input type.
+class TestCompiledProgramsAreReused:
+    """A fit compiles each program once, and later fits reuse them.
 
-    jit compiles a function again whenever an argument's type changes between
-    calls. One spline parameter of a fresh triangular spline flow is built
-    from a Python float, so JAX marks it weakly typed, and the first optimizer
-    update hands back an ordinary float64 array in its place: the second call
-    of the step no longer matched the first and every fit compiled it twice,
-    about 0.7 s each time on an 8-column chain.
+    On test-sized data compiling is most of what a fit costs, so a program
+    compiled twice, or compiled afresh by every fit, is the cost to avoid.
     """
 
     def test_one_fit_compiles_the_training_step_once(self, bounded_chain):
+        """Not once per input type.
+
+        jit compiles a function again whenever an argument's type changes
+        between calls. One spline parameter of a fresh triangular spline flow
+        is built from a Python float, so JAX marks it weakly typed, and the
+        first optimizer update hands back an ordinary float64 array in its
+        place: the second call of the step no longer matched the first and
+        every fit compiled it twice, about 0.7 s each time on an 8-column
+        chain.
+        """
         # Start from empty caches, so the count is this fit's own whatever
         # ran earlier in the process.
         jax.clear_caches()
@@ -567,6 +573,30 @@ class TestTrainingCompilesOnce:
         for pattern in (_TRAINING_STEP_COMPILE, _DENSITY_PASS_COMPILE):
             assert [m for m in first if pattern.match(m)]
             assert not [m for m in second if pattern.match(m)], pattern.pattern
+
+    def test_a_new_chain_of_the_same_shape_compiles_nothing(self):
+        """Another chain, same shape and settings: no program is compiled.
+
+        The marginal maps used to keep their spline and tail constants inside
+        Python closures built per chain, so the map from data to copula space
+        compiled afresh for every chain (about 0.7 s on 10 000 x 8). They now
+        hold those numbers as arrays, which jit traces instead of baking in.
+        Both chains have a bounded and an unbounded column, so both tail
+        kinds are covered.
+        """
+        def chain(seed):
+            rng = np.random.default_rng(seed)
+            return np.tanh(rng.standard_normal((600, 2))) * 3.0
+
+        knobs = {"max_epochs": 2, "flow_layers": 1, "show_progress": False,
+                 "prior_bounds": [[-3.0, 3.0], [-np.inf, np.inf]]}
+        jax.clear_caches()
+        with _compile_log() as first:
+            normalizing_flows_fit(chain(11), rng_seed=0, **knobs)
+        with _compile_log() as second:
+            normalizing_flows_fit(chain(12), rng_seed=1, **knobs)
+        assert [m for m in first if m.startswith("Compiling")]
+        assert not [m for m in second if m.startswith("Compiling")], second
 
     def test_sharing_the_template_functions_does_not_change_the_fit(
             self, monkeypatch, bounded_chain):

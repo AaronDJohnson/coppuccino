@@ -17,7 +17,7 @@ from flowjax.train.losses import MaximumLikelihoodLoss
 from paramax import non_trainable, unwrap
 from paramax.wrappers import NonTrainable
 
-from coppuccino.bijections import SmoothMarginalToGaussian, make_smooth_marginal
+from coppuccino.bijections import SmoothMarginalToGaussian, _smooth_marginal_bijection
 
 __all__ = [
     "normalizing_flows_fit", "normalizing_flows_fit_auto",
@@ -441,19 +441,9 @@ def _create_empirical_transforms(samples: np.ndarray, num_points: int = 200,
                 # clip-free diffeomorphism z in R <-> theta in (lo, hi):
                 # no CDF clip, no quantile clamp (no boundary sample atoms),
                 # no floored wall density (no cliffs); honest analytic tails.
-                theta_of_z, z_of_theta, log_dtheta_dz, x_clamps = \
-                    make_smooth_marginal(
-                        param_samples, num_points=num_points,
-                        prior_low=p_low, prior_high=p_high,
-                        tail_alpha=tail_alpha)
-                # mypy folds flowjax's AbstractVar shape/cond_shape into the
-                # synthesised __init__, so it reads these as the first two
-                # positional arguments. See the ClassVar note on the class.
-                empirical_transforms.append(non_trainable(SmoothMarginalToGaussian(  # type: ignore[call-arg]
-                    param_samples, theta_of_z, z_of_theta, log_dtheta_dz,
-                    num_points=num_points, prior_low=p_low, prior_high=p_high,
-                    tail_alpha=tail_alpha,
-                    x_clamp_lo=x_clamps[0], x_clamp_hi=x_clamps[1])))
+                empirical_transforms.append(non_trainable(_smooth_marginal_bijection(
+                    param_samples, num_points=num_points,
+                    prior_low=p_low, prior_high=p_high, tail_alpha=tail_alpha)))
             except ValueError as exc:
                 raise ValueError(f"parameter (column) {j}: {exc}") from exc
         else:
@@ -464,9 +454,20 @@ def _create_empirical_transforms(samples: np.ndarray, num_points: int = 200,
             )
 
     transform = Stack(empirical_transforms)
-    inverse_log_det = jax.jit(jax.vmap(transform.inverse_and_log_det))
+    inverse_log_det = functools.partial(_to_copula_space, transform)
 
     return transform, inverse_log_det
+
+
+@filter_jit
+def _to_copula_space(transform: Stack, x: jnp.ndarray) -> tuple:
+    """Map rows of ``x`` through ``transform`` into copula space, with log-dets.
+
+    A module-level function taking the transform as an argument, so that one
+    compiled program serves every transform of the same structure: the
+    marginals hold their numbers as arrays, which jit traces.
+    """
+    return jax.vmap(transform.inverse_and_log_det)(x)
 
 
 def _without_weak_types(tree):

@@ -6,9 +6,9 @@ import pytest
 from coppuccino import bijections, fleet
 from coppuccino.bijections import (
     _POS_FLOOR,
-    SmoothMarginalToGaussian,
     _rqs_bulk,
     _rqs_knot_derivatives,
+    _smooth_marginal_bijection,
     make_smooth_marginal,
 )
 
@@ -89,12 +89,8 @@ class TestSmoothMarginalBoundaryAtoms:
     def test_bound_row_and_nan_free_log_det(self):
         """Both directions stay finite and mutually consistent at the bound."""
         x, lo, hi = self._chain_with_upper_atom()
-        theta_of_z, z_of_theta, log_dtheta_dz, clamps = make_smooth_marginal(
-            x, prior_low=lo, prior_high=hi)
-        bij = SmoothMarginalToGaussian(
-            samples=x, theta_of_z=theta_of_z, z_of_theta=z_of_theta,
-            log_dtheta_dz_fn=log_dtheta_dz, prior_low=lo, prior_high=hi,
-            x_clamp_lo=clamps[0], x_clamp_hi=clamps[1])
+        bij = _smooth_marginal_bijection(x, prior_low=lo, prior_high=hi)
+        clamps = (float(bij.x_clamp_lo), float(bij.x_clamp_hi))
 
         # the tail saturates one _WALL_Z_MARGIN below its outermost knot, so
         # the last sliver of the support does share one z; probe outside it

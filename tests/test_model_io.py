@@ -185,6 +185,23 @@ class TestOldFormatFilesAreRefused:
             self._rewrite(path, lambda p: p.update(format_version=1))
             self._assert_refused(path, 1)
 
+    def test_a_version_2_file_is_refused(self, small_flow):
+        """Version 2 came from pre-release builds of 2.0.0.
+
+        Their marginal maps were compiled with the spline and tail constants
+        baked into the program, and XLA rounds some operations differently
+        that way (a division by a constant becomes a multiplication by its
+        reciprocal), so near the walls and deep in the tails a reload moved
+        by up to a few hundred float64 ulps. That is small, but a reload is
+        meant to reproduce the fitted density exactly, so they are refused
+        rather than rebuilt.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "flow.pkl"
+            save_flow(small_flow, path)
+            self._rewrite(path, lambda p: p.update(format_version=2))
+            self._assert_refused(path, 2)
+
     def test_a_unit_cube_file_is_refused(self):
         """The pre-release unit-cube pipeline's files are version 1 too.
 

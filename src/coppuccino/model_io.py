@@ -22,7 +22,7 @@ from flowjax.bijections import Stack
 from flowjax.distributions import Transformed
 from paramax import non_trainable, unwrap
 
-from coppuccino.bijections import SmoothMarginalToGaussian, make_smooth_marginal
+from coppuccino.bijections import SmoothMarginalToGaussian, _smooth_marginal_bijection
 
 __all__ = ["save_flow", "load_flow"]
 
@@ -38,13 +38,18 @@ __all__ = ["save_flow", "load_flow"]
 # no warning).
 # Bump this whenever such a change lands, and raise _MIN_FLOW_FORMAT_VERSION
 # with it.
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 
-# Oldest copula-flow format load_flow rebuilds. Version 2 is the first written
-# by the smooth-only marginal builder; everything older came from coppuccino
-# 1.0.0 (whose 'rqs' / 'pchip' marginals no longer exist) or from a
-# pre-release build. Fleet files keep their own rule (see FleetFlow.load).
-_MIN_FLOW_FORMAT_VERSION = 2
+# Oldest copula-flow format load_flow rebuilds. Version 3 is the first written
+# with the marginal maps held as arrays, which jit traces rather than compiles
+# in. Version 2 came from pre-release builds of 2.0.0 with the same builder but
+# the constants compiled into the program, which XLA rounds differently in
+# places (a division by a constant becomes a multiplication by its
+# reciprocal): near the walls and deep in the tails a reload moved by up to a
+# few hundred float64 ulps. Everything older came from coppuccino 1.0.0
+# (whose 'rqs' / 'pchip' marginals no longer exist) or from a pre-release
+# build. Fleet files keep their own rule (see FleetFlow.load).
+_MIN_FLOW_FORMAT_VERSION = 3
 
 # ``kind`` tags. The two writers in this package store disjoint key sets, so a
 # cross-kind load can never succeed; tagging lets it fail by name instead of on
@@ -373,19 +378,10 @@ def _reconstruct_empirical_transforms(spline_data: dict) -> Stack:
         prior_high = spline_data['prior_high'][i]
         tail_alpha = spline_data['tail_alpha'][i]
 
-        theta_of_z, z_of_theta, log_dtheta_dz, x_clamps = make_smooth_marginal(
+        empirical_transforms.append(non_trainable(_smooth_marginal_bijection(
             samples, num_points=num_points,
             prior_low=prior_low, prior_high=prior_high,
             tail_alpha=tail_alpha,
-        )
-        # mypy folds flowjax's AbstractVar shape/cond_shape into the
-        # synthesised __init__; see the ClassVar note on the class.
-        empirical_transforms.append(non_trainable(SmoothMarginalToGaussian(  # type: ignore[call-arg]
-            samples, theta_of_z, z_of_theta, log_dtheta_dz,
-            num_points=num_points,
-            prior_low=prior_low, prior_high=prior_high,
-            tail_alpha=tail_alpha,
-            x_clamp_lo=x_clamps[0], x_clamp_hi=x_clamps[1],
         )))
 
     return Stack(empirical_transforms)
@@ -567,7 +563,7 @@ def load_flow(path: Union[str, Path]) -> Transformed:
         holds a different kind of coppuccino model (for example a fleet, saved
         by `FleetFlow.save`), was written in a newer save format than this
         install understands, was written by coppuccino 1.0.0 or a pre-release
-        build (save format below 2: refit the chain, or pin coppuccino<2), or
+        build (save format below 3: refit the chain, or pin coppuccino<2), or
         is missing keys `save_flow` always writes. Every message quotes
         `path`.
 
