@@ -1,3 +1,6 @@
+import contextlib
+import logging
+import re
 from types import SimpleNamespace
 
 import jax
@@ -473,6 +476,58 @@ class TestWeightDecayReachesTheOptimizer:
                                                weight_decay=0.0)
         assert "optimizer" not in fit_kwargs
         assert fit_kwargs["learning_rate"] == 1e-3
+
+
+@contextlib.contextmanager
+def _compile_log():
+    """Collect JAX's "Compiling <program> ..." messages while the block runs.
+
+    JAX logs one per program it lowers, i.e. on every tracing-cache miss,
+    whether or not a persistent compilation cache then supplies the binary.
+    """
+    messages: list = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            messages.append(record.getMessage())
+
+    handler = _Collect()
+    logger = logging.getLogger("jax")
+    logger.addHandler(handler)
+    previous = jax.config.jax_log_compiles
+    jax.config.update("jax_log_compiles", True)
+    try:
+        yield messages
+    finally:
+        jax.config.update("jax_log_compiles", previous)
+        logger.removeHandler(handler)
+
+
+# flowjax's jitted training step. JAX names the program "step" up to 0.4.x and
+# "jit(step)" from 0.5 on.
+_TRAINING_STEP_COMPILE = re.compile(r"Compiling (?:jit\()?step\b")
+
+
+class TestTrainingCompilesOnce:
+    """A fit compiles flowjax's training step once, not once per input type.
+
+    jit compiles a function again whenever an argument's type changes between
+    calls. One spline parameter of a fresh triangular spline flow is built
+    from a Python float, so JAX marks it weakly typed, and the first optimizer
+    update hands back an ordinary float64 array in its place: the second call
+    of the step no longer matched the first and every fit compiled it twice,
+    about 0.7 s each time on an 8-column chain.
+    """
+
+    def test_one_fit_compiles_the_training_step_once(self, bounded_chain):
+        # Start from empty caches, so the count is this fit's own whatever
+        # ran earlier in the process.
+        jax.clear_caches()
+        with _compile_log() as compiled:
+            normalizing_flows_fit(bounded_chain, max_epochs=2, flow_layers=1,
+                                  show_progress=False)
+        step_compiles = [m for m in compiled if _TRAINING_STEP_COMPILE.match(m)]
+        assert len(step_compiles) == 1, step_compiles
 
 
 class TestDivergenceGuard:

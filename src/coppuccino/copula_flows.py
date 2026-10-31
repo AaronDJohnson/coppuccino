@@ -455,6 +455,22 @@ def _create_empirical_transforms(samples: np.ndarray, num_points: int = 200,
     return transform, inverse_log_det
 
 
+def _without_weak_types(tree):
+    """``tree`` with every floating-point array leaf given a definite dtype.
+
+    flowjax builds one spline parameter of a triangular spline flow from a
+    Python float, so JAX marks it *weakly typed*, and the first optimizer
+    update returns an ordinary float64 array in its place. jit treats that as
+    a new input type and compiles the training step a second time in every
+    fit (about 0.7 s on an 8-column chain). The values are unchanged: in x64
+    mode the weak leaf already holds float64 numbers.
+    """
+    return jax.tree_util.tree_map(
+        lambda leaf: jnp.asarray(leaf, dtype=leaf.dtype)
+        if eqx.is_inexact_array(leaf) else leaf,
+        tree)
+
+
 def _fit_chain_entry(
     input_flow: Transformed,
     transform: Stack,
@@ -732,14 +748,14 @@ def normalizing_flows_fit(chain: np.ndarray, *, rng_seed: int = 999,
 
     n_params = clean_chain.shape[1]
     # Gaussianized copula: triangular spline flow on unbounded space.
-    flow = triangular_spline_flow(
+    flow = _without_weak_types(triangular_spline_flow(
         key,
         base_dist=Normal(jnp.zeros(n_params)),
         knots=knots,
         flow_layers=flow_layers,
         tanh_max_val=tanh_max_val,
         invert=True
-    )
+    ))
 
     # Keep the untrained copula: it is the baseline the divergence check
     # compares the fitted density against.
