@@ -66,14 +66,17 @@ def _testbed_chain(n=5000, seed=7):
 def smooth_flow():
     """Fit once, reuse across tests (fits dominate test runtime).
 
-    30 epochs: the joint wall-ladder steps ``test_wall_ladder_no_cliff_no_floor``
-    bounds are 4.17 and 1.87 nats here against 4.15 and 1.79 at 60, while at
-    20 the dim-3 step reaches 1.98 of its 2.6 allowance.
+    60 epochs, not fewer. The largest joint wall-ladder steps
+    ``test_wall_ladder_no_cliff_no_floor`` bounds are 4.15 nats (dim 0,
+    against 5) and 1.79 (dim 3, against 2.6) here, and 3.88 and 1.35 on the
+    oldest supported dependencies. At 30 epochs they are 4.17 and 1.87. The
+    dim-0 step is tight at any length: 60-epoch fits at ``rng_seed`` 4 and 5
+    reach 4.68 and 4.24.
     """
     chain = _testbed_chain()
     flow = normalizing_flows_fit(
         chain, prior_bounds=BOUNDS,
-        max_epochs=30, rng_seed=3, show_progress=False,
+        max_epochs=60, rng_seed=3, show_progress=False,
     )
     return flow, chain
 
@@ -158,7 +161,8 @@ def test_unbounded_tails_invert_exactly_and_report_their_true_derivative():
     compared with their forward map. Both directions matter: sampling uses the
     forward map and ``log_prob`` the inverse and the derivative, so a slip in
     either leaves samples untouched and every density beyond the data wrong.
-    Measured: round trip within 2e-15 and derivative within 1.2e-9 here.
+    Measured: round trip within 3e-15 and derivative within 2.3e-9, on the
+    current and the oldest supported dependencies alike.
     """
     rng = np.random.default_rng(8)
     x = rng.standard_normal(3000)
@@ -228,9 +232,10 @@ def test_wall_ladder_no_cliff_no_floor(smooth_flow):
     extreme sample, so it is the deepest |z| the copula ever saw -- it
     extrapolates linearly, and the bounded tail is allowed to run
     ``_WALL_Z_MARGIN`` further before it saturates. Measured on this fixture
-    the joint ladder's largest per-decade step is 4.17 nats (dim 0) and 1.87
-    (dim 3), so the bound below is a pin on that extrapolation, not on the
-    marginal. The per-decade bound over the first
+    the joint ladder's largest per-decade step is 4.15 nats (dim 0) and 1.79
+    (dim 3), 3.88 and 1.35 on the oldest supported dependencies, so the bound
+    below is a pin on that extrapolation, not on the marginal. The per-decade
+    bound over the first
     six decades -- where |z| stays inside the copula's knots -- is the part
     that tests the marginal.
 
@@ -239,9 +244,8 @@ def test_wall_ladder_no_cliff_no_floor(smooth_flow):
     the same density. What must hold is that the plateau starts exactly where
     the builder says it does, and nowhere earlier. Letting the tail run to
     ``|z| = 8`` instead made all 15 rungs distinct but drove the wall value to
-    +12.87 (dim 0) and +11.96 (dim 3) against +9.91 and +2.51 with the margin
-    (+10.00 and +2.65 on the 30-epoch fixture here), above the density of any
-    draw the flow emits.
+    +12.87 (dim 0) and +11.96 (dim 3) against +9.91 and +2.51 with the margin,
+    above the density of any draw the flow emits.
     """
     flow, chain = smooth_flow
     med = np.median(chain, axis=0)
@@ -379,8 +383,10 @@ def test_sample_logprob_contract(smooth_flow):
     box and off the bounds is not enough: a clamped row sits on ``x_clamp_lo``
     / ``x_clamp_hi``, strictly inside the support, so a sampler whose redraw
     never ran would still pass that. On this fixture each of the two raw draws
-    below has a clamped row for the redraw to remove; the dedicated
-    redraw tests in ``test_copula_flows`` use a fixture with far more.
+    below has one clamped row for the redraw to remove, but on the oldest
+    supported dependencies neither has any, so there only the dedicated redraw
+    tests in ``test_copula_flows``, whose fixture has far more, catch a
+    sampler that skips the redraw.
     """
     flow, _ = smooth_flow
     s, lq = sample_and_log_prob(flow, n_samples=20_000, rng_seed=13)

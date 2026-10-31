@@ -46,8 +46,9 @@ def test_selects_and_returns_working_flow(data):
     that real candidates come back with a coherent table and that the flow
     handed back works. The floor on the selected held-out score is what the
     ``data`` fixture's wall atoms are for: the split fit scores -1.05 nats
-    here (both rungs, against about -0.91 for the continuous part of the true
-    law), removing the wall clamp from ``z_of_theta`` in a scratch copy drops
+    here (both rungs, on the current and the oldest supported dependencies,
+    and -1.01 to -1.06 at other seeds; about -0.91 for the continuous part of
+    the true law), removing the wall clamp from ``z_of_theta`` in a scratch copy drops
     it to -3.14, and the original defect -- about -5e5 nats per at-bound row --
     puts it thousands of nats down.
     """
@@ -495,8 +496,10 @@ def test_a_diverged_candidate_is_reported_as_failed_not_ok(data):
     candidate fit, which is the failure path this table already models.
 
     Eight epochs are enough: flowjax keeps the first epoch's parameters, so the
-    diverged rung's training log-density is -2335 nats against -4.7 for its
-    own initialization at 8 epochs exactly as at 20, against a 6-nat budget.
+    diverged rung's training log-density falls 2330 nats below its own
+    initialization (2335 on the oldest supported dependencies, and at least
+    1767 at other seeds), at 8 epochs exactly as at 20, against a 6-nat
+    budget.
     """
     with pytest.warns(UserWarning, match="excluded failed fits"):
         flow, table = normalizing_flows_fit_auto(

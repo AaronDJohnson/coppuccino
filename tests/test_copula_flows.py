@@ -206,11 +206,16 @@ class TestLogProbAccuracy:
         cov = np.array([[1.0, 0.6], [0.6, 1.0]])
         data = rng.multivariate_normal(mean, cov, size=8000)
 
-        # The best validation epoch of this fit is 23 (with max_epochs=120 it
-        # stops on patience at 48), so 40 epochs return the identical flow --
-        # corr 0.969, residual std 0.243 -- for less than half the training.
-        # Rows are what buy the margin: 4000 rows give 0.944 / 0.331 and
-        # 2000 rows fail the residual bound outright (0.526).
+        # 40 epochs, not more: measured at this seed and at seeds 1 and 2
+        # (data and fit alike), the 40-epoch fit keeps corr >= 0.960 and
+        # residual std <= 0.279 on both the current and the oldest supported
+        # dependencies. On current ones the best validation epoch is 22
+        # (seeds 1, 2: 25, 39), so 40 returns the same flow as 120. On the
+        # oldest (jax 0.4.38, optax 0.2.2) it is 55 (65, 49), so 40 stops
+        # short, but the 120-epoch fit scores no better: corr 0.961 to 0.969,
+        # std 0.237 to 0.276. Rows are what buy the margin: on current
+        # dependencies 4000 rows give 0.944 / 0.331 and 2000 rows fail the
+        # residual bound outright (0.526).
         flow = normalizing_flows_fit(
             data, rng_seed=0, max_epochs=40, patience=25, flow_layers=6,
             show_progress=False

@@ -34,11 +34,12 @@ def chains():
 def fleet(chains):
     """The shared trained fleet.
 
-    30 epochs, not more: the worst per-source correlation error the
-    dependence test reads (0.141 against its 0.2 bound) is the same at 30, 50
-    and 100 epochs, while at 20 it is 0.182.
+    100 epochs, not fewer: the worst per-source correlation error the
+    dependence test reads (against its 0.2 bound) is 0.141 here and 0.107 on
+    the oldest supported dependencies. At 30 epochs it is 0.141 here and 0.145
+    there, but a 30-epoch fit at ``rng_seed=3`` reaches 0.180 here.
     """
-    return normalizing_flows_fit_fleet(chains, BOUNDS, max_epochs=30,
+    return normalizing_flows_fit_fleet(chains, BOUNDS, max_epochs=100,
                                        rng_seed=1)
 
 
@@ -91,9 +92,9 @@ def test_density_integrates_to_the_mass_its_draws_put_there(fleet):
     knot grid, a sliver uniform points essentially never land in, while the
     sampler -- an independent path through the inverse spline and the copula's
     own sampler -- reaches it. With 1e5 points the integral's standard error is
-    at most 0.0063 (the most peaked source) and the fraction's 0.0006, so 0.03
-    is about five combined standard errors; the largest measured gap is
-    0.0038.
+    at most 0.0037 (the most peaked source) and the fraction's 0.0004, so 0.03
+    is about eight combined standard errors; the largest measured gap is
+    0.0042 here and 0.0037 on the oldest supported dependencies.
     """
     inset = 1e-6
     lo, hi = -1.0 + inset, 1.0 - inset
