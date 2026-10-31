@@ -1,5 +1,7 @@
 """Tests for fleet fitting (normalizing_flows_fit_fleet / FleetFlow)."""
 
+import builtins
+import errno
 import os
 import tempfile
 
@@ -30,7 +32,13 @@ def chains():
 
 @pytest.fixture(scope="module")
 def fleet(chains):
-    return normalizing_flows_fit_fleet(chains, BOUNDS, max_epochs=100,
+    """The shared trained fleet.
+
+    30 epochs, not more: the worst per-source correlation error the
+    dependence test reads (0.141 against its 0.2 bound) is the same at 30, 50
+    and 100 epochs, while at 20 it is 0.182.
+    """
+    return normalizing_flows_fit_fleet(chains, BOUNDS, max_epochs=30,
                                        rng_seed=1)
 
 
@@ -67,6 +75,35 @@ def test_per_source_dependence_learned(fleet, chains):
     assert np.max(np.abs(fit - true)) < 0.2
     # and the fleet actually distinguishes sources (spread preserved)
     assert np.corrcoef(fit, true)[0, 1] > 0.95
+
+
+def test_density_integrates_to_the_mass_its_draws_put_there(fleet):
+    """``log_prob`` is a normalized density, per source.
+
+    The other density checks here are finiteness, masking, agreement between
+    call paths and relative ordering, all of which a constant offset in the
+    marginal log-determinant (a dropped log of the box width, say) leaves
+    intact. A uniform Monte Carlo integral over the box does not.
+
+    The reference is the fraction of the fleet's own draws in the box inset
+    by 1e-6, rather than 1: each source's clipped second column puts its
+    lower-wall atom (0.2% to 2.8% of the mass) inside the 2e-9 inset of the
+    knot grid, a sliver uniform points essentially never land in, while the
+    sampler -- an independent path through the inverse spline and the copula's
+    own sampler -- reaches it. With 1e5 points the integral's standard error is
+    at most 0.0063 (the most peaked source) and the fraction's 0.0006, so 0.03
+    is about five combined standard errors; the largest measured gap is
+    0.0038.
+    """
+    inset = 1e-6
+    lo, hi = -1.0 + inset, 1.0 - inset
+    m = 100_000
+    u = np.random.default_rng(5).uniform(lo, hi, (m, DIM))
+    integral = (hi - lo) ** DIM * np.mean(
+        np.exp(fleet.log_prob(np.broadcast_to(u, (N, m, DIM)))), axis=1)
+    x = fleet.sample(m, rng_seed=6)
+    inside = np.mean(np.all((x > lo) & (x < hi), axis=-1), axis=1)
+    assert np.max(np.abs(integral - inside)) < 0.03, (integral, inside)
 
 
 def test_log_prob_is_minus_inf_outside_the_prior_box(fleet):
@@ -126,21 +163,6 @@ def test_log_prob_reports_nan_rows_as_unsupported(fleet):
     assert np.all(batched[:, 1:] == -np.inf)
 
 
-def test_source_index_matches_batched(fleet):
-    x = fleet.sample(200, rng_seed=4)
-    lp_all = fleet.log_prob(x)
-    for s in (0, N - 1):
-        assert np.allclose(fleet.log_prob(x[s], source_index=s), lp_all[s])
-
-
-def test_sample_source_index_matches_batched(fleet):
-    """The sample-side analogue: same seed, same draws as the fleet's slice."""
-    x = fleet.sample(128, rng_seed=11)
-    for s in (0, 1, N - 1, -1):
-        one = fleet.sample(128, rng_seed=11, source_index=s)
-        assert np.max(np.abs(one - x[s])) == 0.0
-
-
 def test_source_index_out_of_range_raises(fleet):
     """JAX clamps out-of-bounds indices, so the fleet has to reject them."""
     g = np.zeros((1, DIM))
@@ -154,12 +176,21 @@ def test_source_index_out_of_range_raises(fleet):
 
 
 def test_save_load_roundtrip_exact(fleet):
+    """Bitwise round trip, and the file carries the format and kind stamps."""
+    import cloudpickle
+
+    from coppuccino.model_io import FLEET_KIND, FORMAT_VERSION
+
     x = fleet.sample(300, rng_seed=5)
     lp = fleet.log_prob(x)
     with tempfile.TemporaryDirectory() as td:
         p = os.path.join(td, "fleet.pkl")
         fleet.save(p)
+        with open(p, "rb") as f:
+            payload = cloudpickle.load(f)
         f2 = FleetFlow.load(p)
+    assert payload["format_version"] == FORMAT_VERSION
+    assert payload["kind"] == FLEET_KIND
     assert f2.arch == fleet.arch
     assert np.max(np.abs(lp - f2.log_prob(x))) == 0.0
     s1 = fleet.sample(64, rng_seed=6)
@@ -168,28 +199,42 @@ def test_save_load_roundtrip_exact(fleet):
 
 
 def test_warm_start(chains, fleet):
-    f2 = normalizing_flows_fit_fleet(chains, BOUNDS, max_epochs=5,
-                                     rng_seed=1, warm_start=fleet)
+    """A warm start begins from the previous fleet's parameters.
+
+    At a learning rate of 1e-12 one epoch cannot move them measurably, so the
+    warm-started fleet must reproduce the previous one's density. The arch
+    tuple alone cannot show that: a fit that silently cold-started from the
+    same seed has an identical one.
+    """
+    f2 = normalizing_flows_fit_fleet(chains, BOUNDS, max_epochs=1,
+                                     learning_rate=1e-12, rng_seed=1,
+                                     warm_start=fleet)
     assert f2.arch[:5] == fleet.arch[:5]
-    x = f2.sample(500, rng_seed=7)
-    assert np.all(np.isfinite(f2.log_prob(x)))
+    x = fleet.sample(500, rng_seed=7)
+    assert np.max(np.abs(f2.log_prob(x) - fleet.log_prob(x))) < 1e-6
     # arch mismatch is rejected
     with pytest.raises(ValueError, match="warm_start"):
         normalizing_flows_fit_fleet(chains, BOUNDS, max_epochs=2,
                                     knots=2, warm_start=fleet)
 
 
-def test_arch_kwargs_respected(chains):
-    def nparams(fl):
-        leaves = jax.tree_util.tree_leaves(
-            eqx.filter(fl.params, eqx.is_inexact_array))
+def test_arch_kwargs_respected(chains, fleet):
+    """Non-default ``knots`` / ``flow_layers`` reach both the parameters and
+    the arch tuple ``load`` rebuilds from.
+
+    The parameter count is compared with a template built directly at those
+    settings, so dropping either keyword on its way to the initializer changes
+    it; the shared fleet is the default-architecture contrast.
+    """
+    def nparams(tree):
+        leaves = jax.tree_util.tree_leaves(eqx.filter(tree, eqx.is_inexact_array))
         return sum(int(np.prod(leaf.shape)) for leaf in leaves)
+
     small = normalizing_flows_fit_fleet(chains, BOUNDS, max_epochs=2,
                                         knots=2, flow_layers=3, rng_seed=1)
-    big = normalizing_flows_fit_fleet(chains, BOUNDS, max_epochs=2,
-                                      knots=8, flow_layers=8, rng_seed=1)
-    assert nparams(big) > nparams(small)
-    assert small.arch[2:4] == (2, 3) and big.arch[2:4] == (8, 8)
+    assert nparams(small.params) == N * nparams(fleet_mod._template(DIM, 2, 3))
+    assert nparams(small.params) < nparams(fleet.params)
+    assert small.arch[2:4] == (2, 3) and fleet.arch[2:4] == (4, 6)
 
 
 def test_determinism(chains):
@@ -255,24 +300,13 @@ def test_small_fleets_skip_the_traced_initializer(monkeypatch):
     assert len(calls) == flat < 9
 
 
-def test_load_rebuilds_a_single_template(fleet, monkeypatch):
-    """Deserialisation overwrites every value, so one template is enough."""
-    x = fleet.sample(64, rng_seed=8)
-    lp = fleet.log_prob(x)
-    with tempfile.TemporaryDirectory() as td:
-        p = os.path.join(td, "fleet.pkl")
-        fleet.save(p)
-        calls = _count_template_builds(monkeypatch)
-        f2 = FleetFlow.load(p)
-    assert len(calls) == 1
-    assert np.max(np.abs(lp - f2.log_prob(x))) == 0.0
-
-
-def test_load_allocates_no_storage_for_the_skeleton(fleet, monkeypatch):
-    """Deserialisation reads shape and dtype from `like` and overwrites every
-    value, so `like` must carry no device buffers. Materialising it allocated a
-    second full copy of the fleet's parameters purely to be discarded -- the
-    dominant avoidable term in load's memory, which at fleet scale is GBs.
+def test_load_builds_one_template_and_no_skeleton_storage(fleet, monkeypatch):
+    """Deserialisation reads only shape and dtype from `like` and overwrites
+    every value, so load needs one template and no device buffers for the
+    skeleton. Building one template per source made load scale with the
+    fleet, and materialising the skeleton allocated a second full copy of the
+    fleet's parameters purely to be discarded -- the dominant avoidable term in
+    load's memory, which at fleet scale is GBs.
     """
     x = fleet.sample(32, rng_seed=21)
     lp = fleet.log_prob(x)
@@ -289,29 +323,39 @@ def test_load_allocates_no_storage_for_the_skeleton(fleet, monkeypatch):
     with tempfile.TemporaryDirectory() as td:
         p = os.path.join(td, "fleet.pkl")
         fleet.save(p)
+        calls = _count_template_builds(monkeypatch)
         monkeypatch.setattr(fleet_mod.eqx, "tree_deserialise_leaves", spy)
         f2 = FleetFlow.load(p)
+    assert len(calls) == 1
     assert seen["leaves"] > 0            # the spy really did see the skeleton
     assert seen["bytes"] == 0
     assert np.max(np.abs(lp - f2.log_prob(x))) == 0.0
 
 
+class _StopBeforeTraining(Exception):
+    """Raised by a spy once it has seen what it needs; nothing is trained."""
+
+
 def test_training_split_does_not_pin_the_whole_u_tensor(monkeypatch):
-    """Only the two halves may stay resident, not a third whole-chain copy."""
+    """Only the two halves may stay resident, not a third whole-chain copy.
+
+    The spy stops the fit at the point it inspects, so no training step is
+    ever compiled.
+    """
     n_src, n_samp, dim = 3, 199, 2
     rng = np.random.default_rng(0)
     ch = rng.uniform(-1.0, 1.0, (n_src, n_samp, dim))
     n_val = max(1, int(round(n_samp * 0.1)))
     seen = {}
-    real = fleet_mod._stack_params
 
     def spy(*args, **kwargs):
         # reached immediately after the split and before any training step
         seen["shapes"] = {tuple(a.shape) for a in jax.live_arrays()}
-        return real(*args, **kwargs)
+        raise _StopBeforeTraining
 
     monkeypatch.setattr(fleet_mod, "_stack_params", spy)
-    normalizing_flows_fit_fleet(ch, BOUNDS, max_epochs=1, rng_seed=1)
+    with pytest.raises(_StopBeforeTraining):
+        normalizing_flows_fit_fleet(ch, BOUNDS, max_epochs=1, rng_seed=1)
     assert (n_src, n_samp - n_val, dim) in seen["shapes"]
     assert (n_src, n_val, dim) in seen["shapes"]
     assert (n_src, n_samp, dim) not in seen["shapes"]
@@ -402,14 +446,16 @@ def _knot_families(rng):
     ]
 
 
-@pytest.mark.parametrize("num_points", [60, 200])
-def test_vectorized_pchip_slopes_are_bitwise_the_scipy_loop(num_points):
+def test_vectorized_pchip_slopes_are_bitwise_the_scipy_loop():
     """`_build_fleet_knots` used to call scipy's PchipInterpolator once per
     (source, dimension) -- 80,000 constructions at the documented 10^4-source
     scale, and ~74% of the builder's time. The array form replacing it has to
     be bit-identical, ties, clipped walls and ragged boxes included, or the
-    same seeds stop reproducing the same fit.
+    same seeds stop reproducing the same fit. 200 grid points over 400
+    samples puts several quantiles between adjacent samples, so the CDF tie
+    bumps fire on every family.
     """
+    num_points = 200
     from coppuccino.bijections import _rqs_knot_derivatives
 
     rng = np.random.default_rng(11)
@@ -599,14 +645,11 @@ def test_input_validation(chains):
 
 
 @pytest.mark.parametrize("kwargs, name", [
-    ({"batch_size": -1}, "batch_size"),
     ({"batch_size": 0}, "batch_size"),
     ({"val_prop": 0.0}, "val_prop"),
     ({"val_prop": 1.0}, "val_prop"),
-    ({"val_prop": float("nan")}, "val_prop"),
     # rounds to every row, leaving nothing to train on
     ({"val_prop": 0.9999}, "val_prop"),
-    ({"learning_rate": -1e-2}, "learning_rate"),
     ({"learning_rate": 0.0}, "learning_rate"),
     ({"max_epochs": 0}, "max_epochs"),
     ({"patience": 0}, "patience"),
@@ -614,14 +657,16 @@ def test_input_validation(chains):
     ({"flow_layers": 0}, "flow_layers"),
     ({"num_points": 1}, "num_points"),
     ({"rng_seed": -1}, "rng_seed"),
-    ({"rng_seed": 1.5}, "rng_seed"),
 ])
 def test_training_settings_are_checked_by_name(chains, kwargs, name):
     """The fleet's training knobs get the single-flow fit's range checks.
 
     Unchecked, a negative batch_size, a non-positive learning_rate or
     max_epochs=0 returned a fleet that never trained, and batch_size=0,
-    val_prop=1.0 or knots=0 died on a bare ZeroDivisionError.
+    val_prop=1.0 or knots=0 died on a bare ZeroDivisionError. One boundary
+    value per knob shows it is wired to the check; the shared range helpers'
+    other branches are tested with ``normalizing_flows_fit``. ``val_prop`` has
+    three cases because three different checks guard it.
     """
     with pytest.raises(ValueError, match=name):
         normalizing_flows_fit_fleet(chains, BOUNDS, **kwargs)
@@ -633,14 +678,28 @@ def test_fit_options_are_keyword_only(chains):
 
 
 def test_a_source_that_never_trains_is_named(chains, monkeypatch):
-    """A source left at its initialization is reported, and the rest are kept.
+    """A source left at its initialization is reported, and the rest are kept
+    at their own best epoch.
 
     Per-source best parameters only move when that source's validation loss
     improves, so a source that never improves comes back untrained. Source 2
     is started from NaN parameters here, so its loss is NaN throughout, which
     no comparison ever counts as an improvement.
+
+    The same fit pins the per-source bookkeeping. From the second epoch on
+    the optimizer turns every update NaN for the odd-numbered sources while
+    the even ones keep training, so the odd sources' last epochs are NaN, and
+    in every later epoch some sources improve and others do not. They come
+    back finite only if the fit returns each source's best parameters rather
+    than its last, and the improvement mask keeps a source that did not
+    improve at its earlier best. Nothing else distinguishes either, since a
+    healthy fit's last epoch is about as good as its best.
     """
     real = fleet_mod._stack_params
+    real_adam = fleet_mod.optax.adam
+    # the fit's defaults: 200 of the 2000 rows held out, batches of 128
+    steps_per_epoch = (NSAMP - 200) // 128
+    odd = jnp.arange(N) % 2 == 1
 
     def poisoned(*args, **kwargs):
         params, static = real(*args, **kwargs)
@@ -648,7 +707,25 @@ def test_a_source_that_never_trains_is_named(chains, monkeypatch):
             lambda a: a.at[2].set(jnp.nan) if eqx.is_inexact_array(a) else a, params)
         return params, static
 
+    def adam_then_nan_for_odd_sources(learning_rate):
+        inner = real_adam(learning_rate)
+
+        def init(params):
+            return inner.init(params), jnp.zeros((), jnp.int32)
+
+        def update(grads, state, params=None):
+            inner_state, step = state
+            updates, inner_state = inner.update(grads, inner_state, params)
+            spoil = odd & (step >= steps_per_epoch)
+            updates = jax.tree_util.tree_map(
+                lambda u: jnp.where(spoil.reshape((-1,) + (1,) * (u.ndim - 1)),
+                                    jnp.nan, u), updates)
+            return updates, (inner_state, step + 1)
+
+        return fleet_mod.optax.GradientTransformation(init, update)
+
     monkeypatch.setattr(fleet_mod, "_stack_params", poisoned)
+    monkeypatch.setattr(fleet_mod.optax, "adam", adam_then_nan_for_odd_sources)
     with pytest.warns(UserWarning, match=r"1 of 6 sources .*\[2\]"):
         fl = normalizing_flows_fit_fleet(chains, BOUNDS, max_epochs=3, rng_seed=1)
     lp = fl.log_prob(chains[:, :200])
@@ -662,12 +739,13 @@ def test_a_fleet_that_never_trains_raises(chains):
                                     rng_seed=1)
 
 
-@pytest.mark.parametrize("n_samples", [0, -3, 10.5])
-def test_draw_counts_are_checked(fleet, n_samples):
+def test_draw_counts_are_checked(fleet):
+    """Both draw methods are wired to the shared ``n_samples`` check, whose
+    other branches are tested with the package-level ``sample``."""
     with pytest.raises(ValueError, match="n_samples"):
-        fleet.sample(n_samples, rng_seed=0)
+        fleet.sample(0, rng_seed=0)
     with pytest.raises(ValueError, match="n_samples"):
-        fleet.sample_and_log_prob(n_samples, rng_seed=0)
+        fleet.sample_and_log_prob(0, rng_seed=0)
 
 
 def test_a_damaged_fleet_file_is_named(fleet):
@@ -753,16 +831,24 @@ def test_a_box_far_wider_than_the_chain_does_not_swallow_it():
 
 
 def test_sample_and_log_prob_matches_sample_then_log_prob(fleet):
-    """Parity with the package-level verb, and bitwise-consistent densities."""
+    """Parity with the package-level verb, and bitwise-consistent densities.
+
+    For a fixed seed a single source's draws are the corresponding slice of
+    the whole-fleet draws, and its densities the slice of the batched ones --
+    at the first, a middle, the last and a negative index, since a falsy
+    ``source_index=0`` and an end-of-range clamp are the likely ways to get
+    that wrong.
+    """
     x, lp = fleet.sample_and_log_prob(128, rng_seed=12)
     assert x.shape == (N, 128, DIM)
     assert lp.shape == (N, 128)
     assert np.max(np.abs(x - fleet.sample(128, rng_seed=12))) == 0.0
     assert np.max(np.abs(lp - fleet.log_prob(x))) == 0.0
 
-    x1, lp1 = fleet.sample_and_log_prob(128, rng_seed=12, source_index=1)
-    assert np.max(np.abs(x1 - x[1])) == 0.0
-    assert np.max(np.abs(lp1 - lp[1])) == 0.0
+    for s in (0, 1, N - 1, -1):
+        x1, lp1 = fleet.sample_and_log_prob(128, rng_seed=12, source_index=s)
+        assert np.max(np.abs(x1 - x[s])) == 0.0
+        assert np.max(np.abs(lp1 - lp[s])) == 0.0
 
 
 def test_package_level_verbs_reject_a_fleet(fleet):
@@ -788,20 +874,6 @@ def test_package_level_verbs_reject_a_fleet(fleet):
         with pytest.raises(TypeError, match="fleet.save"):
             cp.save_flow(fleet, p)
         assert not os.path.exists(p)
-
-
-def test_saved_fleet_carries_version_and_kind(fleet):
-    import cloudpickle
-
-    from coppuccino.model_io import FLEET_KIND, FORMAT_VERSION
-
-    with tempfile.TemporaryDirectory() as td:
-        p = os.path.join(td, "fleet.pkl")
-        fleet.save(p)
-        with open(p, "rb") as f:
-            payload = cloudpickle.load(f)
-    assert payload["format_version"] == FORMAT_VERSION
-    assert payload["kind"] == FLEET_KIND
 
 
 def test_unstamped_legacy_fleet_file_still_loads(fleet):
@@ -846,19 +918,58 @@ def test_load_rejects_a_single_flow_file(fleet):
             FleetFlow.load(p)
 
 
+class _DiskFullHalfway:
+    """A writable file whose first write stores half the bytes, then fails
+    the way a full disk does."""
+
+    def __init__(self, f):
+        self._f = f
+
+    def write(self, data):
+        self._f.write(bytes(data)[: len(data) // 2])
+        self._f.flush()
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._f.close()
+        return False
+
+    def __getattr__(self, name):
+        return getattr(self._f, name)
+
+
 def test_failed_save_leaves_the_previous_fleet_intact(fleet, monkeypatch):
-    """The old writer opened the destination 'wb', which truncates on entry."""
+    """The old writer opened the destination 'wb', which truncates on entry.
+
+    The fault is injected in the write itself, after half the payload is on
+    disk, at both ways of getting a file to write to: ``os.fdopen`` (how the
+    atomic writer opens its temporary sibling) and ``open`` on a path in the
+    destination directory (how a direct writer would open the destination).
+    So a writer that truncates the destination fails here whichever it uses,
+    and the atomic one has a real half-written temporary file to clean up.
+    Failing earlier, inside ``cloudpickle.dumps``, could tell neither apart:
+    no write ever starts.
+    """
     x = fleet.sample(64, rng_seed=14)
+    real_fdopen, real_open = os.fdopen, builtins.open
     with tempfile.TemporaryDirectory() as td:
         p = os.path.join(td, "fleet.pkl")
         fleet.save(p)
         good = os.path.getsize(p)
 
-        def boom(*_a, **_kw):
-            raise OSError(28, "No space left on device")
+        def open_into_a_full_disk(file, mode="r", *args, **kwargs):
+            f = real_open(file, mode, *args, **kwargs)
+            in_td = (isinstance(file, (str, os.PathLike))
+                     and os.path.dirname(os.path.abspath(file)) == td)
+            return _DiskFullHalfway(f) if in_td and "r" not in mode else f
 
-        monkeypatch.setattr(fleet_mod.cloudpickle, "dumps", boom)
-        with pytest.raises(OSError):
+        monkeypatch.setattr(os, "fdopen", lambda fd, *args, **kwargs:
+                            _DiskFullHalfway(real_fdopen(fd, *args, **kwargs)))
+        monkeypatch.setattr(builtins, "open", open_into_a_full_disk)
+        with pytest.raises(OSError, match="No space left on device"):
             fleet.save(p)
         monkeypatch.undo()
 
