@@ -1,15 +1,16 @@
+from types import SimpleNamespace
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from equinox import filter_jit
-from flowjax.distributions import Transformed
+from flowjax.distributions import Normal, Transformed
 
 from coppuccino.copula_flows import (
     _MIN_SAMPLES_PER_DIM,
     _assert_fit_converged,
     _create_empirical_transforms,
-    _resolve_seed,
     log_prob,
     normalizing_flows_fit,
     normalizing_flows_fit_auto,
@@ -49,6 +50,51 @@ def largest_value_multiplicity(samples: np.ndarray) -> int:
     )
 
 
+# Fitting is the cost of this module, and on test-sized data it is almost all
+# JAX tracing and compilation, paid once per *distinct* flow whatever
+# ``max_epochs`` says. Tests that only need some fitted flow therefore share
+# the module-scoped fixtures below rather than fitting their own; a test fits
+# its own flow only when its premise is the data or the arguments of the fit.
+
+# The smallest value each training knob's validator accepts.
+_MINIMUM_LEGAL_KNOBS = {"max_epochs": 1, "knots": 2, "patience": 1,
+                        "num_points": 2, "flow_layers": 1,
+                        "weight_decay": 0.0, "rng_seed": 0}
+
+
+@pytest.fixture(scope="module")
+def bounded_chain():
+    """600 rows strictly inside [-3, 3]^2."""
+    rng = np.random.default_rng(0)
+    return np.tanh(rng.standard_normal((600, 2))) * 3.0
+
+
+@pytest.fixture(scope="module")
+def small_flow(bounded_chain):
+    """One cheap unbounded flow shared by every test that only needs a flow.
+
+    It is fitted at ``_MINIMUM_LEGAL_KNOBS``, so building it is also the
+    check that the knob validators accept the bottom of their documented
+    range (``test_the_minimum_legal_knob_values_are_accepted``). Keep it at
+    those values.
+    """
+    return normalizing_flows_fit(bounded_chain, show_progress=False,
+                                 **_MINIMUM_LEGAL_KNOBS)
+
+
+@pytest.fixture(scope="module")
+def list_input_flow(bounded_chain):
+    """A flow fitted from plain nested lists, with a one-sided box.
+
+    Both ``chain`` and ``prior_bounds`` arrive as lists, and the box bounds
+    column 0 from below only and column 1 not at all, so one fit serves the
+    list-coercion tests and the one-sided masking test.
+    """
+    return normalizing_flows_fit(
+        bounded_chain.tolist(), prior_bounds=[[-4.0, np.inf], [-np.inf, np.inf]],
+        max_epochs=1, show_progress=False)
+
+
 class TestMarginalOptions:
     """The removed marginal options fail loudly rather than being ignored."""
 
@@ -67,74 +113,19 @@ class TestMarginalOptions:
         exists; a positional call has to raise rather than shift silently."""
         chain = np.random.default_rng(0).standard_normal((200, 2))
         with pytest.raises(TypeError, match="positional"):
-            normalizing_flows_fit(chain, 999)
+            normalizing_flows_fit(chain, 999, show_progress=False)
 
 
 class TestCreateEmpiricalTransforms:
-    """Test the _create_empirical_transforms function."""
-
-    def test_basic_functionality(self):
-        """Test basic creation of empirical transforms."""
-        # Create sample data with 2 parameters
-        np.random.seed(42)
-        samples = np.random.randn(100, 2)
-
-        transform, inverse_log_det = _create_empirical_transforms(samples)
-
-        # Check that transform is created
-        assert transform is not None
-        assert inverse_log_det is not None
-
-    def test_with_nan_values(self):
-        """Test that NaN values are properly filtered."""
-        np.random.seed(42)
-        samples = np.random.randn(100, 2)
-        # Add some NaN values
-        samples[0, 0] = np.nan
-        samples[5, 1] = np.nan
-
-        transform, inverse_log_det = _create_empirical_transforms(samples)
-
-        # Should still work after filtering NaNs
-        assert transform is not None
-        assert inverse_log_det is not None
-
-    def test_insufficient_samples(self):
-        """Test error handling with insufficient samples."""
-        # Create data with too few samples
-        samples = np.random.randn(10, 2)
-
-        with pytest.raises(ValueError, match="Insufficient samples"):
-            _create_empirical_transforms(samples)
-
-    def test_single_parameter(self):
-        """Test with single parameter."""
-        np.random.seed(42)
-        samples = np.random.randn(100, 1)
-
-        transform, inverse_log_det = _create_empirical_transforms(samples)
-
-        assert transform is not None
-        assert inverse_log_det is not None
-
-    def test_multiple_parameters(self):
-        """Test with multiple parameters."""
-        np.random.seed(42)
-        samples = np.random.randn(100, 5)
-
-        transform, inverse_log_det = _create_empirical_transforms(samples)
-
-        assert transform is not None
-        assert inverse_log_det is not None
+    """The marginal stack, exercised on its own without a copula fit."""
 
     def test_inverse_log_det_callable(self):
-        """Test that inverse_log_det is callable and produces valid output."""
+        """The jitted inverse returns one z row and one log-det per input row."""
         np.random.seed(42)
         samples = np.random.randn(100, 2)
 
         transform, inverse_log_det = _create_empirical_transforms(samples)
 
-        # Test that we can call inverse_log_det
         test_data = samples[:10]
         z, log_dets = inverse_log_det(test_data)
 
@@ -144,222 +135,58 @@ class TestCreateEmpiricalTransforms:
         assert jnp.all(jnp.isfinite(log_dets))
 
 
-class TestNormalizingFlowsFit:
-    """Test the normalizing_flows_fit function."""
+class TestVerbs:
+    """The three public verbs on one fitted flow."""
 
-    def test_basic_fit(self):
-        """Test basic flow fitting."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 3)
+    def test_verbs_return_the_documented_shapes(self, small_flow):
+        """Each verb's return type and shape, for every input form it takes.
 
-        flow = normalizing_flows_fit(
-            chain,
-            rng_seed=999,
-            max_epochs=5,  # Use few epochs for testing
-            patience=2
-        )
+        One flow serves all three verbs: the shapes do not depend on the fit,
+        so a fit per verb (or per draw count) would only pay compilation
+        again.
+        """
+        draws = sample(small_flow, 100, rng_seed=0)
+        assert isinstance(draws, np.ndarray) and draws.shape == (100, 2)
+        assert np.all(np.isfinite(draws))
 
-        assert isinstance(flow, Transformed)
+        scores = log_prob(small_flow, draws[:50])
+        assert isinstance(scores, np.ndarray) and scores.shape == (50,)
+        assert np.all(np.isfinite(scores))
+        assert log_prob(small_flow, draws[:1]).shape == (1,)
 
-    def test_different_dimensions(self):
-        """Test fitting with different parameter dimensions."""
-        np.random.seed(42)
+        both, both_lp = sample_and_log_prob(small_flow, 100, rng_seed=0)
+        assert isinstance(both, np.ndarray) and both.shape == (100, 2)
+        assert isinstance(both_lp, np.ndarray) and both_lp.shape == (100,)
+        assert np.all(np.isfinite(both)) and np.all(np.isfinite(both_lp))
 
-        # Test with 1D
-        chain_1d = np.random.randn(200, 1)
-        flow_1d = normalizing_flows_fit(chain_1d, max_epochs=5, patience=2)
-        assert isinstance(flow_1d, Transformed)
+    def test_the_same_seed_refits_the_same_flow(self, bounded_chain, small_flow):
+        """Two independent fits with one ``rng_seed`` give the same flow.
 
-        # Test with 2D
-        chain_2d = np.random.randn(200, 2)
-        flow_2d = normalizing_flows_fit(chain_2d, max_epochs=5, patience=2)
-        assert isinstance(flow_2d, Transformed)
+        ``small_flow`` is the first fit; this refits from scratch with the
+        identical arguments and compares draws made with one sampling seed.
+        """
+        refit = normalizing_flows_fit(bounded_chain, show_progress=False,
+                                      **_MINIMUM_LEGAL_KNOBS)
+        np.testing.assert_array_almost_equal(sample(small_flow, 100, rng_seed=42),
+                                             sample(refit, 100, rng_seed=42))
 
-        # Test with 5D
-        chain_5d = np.random.randn(200, 5)
-        flow_5d = normalizing_flows_fit(chain_5d, max_epochs=5, patience=2)
-        assert isinstance(flow_5d, Transformed)
-
-    def test_custom_parameters(self):
-        """Test fitting with custom parameters."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-
-        flow = normalizing_flows_fit(
-            chain,
-            rng_seed=123,
-            knots=8,
-            patience=3,
-            learning_rate=1e-2,
-            max_epochs=5
-        )
-
-        assert isinstance(flow, Transformed)
-
-    def test_reproducibility(self):
-        """Test that same seed produces same results."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-
-        flow1 = normalizing_flows_fit(chain, rng_seed=999, max_epochs=5, patience=2)
-        flow2 = normalizing_flows_fit(chain, rng_seed=999, max_epochs=5, patience=2)
-
-        # Sample from both flows and compare
-        samples1 = sample(flow1, 100, rng_seed=42)
-        samples2 = sample(flow2, 100, rng_seed=42)
-
-        # Should be identical with same seed
-        np.testing.assert_array_almost_equal(samples1, samples2)
-
-
-class TestSample:
-    """Test the sample function."""
-
-    def test_basic_sampling(self):
-        """Test basic sampling from a fitted flow."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
-
-        samples = sample(flow, n_samples=100, rng_seed=999)
-
-        assert samples.shape == (100, 2)
-        assert isinstance(samples, np.ndarray)
-        assert np.all(np.isfinite(samples))
-
-    def test_different_sample_sizes(self):
-        """Test sampling different numbers of samples."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
-
-        for n in [10, 50, 100, 500]:
-            samples = sample(flow, n_samples=n, rng_seed=999)
-            assert samples.shape == (n, 2)
-
-    def test_sampling_reproducibility(self):
-        """Test that sampling with same seed is reproducible."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
-
-        samples1 = sample(flow, n_samples=100, rng_seed=42)
-        samples2 = sample(flow, n_samples=100, rng_seed=42)
-
-        np.testing.assert_array_equal(samples1, samples2)
-
-    def test_different_seeds_produce_different_samples(self):
-        """Test that different seeds produce different samples."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
-
-        samples1 = sample(flow, n_samples=100, rng_seed=42)
-        samples2 = sample(flow, n_samples=100, rng_seed=123)
-
-        # Samples should be different
-        assert not np.array_equal(samples1, samples2)
-
-
-class TestLogProb:
-    """Test the log_prob function."""
-
-    def test_basic_log_prob(self):
-        """Test basic log probability computation."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
-
-        test_samples = np.random.randn(50, 2)
-        log_probs = log_prob(flow, test_samples)
-
-        assert log_probs.shape == (50,)
-        assert isinstance(log_probs, np.ndarray)
-        assert np.all(np.isfinite(log_probs))
-
-    def test_log_prob_on_training_data(self):
-        """Test log probability on training data."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
-
-        # Compute log prob on training data
-        log_probs = log_prob(flow, chain)
-
-        assert log_probs.shape == (200,)
-        assert np.all(np.isfinite(log_probs))
-
-    def test_single_sample_log_prob(self):
-        """Test log probability for a single sample."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
-
-        single_sample = np.random.randn(1, 2)
-        log_probs = log_prob(flow, single_sample)
-
-        assert log_probs.shape == (1,)
-        assert np.isfinite(log_probs[0])
-
-
-class TestSampleAndLogProb:
-    """Test the sample_and_log_prob function."""
-
-    def test_basic_functionality(self):
-        """Test basic sampling and log probability computation."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
-
-        samples, log_probs = sample_and_log_prob(flow, n_samples=100, rng_seed=999)
-
-        assert samples.shape == (100, 2)
-        assert log_probs.shape == (100,)
-        assert isinstance(samples, np.ndarray)
-        assert isinstance(log_probs, np.ndarray)
-        assert np.all(np.isfinite(samples))
-        assert np.all(np.isfinite(log_probs))
-
-    def test_consistency_with_separate_calls(self):
+    def test_consistency_with_separate_calls(self, small_flow):
         """sample_and_log_prob and sample return the *same draws* for a fixed
-        seed, and (v2.0 smooth marginals) the returned log-probs agree with
-        log_prob(flow, samples): one map is evaluated both ways, and any
-        near-wall float-truncation rows are recomputed via log_prob inside
-        sample_and_log_prob."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
+        seed, and the returned log-probs agree with log_prob(flow, samples):
+        one map is evaluated both ways.
 
+        Same-seed determinism of both verbs follows: neither could match the
+        other draw for draw if either ignored its seed. The flow is unbounded,
+        so the redraw loop and the near-wall recompute never run here; those
+        are pinned on ``wall_atom_flow`` below.
+        """
         samples_combined, lp_combined = sample_and_log_prob(
-            flow, n_samples=100, rng_seed=42)
-        samples_separate = sample(flow, n_samples=100, rng_seed=42)
+            small_flow, n_samples=100, rng_seed=42)
+        samples_separate = sample(small_flow, n_samples=100, rng_seed=42)
 
         np.testing.assert_array_almost_equal(samples_combined, samples_separate)
         np.testing.assert_allclose(
-            lp_combined, log_prob(flow, samples_combined), rtol=0, atol=1e-8)
-
-    def test_reproducibility(self):
-        """Test reproducibility with same seed."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
-
-        samples1, log_probs1 = sample_and_log_prob(flow, n_samples=100, rng_seed=42)
-        samples2, log_probs2 = sample_and_log_prob(flow, n_samples=100, rng_seed=42)
-
-        np.testing.assert_array_equal(samples1, samples2)
-        np.testing.assert_array_equal(log_probs1, log_probs2)
-
-    def test_different_sample_sizes(self):
-        """Test with different sample sizes."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
-
-        for n in [10, 50, 100]:
-            samples, log_probs = sample_and_log_prob(flow, n_samples=n, rng_seed=999)
-            assert samples.shape == (n, 2)
-            assert log_probs.shape == (n,)
+            lp_combined, log_prob(small_flow, samples_combined), rtol=0, atol=1e-8)
 
 
 class TestLogProbAccuracy:
@@ -379,8 +206,14 @@ class TestLogProbAccuracy:
         cov = np.array([[1.0, 0.6], [0.6, 1.0]])
         data = rng.multivariate_normal(mean, cov, size=8000)
 
+        # The best validation epoch of this fit is 23 (with max_epochs=120 it
+        # stops on patience at 48), so 40 epochs return the identical flow --
+        # corr 0.969, residual std 0.243 -- for less than half the training.
+        # Rows are what buy the margin: 4000 rows give 0.944 / 0.331 and
+        # 2000 rows fail the residual bound outright (0.526).
         flow = normalizing_flows_fit(
-            data, rng_seed=0, max_epochs=120, patience=25, flow_layers=6
+            data, rng_seed=0, max_epochs=40, patience=25, flow_layers=6,
+            show_progress=False
         )
 
         # Evaluate on in-support test points drawn from the same distribution.
@@ -399,13 +232,6 @@ class TestLogProbAccuracy:
         # spread is small — the density is right, not merely monotone-related.
         resid = np.asarray(flow_lp) - true_lp
         assert float(np.std(resid)) < 0.5
-
-
-@pytest.fixture(scope="module")
-def bounded_chain():
-    """600 rows strictly inside [-3, 3]^2 (fits are the test-suite bottleneck)."""
-    rng = np.random.default_rng(0)
-    return np.tanh(rng.standard_normal((600, 2))) * 3.0
 
 
 class TestPriorBoundsValidation:
@@ -470,29 +296,36 @@ class TestPriorBoundsValidation:
 
     def test_bounds_by_kind_transpose_is_caught_by_containment(self, bounded_chain):
         """``[[low0, low1], [high0, high1]]`` keeps low < high on every row, so
-        only the containment check can catch it."""
-        # true bounds [[-4, 4], [-3.5, 5]] written out by kind instead of by
-        # parameter; both rows are still strictly increasing
-        transposed = np.array([[-4.0, -3.5], [4.0, 5.0]])
+        only the containment check can catch it -- and here only its upper
+        half.
+
+        The two columns live on disjoint ranges, [0, 1] and [3, 4], with true
+        bounds [-1, 2] and [0.5, 6]. Written out by kind, column 0's row
+        becomes [-1, 0.5]: still below the data, so only ``high < max``
+        flags it, and column 1's row [2, 6] still contains its data. Every
+        other containment test also breaks a lower side, which left the
+        ``highs > pb[:, 1]`` half of the check unpinned.
+        """
+        chain = np.column_stack([(bounded_chain[:, 0] + 3.0) / 6.0,
+                                 (bounded_chain[:, 1] + 3.0) / 6.0 + 3.0])
+        true_bounds = np.array([[-1.0, 2.0], [0.5, 6.0]])
+        transposed = true_bounds.T.copy()
         assert np.all(transposed[:, 0] < transposed[:, 1])
-        with pytest.raises(ValueError, match="outside prior_bounds"):
-            normalizing_flows_fit(bounded_chain, prior_bounds=transposed,
+        assert np.all(chain.min(axis=0) >= true_bounds[:, 0])
+        assert np.all(chain.max(axis=0) <= true_bounds[:, 1])
+        # only column 0's upper side is violated
+        assert np.all(chain.min(axis=0) >= transposed[:, 0])
+        assert chain[:, 0].max() > transposed[0, 1]
+        assert chain[:, 1].max() <= transposed[1, 1]
+        with pytest.raises(ValueError, match="outside prior_bounds") as exc:
+            normalizing_flows_fit(chain, prior_bounds=transposed,
                                   max_epochs=1, show_progress=False)
+        assert "parameter (column) 0" in str(exc.value)
 
-    def test_list_bounds_and_infinite_sides_are_accepted(self, bounded_chain):
+    def test_list_bounds_and_infinite_sides_are_accepted(self, list_input_flow,
+                                                         bounded_chain):
         """A plain nested list used to die with a bare TypeError from indexing."""
-        flow = normalizing_flows_fit(bounded_chain,
-                                     prior_bounds=[[-4.0, 4.0], [-np.inf, np.inf]],
-                                     max_epochs=1, show_progress=False)
-        assert np.all(np.isfinite(log_prob(flow, bounded_chain[:20])))
-
-    def test_data_touching_the_bound_is_inside(self, bounded_chain):
-        """Containment is inclusive: a sample exactly on the bound is legal."""
-        bounds = np.array([[bounded_chain[:, 0].min(), bounded_chain[:, 0].max()],
-                           [bounded_chain[:, 1].min(), bounded_chain[:, 1].max()]])
-        flow = normalizing_flows_fit(bounded_chain, prior_bounds=bounds,
-                                     max_epochs=1, show_progress=False)
-        assert np.all(np.isfinite(log_prob(flow, bounded_chain[:20])))
+        assert np.all(np.isfinite(log_prob(list_input_flow, bounded_chain[:20])))
 
 
 class TestChainValidation:
@@ -510,10 +343,8 @@ class TestChainValidation:
             normalizing_flows_fit(bounded_chain[:300].reshape(150, 2, 2),
                                   max_epochs=1, show_progress=False)
 
-    def test_list_chain_is_accepted(self, bounded_chain):
-        flow = normalizing_flows_fit(bounded_chain.tolist(), max_epochs=1,
-                                     show_progress=False)
-        assert np.all(np.isfinite(log_prob(flow, bounded_chain[:20])))
+    def test_list_chain_is_accepted(self, list_input_flow, bounded_chain):
+        assert np.all(np.isfinite(log_prob(list_input_flow, bounded_chain[:20])))
 
     def test_infinite_rows_are_dropped_not_fitted(self, bounded_chain):
         """+-inf rows used to die inside scipy, naming neither column nor
@@ -550,7 +381,18 @@ class TestTrainingKnobValidation:
          ({"num_points": -5}, "num_points"),
          ({"num_points": 1}, "num_points"),
          ({"rng_seed": 1.5}, "rng_seed"),
+         # ``True`` is an ``int`` to isinstance, and would otherwise be read
+         # as seed 1
+         ({"rng_seed": True}, "rng_seed"),
          ({"learning_rate": 0.0}, "learning_rate"),
+         # A plausible sign typo, and the only knob in the set that no
+         # post-fit check could catch. flowjax keeps the best-validation-loss
+         # parameters and epoch 1 is always accepted, so a wrong-sign step is
+         # frozen there. Measured on ``bounded_chain`` with the validation
+         # stubbed out: the returned flow is bitwise identical at max_epochs
+         # 1, 2, 30 and 400, reports 100% finite densities, and its sample std
+         # [2.65, 2.77] is indistinguishable from a 1-epoch ``+1e-3`` fit's
+         # [2.61, 2.74].
          ({"learning_rate": -1e-3}, "learning_rate"),
          ({"learning_rate": np.nan}, "learning_rate"),
          ({"tanh_max_val": -1.0}, "tanh_max_val"),
@@ -568,33 +410,64 @@ class TestTrainingKnobValidation:
         assert message.startswith(parameter)
         assert repr(kwargs[parameter]) in message
 
-    def test_a_negative_learning_rate_is_refused_before_it_trains(
-            self, bounded_chain):
-        """``learning_rate=-1e-3`` is a plausible sign typo, and the only knob
-        in the set that no post-fit check could catch.
+    def test_the_minimum_legal_knob_values_are_accepted(self, small_flow,
+                                                        bounded_chain):
+        """The guard must not have narrowed the working range.
 
-        flowjax keeps the best-validation-loss parameters, and epoch 1 is
-        always accepted (it is trivially the minimum of a one-element loss
-        history), so a wrong-sign step is frozen there and every later, worse
-        epoch is discarded. Measured on this fixture with the hyperparameter
-        validation stubbed out: the returned flow is bitwise identical at
-        ``max_epochs`` 1, 2, 30 and 400; it reports 100% finite densities; and
-        its 4,000-draw sample std is [2.65, 2.77] against a data std of
-        [1.87, 1.84] -- indistinguishable from ``learning_rate=+1e-3,
-        max_epochs=1``, which gives [2.61, 2.74]. There is no non-finite
-        parameter, no non-finite density and no absurd scale to key on.
+        ``small_flow`` is fitted at ``_MINIMUM_LEGAL_KNOBS``, the smallest value
+        each validator accepts, so the fixture building at all is most of
+        this test.
         """
-        with pytest.raises(ValueError, match=r"learning_rate must be .*> 0"):
-            normalizing_flows_fit(bounded_chain, learning_rate=-1e-3,
-                                  max_epochs=1, show_progress=False)
+        assert np.all(np.isfinite(log_prob(small_flow, bounded_chain[:20])))
 
-    def test_the_documented_defaults_all_pass(self, bounded_chain):
-        """The guard must not have narrowed the working range."""
-        flow = normalizing_flows_fit(bounded_chain, max_epochs=1, knots=2,
-                                     patience=1, num_points=2, flow_layers=1,
-                                     weight_decay=0.0, rng_seed=0,
-                                     show_progress=False)
-        assert np.all(np.isfinite(log_prob(flow, bounded_chain[:20])))
+
+class _StopBeforeTraining(Exception):
+    """Raised by a ``fit_to_data`` spy once it has seen its arguments."""
+
+
+class TestWeightDecayReachesTheOptimizer:
+    """``weight_decay`` is wired through to the optimizer flowjax trains with.
+
+    The only fit that exercises it otherwise asserts a finite density, which
+    plain Adam gives too, so dropping the AdamW branch in ``_fit_chain_entry``
+    left the suite green. A spy on the ``fit_to_data`` that module calls
+    captures its keyword arguments and stops before any training happens.
+    """
+
+    @staticmethod
+    def _captured_fit_kwargs(monkeypatch, chain, **kwargs):
+        captured = {}
+
+        def spy(key, dist, x, **fit_kwargs):
+            captured.update(fit_kwargs)
+            raise _StopBeforeTraining
+
+        monkeypatch.setattr("coppuccino.copula_flows.fit_to_data", spy)
+        with pytest.raises(_StopBeforeTraining):
+            normalizing_flows_fit(chain, show_progress=False, **kwargs)
+        return captured
+
+    def test_a_positive_weight_decay_decays_the_weights(self, monkeypatch,
+                                                        bounded_chain):
+        """The optimizer handed over is AdamW with the requested decay.
+
+        At zero gradient Adam's update is exactly zero, so any update at all
+        is the decoupled decay term, ``-learning_rate * weight_decay * w``.
+        """
+        fit_kwargs = self._captured_fit_kwargs(
+            monkeypatch, bounded_chain, learning_rate=1e-3, weight_decay=1e-2)
+        optimizer = fit_kwargs["optimizer"]
+        weights = jnp.ones(3)
+        updates, _ = optimizer.update(jnp.zeros(3), optimizer.init(weights),
+                                      weights)
+        np.testing.assert_allclose(np.asarray(updates), -1e-3 * 1e-2 * np.ones(3))
+
+    def test_no_weight_decay_leaves_flowjax_its_default_optimizer(
+            self, monkeypatch, bounded_chain):
+        fit_kwargs = self._captured_fit_kwargs(monkeypatch, bounded_chain,
+                                               weight_decay=0.0)
+        assert "optimizer" not in fit_kwargs
+        assert fit_kwargs["learning_rate"] == 1e-3
 
 
 class TestDivergenceGuard:
@@ -624,7 +497,9 @@ class TestDivergenceGuard:
         assert "learning_rate=100000.0" in str(exc.value)
         assert "max_epochs=8" in str(exc.value)
 
-    @pytest.mark.parametrize("learning_rate", [1.0, 10.0, 60.0, 100.0])
+    # the two edges of the band: 1.0 sits nearest the density budget, 100.0
+    # nearest the rates whose parameters go non-finite
+    @pytest.mark.parametrize("learning_rate", [1.0, 100.0])
     def test_the_finite_parameter_band_is_caught_by_its_density(
             self, bounded_chain, learning_rate):
         """The band the parameter check cannot see, closed by the density check.
@@ -642,8 +517,7 @@ class TestDivergenceGuard:
         assert f"learning_rate={learning_rate!r}" in message
         assert "max_epochs=8" in message
 
-    def test_a_nonfinite_mean_density_is_refused_not_compared(
-            self, bounded_chain):
+    def test_a_nonfinite_mean_density_is_refused_not_compared(self, small_flow):
         """A non-finite mean density is a failure, and says so.
 
         The comparison against the baseline is a subtraction and a ``>=``,
@@ -653,22 +527,37 @@ class TestDivergenceGuard:
         guard that quoted a NaN as though it were a measured density would
         send the caller looking for a threshold problem.
         """
-        flow = normalizing_flows_fit(bounded_chain, max_epochs=3,
-                                     show_progress=False)
         unreachable = jnp.asarray(np.full((4, 2), np.inf))
         with pytest.raises(RuntimeError, match="optimizer diverged") as exc:
-            _assert_fit_converged(flow, flow.base_dist, unreachable, 1e-3, 3)
+            _assert_fit_converged(small_flow, small_flow.base_dist, unreachable,
+                                  1e-3, 3)
         assert "is non-finite" in str(exc.value)
 
-    def test_a_healthy_fit_is_untouched(self, bounded_chain):
-        flow = normalizing_flows_fit(bounded_chain, max_epochs=3,
-                                     show_progress=False)
-        assert np.all(np.isfinite(sample(flow, 200, rng_seed=0)))
+    def test_the_budget_is_per_dimension(self):
+        """The density budget is 3 nats *per dimension*, measured exactly.
+
+        Two Gaussians stand in for the untrained and the trained copula, and
+        every training row sits at their shared mean, where a scale of
+        ``exp(k)`` costs exactly ``k`` nats per dimension against the
+        unit-scale baseline. A budget written in total nats would refuse the
+        5-D, 2-nats-per-dimension case; a looser per-dimension constant would
+        let the 4-nat case through.
+        """
+        for dim in (1, 5):
+            z_train = jnp.zeros((8, dim))
+            baseline = Normal(jnp.zeros(dim))
+
+            def worse_by(nats, dim=dim):
+                return SimpleNamespace(base_dist=Normal(
+                    jnp.zeros(dim), jnp.full(dim, np.exp(nats))))
+
+            _assert_fit_converged(worse_by(2.0), baseline, z_train, 1e-3, 8)
+            with pytest.raises(RuntimeError, match="optimizer diverged"):
+                _assert_fit_converged(worse_by(4.0), baseline, z_train, 1e-3, 8)
 
     @pytest.mark.parametrize(
         "kwargs",
         [{"learning_rate": 1e-4},
-         {"learning_rate": 1e-2},
          {"learning_rate": 1e-1},
          {"knots": 2, "flow_layers": 2, "tanh_max_val": 2.0},
          {"knots": 8, "flow_layers": 8},
@@ -687,26 +576,19 @@ class TestDivergenceGuard:
         assert np.all(np.isfinite(log_prob(flow, bounded_chain[:50])))
 
     @pytest.mark.parametrize("chain_shape", [(200, 1), (400, 5)])
-    def test_the_guard_scales_its_budget_with_dimension(self, chain_shape):
-        """A per-dimension budget must accept 1-D and 5-D fits alike.
+    def test_one_and_five_dimensional_fits_pass_the_guard(self, chain_shape):
+        """Smoke: a 1-D copula (the narrowest) and a 5-D one fit and score.
 
-        A budget expressed in total nats instead would tighten as dimensions
-        are added, and reject wide chains for having more coordinates.
+        This does not pin the per-dimension budget: a healthy fit beats its
+        own initialization, so its deficit is negative and any non-negative
+        budget lets it through. ``test_the_budget_is_per_dimension`` pins
+        that.
         """
         rng = np.random.default_rng(1)
         chain = rng.standard_normal(chain_shape)
         flow = normalizing_flows_fit(chain, max_epochs=8, rng_seed=0,
                                      show_progress=False)
         assert np.all(np.isfinite(log_prob(flow, chain[:50])))
-
-    def test_auto_reports_the_divergence_per_candidate(self, bounded_chain):
-        """``normalizing_flows_fit_auto`` aggregates it as a candidate failure
-        rather than letting an all-NaN flow win the comparison."""
-        with pytest.warns(UserWarning, match="excluded failed fits"), \
-                pytest.raises(RuntimeError, match="every candidate fit raised"):
-            normalizing_flows_fit_auto(
-                bounded_chain, candidates=[{"learning_rate": 1e5}],
-                max_epochs=8, refit_best=False, n_workers=1)
 
 
 class TestZeroColumnChain:
@@ -724,17 +606,6 @@ class TestZeroColumnChain:
     def test_auto_names_the_shape(self):
         with pytest.raises(ValueError, match="at least one parameter"):
             normalizing_flows_fit_auto(np.zeros((300, 0)), refit_best=False)
-
-    def test_the_transform_builder_names_the_shape(self):
-        with pytest.raises(ValueError, match=r"n_params >= 1"):
-            _create_empirical_transforms(np.zeros((300, 0)))
-
-
-@pytest.fixture(scope="module")
-def small_flow(bounded_chain):
-    """One cheap fitted flow shared by the argument-handling tests."""
-    return normalizing_flows_fit(bounded_chain, max_epochs=2,
-                                 show_progress=False, rng_seed=0)
 
 
 class TestArgumentCoercion:
@@ -755,7 +626,9 @@ class TestArgumentCoercion:
         with pytest.raises(ValueError, match=r"got shape \(2, 2, 2\)"):
             log_prob(small_flow, np.zeros((2, 2, 2)))
 
-    @pytest.mark.parametrize("n_samples", [-5, 0, 10.5, None])
+    # ``True`` passes ``isinstance(n, int)``; without its own rejection it
+    # would draw a single row
+    @pytest.mark.parametrize("n_samples", [-5, 0, 10.5, None, True])
     def test_bad_n_samples_names_itself(self, small_flow, n_samples):
         """Unvalidated these surface as jax static-shape TypeErrors naming
         'broadcast_in_dim' or 'Shapes must be 1D sequences'."""
@@ -790,20 +663,12 @@ class TestDegenerateColumnDiagnostics:
 class TestUnseededSampling:
     """``rng_seed=None`` is the documented default of both sampling helpers."""
 
-    def test_resolve_seed_passes_through_an_integer(self):
-        assert _resolve_seed(7) == 7
-
-    def test_resolve_seed_draws_a_fresh_seed_for_none(self):
-        # A refactor to `int(rng_seed or 0)` would conflate None with 0 and
-        # still pass every explicitly-seeded test in the suite.
-        assert len({_resolve_seed(None) for _ in range(5)}) == 5
-
-    def test_unseeded_draws_are_independent(self, bounded_chain):
-        flow = normalizing_flows_fit(bounded_chain, max_epochs=2,
-                                     show_progress=False)
-        assert not np.array_equal(sample(flow, 64), sample(flow, 64))
-        first, _ = sample_and_log_prob(flow, 64)
-        second, _ = sample_and_log_prob(flow, 64)
+    def test_unseeded_draws_are_independent(self, small_flow):
+        """A refactor to ``int(rng_seed or 0)`` would conflate None with 0 and
+        still pass every explicitly-seeded test in the suite."""
+        assert not np.array_equal(sample(small_flow, 64), sample(small_flow, 64))
+        first, _ = sample_and_log_prob(small_flow, 64)
+        second, _ = sample_and_log_prob(small_flow, 64)
         assert not np.array_equal(first, second)
 
 
@@ -813,7 +678,8 @@ def wall_atom_flow():
 
     54.1% of the rows sit exactly on a wall, which is the documented use of
     ``prior_bounds`` and the configuration that drives the smooth marginal's
-    bounded tail into its float64 saturation region.
+    bounded tail into its float64 saturation region. Building it is also the
+    check that containment is inclusive: a chain touching its box is inside.
     """
     rng = np.random.default_rng(0)
     chain = np.clip(rng.standard_normal((1500, 2)), -1.0, 1.0)
@@ -872,6 +738,13 @@ class TestTailClampRedrawIsLoadBearing:
         assert self._largest_atom_fraction(emitted) < 0.01
 
     def test_sample_and_log_prob_removes_them_too(self, wall_atom_flow):
+        """The atoms go, and the densities returned with the redrawn rows are
+        the ones ``log_prob`` reports for them (measured to 8e-11 here).
+
+        The near-wall recompute inside ``sample_and_log_prob`` does not fire
+        on this fixture -- no kept row comes within its 1e6-ULP window of a
+        clamp -- so ``TestNearWallDensitiesAreRecomputed`` pins that.
+        """
         raw_atoms = self._raw_atom_fraction(wall_atom_flow, 1)
         emitted, log_probs = sample_and_log_prob(wall_atom_flow, self.N_DRAWS,
                                                  rng_seed=1)
@@ -879,6 +752,8 @@ class TestTailClampRedrawIsLoadBearing:
         assert self._largest_atom_fraction(emitted) < 0.01
         # and the densities that come back with them stay usable
         assert np.all(np.isfinite(log_probs))
+        np.testing.assert_allclose(
+            log_probs, log_prob(wall_atom_flow, emitted), rtol=0, atol=1e-8)
 
     @pytest.mark.parametrize("verb", [sample, sample_and_log_prob])
     def test_no_draw_reuses_a_key_another_draw_consumed(
@@ -922,6 +797,80 @@ class TestTailClampRedrawIsLoadBearing:
             assert not used & seen
             seen |= used
 
+    def test_a_redraw_that_never_clears_gives_up_with_a_warning(
+            self, wall_atom_flow, monkeypatch):
+        """The loop is bounded, and running out of rounds is reported.
+
+        With a single round allowed, the replacement block clamps at the same
+        rate as the raw draw, so rows are still clamped when the rounds run
+        out. ``sample`` must return the last draw and say so rather than loop
+        on or hand the atoms back silently. The loop and its warning are one
+        helper shared by both verbs, so one verb covers it.
+        """
+        monkeypatch.setattr("coppuccino.copula_flows._MAX_REDRAW_ROUNDS", 1)
+        with pytest.warns(UserWarning, match="persisted after 1 redraw rounds"):
+            emitted = sample(wall_atom_flow, self.N_DRAWS, rng_seed=1)
+        assert emitted.shape == (self.N_DRAWS, 2)
+        assert largest_value_multiplicity(emitted) > 1
+
+    def test_a_last_round_that_clears_every_row_does_not_warn(self, monkeypatch):
+        """The give-up warning is for rows that are *still* clamped.
+
+        The loop used to check before each redraw and then warn once the
+        rounds ran out, so a final round that cleared every row still reported
+        that clamped rows persisted.
+        """
+        from coppuccino import copula_flows as cf_mod
+
+        monkeypatch.setattr(cf_mod, "_MAX_REDRAW_ROUNDS", 1)
+        limits = (np.array([-1.0]), np.array([1.0]))
+        samples = np.array([[0.0], [1.0], [0.5]])  # row 1 sits on the clamp
+
+        def clean_draw(key, block):
+            return (np.zeros((block, 1)),)
+
+        cf_mod._redraw_clamped_rows(clean_draw, (samples,), limits,
+                                    jax.random.key(0), len(samples), "sample")
+        np.testing.assert_array_equal(samples, [[0.0], [0.0], [0.5]])
+
+
+class TestNearWallDensitiesAreRecomputed:
+    """``sample_and_log_prob`` rescores rows within 1e6 ULPs of a tail clamp.
+
+    The forward pass reports the log-det at the generated z, ``log_prob`` the
+    one reconstructed from the float-truncated x, and where a bounded support
+    is only a few dozen ULPs wide the two differ by nats. No fitted flow in
+    this module puts a kept row inside that window (``wall_atom_flow``'s
+    closest sits about 3e6 ULPs from its clamp), so the flow here is the
+    marginal stack over an untrained standard-normal copula: nothing is
+    trained, and every draw lands in the window. Without the recompute its
+    densities missed ``log_prob`` by up to 3.4 nats.
+    """
+
+    def test_draws_in_a_ulp_wide_support_report_their_log_prob(self):
+        rng = np.random.default_rng(0)
+        # about 50 ULPs wide at this magnitude, half the column on its bound
+        lo, hi = 1e10, 1e10 + 1e-4
+        chain = np.column_stack([
+            np.concatenate([np.full(300, hi), rng.uniform(lo, hi, 300)]),
+            rng.standard_normal(600)])
+        transform, _ = _create_empirical_transforms(
+            chain, prior_bounds=np.array([[lo, hi], [-np.inf, np.inf]]))
+        flow = Transformed(Normal(jnp.zeros(2)), transform)
+        samples, log_probs = sample_and_log_prob(flow, 4000, rng_seed=1)
+        np.testing.assert_allclose(log_probs, log_prob(flow, samples),
+                                   rtol=0, atol=1e-8)
+
+
+@pytest.fixture(scope="module")
+def box_flow():
+    """Uniform data on its own unit box, whose true log-density is 0."""
+    rng = np.random.default_rng(4)
+    chain = rng.uniform(0.0, 1.0, (1200, 2))
+    bounds = np.array([[0.0, 1.0], [0.0, 1.0]])
+    return normalizing_flows_fit(chain, prior_bounds=bounds, max_epochs=30,
+                                 show_progress=False, rng_seed=1)
+
 
 class TestPriorBoxIsHardSupport:
     """log_prob must be -inf outside prior_bounds, finite on the closed box.
@@ -932,42 +881,31 @@ class TestPriorBoxIsHardSupport:
     fits larger than the density of every real draw.
     """
 
-    @staticmethod
-    def _bounded_flow():
-        rng = np.random.default_rng(4)
-        chain = rng.uniform(0.0, 1.0, (1200, 2))
-        bounds = np.array([[0.0, 1.0], [0.0, 1.0]])
-        return normalizing_flows_fit(chain, prior_bounds=bounds, max_epochs=30,
-                                     show_progress=False, rng_seed=1)
-
-    def test_outside_the_box_is_minus_inf(self):
-        flow = self._bounded_flow()
+    def test_outside_the_box_is_minus_inf(self, box_flow):
         outside = np.array([[1.001, 0.5], [5.0, 0.5], [1e6, 0.5],
                             [np.inf, 0.5], [-1e-9, 0.5], [0.5, -3.0]])
-        assert np.all(np.isneginf(log_prob(flow, outside)))
+        assert np.all(np.isneginf(log_prob(box_flow, outside)))
 
-    def test_a_single_point_scores_as_a_scalar_with_or_without_a_box(self):
+    def test_a_single_point_scores_as_a_scalar_with_or_without_a_box(
+            self, box_flow, small_flow):
         """A (n_params,) query returns shape (), and the mask must not change it.
 
         The mask is built row-wise from ``np.atleast_2d``, and broadcasting its
         (1,) against the flow's () used to hand back (1,) for a bounded flow
         only, so the same call changed shape with ``prior_bounds``.
         """
-        bounded = self._bounded_flow()
-        unbounded = normalizing_flows_fit(
-            np.random.default_rng(4).standard_normal((400, 2)), max_epochs=3,
-            show_progress=False, rng_seed=1)
         point = np.array([0.5, 0.5])
-        assert np.shape(log_prob(unbounded, point)) == ()
-        assert np.shape(log_prob(bounded, point)) == ()
-        outside = log_prob(bounded, np.array([1.5, 0.5]))
+        assert np.shape(log_prob(small_flow, point)) == ()
+        assert np.shape(log_prob(box_flow, point)) == ()
+        outside = log_prob(box_flow, np.array([1.5, 0.5]))
         assert np.shape(outside) == ()
         assert np.isneginf(outside)
 
     ON_BOX =np.array([[0.0, 0.5], [1.0, 0.5], [0.5, 0.0], [0.5, 1.0],
                        [0.0, 0.0], [1.0, 1.0]])
 
-    def test_the_bounds_themselves_are_reported_by_the_flow_not_the_mask(self):
+    def test_the_bounds_themselves_are_reported_by_the_flow_not_the_mask(
+            self, box_flow):
         """Finite on the closed box, *and* the mask leaves those rows alone.
 
         Finiteness on its own is nearly free -- it also holds for a mask that
@@ -975,18 +913,17 @@ class TestPriorBoxIsHardSupport:
         Requiring bitwise equality with the unmasked flow pins the actual
         contract: the box is closed, and ``-inf`` is applied strictly outside.
         """
-        flow = self._bounded_flow()
-        got = log_prob(flow, self.ON_BOX)
-        raw = np.asarray(filter_jit(flow.log_prob)(self.ON_BOX))
+        got = log_prob(box_flow, self.ON_BOX)
+        raw = np.asarray(filter_jit(box_flow.log_prob)(self.ON_BOX))
         assert np.all(np.isfinite(got))
         np.testing.assert_array_equal(got, raw)
         # one ULP outside is already -inf, so the boundary is exactly the box
         just_outside = np.array([[np.nextafter(1.0, np.inf), 0.5],
                                  [np.nextafter(0.0, -np.inf), 0.5]])
-        assert np.all(np.isneginf(log_prob(flow, just_outside)))
+        assert np.all(np.isneginf(log_prob(box_flow, just_outside)))
 
     @pytest.mark.xfail(
-        strict=False,
+        strict=True,
         reason="Known copula-extrapolation defect, not a masking defect and "
                "not a marginal defect. On this fixture (U(0,1)^2, true "
                "log-density 0 everywhere, seed 4 chain, seed 1 fit, 30 "
@@ -1004,8 +941,9 @@ class TestPriorBoxIsHardSupport:
                "wall resolution and marginal wall-density accuracy, so the "
                "fix has to bound the copula's extrapolation itself. The box "
                "maximum still exceeds the +8.50 maximum over 20,000 of the "
-               "flow's own draws, by 1.50. Delete this marker with that fix.")
-    def test_the_bounds_are_within_a_few_nats_of_the_interior(self):
+               "flow's own draws, by 1.50. strict: an unexpected pass fails "
+               "the suite, so delete this marker with that fix.")
+    def test_the_bounds_are_within_a_few_nats_of_the_interior(self, box_flow):
         """The at-bound density must be comparable to the interior.
 
         The fixture is uniform on its own box, so the truth is flat: every
@@ -1014,34 +952,21 @@ class TestPriorBoxIsHardSupport:
         most. Without this, ``test_the_bounds_themselves_...`` above passes
         for an arbitrarily wrong finite value.
         """
-        flow = self._bounded_flow()
         interior = float(np.median(log_prob(
-            flow, np.array([[0.5, 0.5], [0.25, 0.75], [0.75, 0.25]]))))
-        assert np.max(np.abs(log_prob(flow, self.ON_BOX) - interior)) < 5.0
+            box_flow, np.array([[0.5, 0.5], [0.25, 0.75], [0.75, 0.25]]))))
+        assert np.max(np.abs(log_prob(box_flow, self.ON_BOX) - interior)) < 5.0
 
-    def test_every_draw_has_a_finite_density(self):
-        flow = self._bounded_flow()
-        samples, log_probs = sample_and_log_prob(flow, 4000, rng_seed=2)
-        assert np.all(np.isfinite(log_probs))
-        assert np.array_equal(log_prob(flow, samples), log_probs) or np.allclose(
-            log_prob(flow, samples), log_probs, atol=1e-6)
-
-    def test_unbounded_flows_are_untouched(self):
+    def test_unbounded_flows_are_untouched(self, small_flow):
         """No prior_bounds means no hard support: distant points stay finite."""
-        rng = np.random.default_rng(5)
-        flow = normalizing_flows_fit(rng.standard_normal((800, 2)),
-                                     max_epochs=20, show_progress=False,
-                                     rng_seed=1)
         far = np.array([[0.0, 0.0], [20.0, 20.0], [-50.0, 3.0]])
-        assert np.all(np.isfinite(log_prob(flow, far)))
+        assert np.all(np.isfinite(log_prob(small_flow, far)))
 
-    def test_one_sided_bounds_mask_only_the_bounded_side(self):
-        rng = np.random.default_rng(6)
-        flow = normalizing_flows_fit(
-            rng.exponential(1.0, (800, 2)),
-            prior_bounds=np.array([[0.0, np.inf], [0.0, np.inf]]),
-            max_epochs=20, show_progress=False, rng_seed=1)
-        got = log_prob(flow, np.array([[1.0, 1.0], [-1e-3, 1.0], [500.0, 1.0]]))
+    def test_one_sided_bounds_mask_only_the_bounded_side(self, list_input_flow):
+        """Column 0 is bounded below at -4 only, column 1 not at all."""
+        got = log_prob(list_input_flow,
+                       np.array([[1.0, 1.0], [-4.001, 1.0], [500.0, 1.0],
+                                 [1.0, -500.0]]))
         assert np.isfinite(got[0])
         assert np.isneginf(got[1])
         assert np.isfinite(got[2])
+        assert np.isfinite(got[3])

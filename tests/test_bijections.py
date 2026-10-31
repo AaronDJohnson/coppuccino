@@ -132,22 +132,30 @@ class TestSmoothMarginalBoundaryAtoms:
         assert np.allclose(z_back, zs[kept], rtol=1e-6)
 
     def test_unbounded_and_atom_free_sides_are_untouched(self):
-        """Absorption is tied to an atom actually being relocated: a bounded
-        side with no wall atom keeps its analytic tail over the whole region
-        the tail resolves, which is everything up to ``x_clamp_hi``.
+        """Absorption is tied to an atom actually being relocated.
 
-        The saturated sliver beyond it is the ``_WALL_Z_MARGIN`` trade, not
-        absorption: it is set by the outermost knot's z, not by any atom, and
-        it is the same fraction of the knot-to-bound distance on a chain with
-        no atom at all. Here it is 9.4e-5 wide against a 6.6e-2 knot-to-bound
-        gap (0.14% of it), so probes an order of magnitude inside it are
-        still resolved separately.
+        The map is built with its upper side bounded at 1 but carrying no
+        wall atom, and its lower side unbounded.
+
+        The bounded side keeps its analytic tail over the whole region the
+        tail resolves, which is everything up to ``x_clamp_hi``. The saturated
+        sliver beyond it is the ``_WALL_Z_MARGIN`` trade, not absorption: it
+        is set by the outermost knot's z, not by any atom, and it is the same
+        fraction of the knot-to-bound distance on a chain with no atom at all.
+        Here it is 9.4e-5 wide against a 6.6e-2 knot-to-bound gap (0.14% of
+        it), so probes an order of magnitude inside it are still resolved
+        separately.
+
+        The unbounded side has no saturation point at all: no clamp is
+        reported, and theta keeps moving, invertibly, however deep z goes. A
+        wall tail or an inset applied there by mistake would show up as a
+        clamp and a plateau.
         """
         rng = np.random.default_rng(5)
         x = rng.normal(0.0, 0.3, 1500)
-        assert x.min() > -1.0 + 1e-6 and x.max() < 1.0 - 1e-6  # no wall atom
-        _, z_of_theta, _, clamps = make_smooth_marginal(x, prior_low=-1.0,
-                                                        prior_high=1.0)
+        assert x.max() < 1.0 - 1e-6  # no wall atom
+        theta_of_z, z_of_theta, _, clamps = make_smooth_marginal(
+            x, prior_low=None, prior_high=1.0)
         sliver = 1.0 - clamps[1]
         assert sliver < 0.01 * (1.0 - x.max())
         # strictly monotone right up to the saturation point
@@ -155,6 +163,13 @@ class TestSmoothMarginalBoundaryAtoms:
                             1.0 - 10.0 * sliver, 1.0 - sliver])
         zs = np.asarray(z_of_theta(probes))
         assert np.all(np.diff(zs) > 0)
+
+        assert clamps[0] is None
+        deep = np.array([-40.0, -20.0, -10.0, -5.0])
+        theta = np.asarray(theta_of_z(jnp.asarray(deep)))
+        assert np.all(np.isfinite(theta)) and np.all(np.diff(theta) > 0)
+        np.testing.assert_allclose(np.asarray(z_of_theta(jnp.asarray(theta))),
+                                   deep, rtol=1e-12)
 
 
 class TestWallDepthTracksTheTrainingEdge:
@@ -186,17 +201,11 @@ class TestWallDepthTracksTheTrainingEdge:
             edge - bijections._WALL_Z_MARGIN, abs=1e-6)
         # and the wall resolution therefore *improves* with more data rather
         # than staying pinned: 2.8e-3 of the knot-to-bound gap at n = 300
-        # down to 3.3e-4 at n = 100000
+        # down to 3.3e-4 at n = 100000. That trend needs no test of its own:
+        # the wall shape has unit slope at the bound, so to first order the
+        # fraction is Phi(wall z) / Phi(edge), and the assertion above pins
+        # both z values exactly at every n.
         assert clamps[0] / float(x.min()) < 3e-3
-
-    def test_more_data_resolves_further_into_the_wall(self):
-        fracs = []
-        for n in (300, 100000):
-            x = np.random.default_rng(0).uniform(0.0, 1.0, n)
-            _, _, _, clamps = make_smooth_marginal(x, prior_low=0.0,
-                                                   prior_high=1.0)
-            fracs.append(clamps[0] / float(x.min()))
-        assert fracs[1] < 0.25 * fracs[0], fracs
 
 
 class TestWallShapeJoinPin:

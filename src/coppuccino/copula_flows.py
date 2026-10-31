@@ -1493,6 +1493,8 @@ def _redraw_clamped_rows(draw: Callable[[jax.Array, int], tuple],
         key, sub = jr.split(key)
         for target, fresh in zip(arrays, draw(sub, block)):
             target[bad] = np.asarray(fresh)[:m]
+    if not _clamped_rows(samples, limits).any():
+        return
     warnings.warn(
         f"{verb}(): tail-clamped rows persisted after "
         f"{_MAX_REDRAW_ROUNDS} redraw rounds; returning the last "
