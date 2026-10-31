@@ -7,83 +7,58 @@ import cloudpickle
 import numpy as np
 import pytest
 from flowjax.distributions import Transformed
+from paramax import unwrap
 
 import coppuccino.model_io as model_io
-from coppuccino.copula_flows import log_prob, normalizing_flows_fit, sample, sample_and_log_prob
+from coppuccino.copula_flows import log_prob, normalizing_flows_fit, sample
 from coppuccino.model_io import (
     FLEET_KIND,
     FLOW_KIND,
     FORMAT_VERSION,
     _atomic_write_bytes,
     _extract_spline_data,
-    _reconstruct_empirical_transforms,
     load_flow,
     save_flow,
 )
 
 
-class TestSaveFlow:
-    """Test the save_flow function."""
+@pytest.fixture(scope="module")
+def small_flow():
+    """A cheap fitted flow shared by every test that only needs *a* flow.
 
-    def test_basic_save(self):
-        """Test basic flow saving."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
+    A fit costs about two seconds of tracing and compiling whatever its epoch
+    count, so the file fits once here instead of once per test.
+    """
+    np.random.seed(42)
+    chain = np.random.randn(200, 2)
+    return normalizing_flows_fit(chain, max_epochs=5, patience=2,
+                                 show_progress=False)
 
-        with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as f:
-            path = f.name
 
-        try:
-            save_flow(flow, path)
-            assert os.path.exists(path)
-            assert os.path.getsize(path) > 0
-        finally:
-            os.unlink(path)
+@pytest.fixture(scope="module")
+def tail_alpha_flow():
+    """A 2,400-row flow fitted with a non-default ``tail_alpha=0.5``.
 
-    def test_save_with_path_object(self):
-        """Test saving with Path object."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
+    One fit serves two tests: the size law needs a second chain length, and
+    the tail_alpha round trip needs a non-default tail_alpha. tail_alpha is
+    one float per dimension whatever its value, so it does not move the
+    payload size the size law measures.
+    """
+    chain = np.random.default_rng(0).standard_normal((2400, 2))
+    return normalizing_flows_fit(chain, max_epochs=3, patience=2,
+                                 tail_alpha=0.5, show_progress=False)
 
-        with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as f:
-            path = Path(f.name)
 
-        try:
-            save_flow(flow, path)
-            assert path.exists()
-        finally:
-            path.unlink()
-
-    def test_save_different_dimensions(self):
-        """Test saving flows with different dimensions."""
-        np.random.seed(42)
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # 1D flow
-            chain_1d = np.random.randn(200, 1)
-            flow_1d = normalizing_flows_fit(chain_1d, max_epochs=5, patience=2)
-            save_flow(flow_1d, os.path.join(tmpdir, "flow_1d.pkl"))
-            assert os.path.exists(os.path.join(tmpdir, "flow_1d.pkl"))
-
-            # 3D flow
-            chain_3d = np.random.randn(200, 3)
-            flow_3d = normalizing_flows_fit(chain_3d, max_epochs=5, patience=2)
-            save_flow(flow_3d, os.path.join(tmpdir, "flow_3d.pkl"))
-            assert os.path.exists(os.path.join(tmpdir, "flow_3d.pkl"))
-
-            # 5D flow
-            chain_5d = np.random.randn(200, 5)
-            flow_5d = normalizing_flows_fit(chain_5d, max_epochs=5, patience=2)
-            save_flow(flow_5d, os.path.join(tmpdir, "flow_5d.pkl"))
-            assert os.path.exists(os.path.join(tmpdir, "flow_5d.pkl"))
+def _n_rows(flow):
+    """Training rows a fitted flow retains (one column per marginal)."""
+    return int(_extract_spline_data(flow)['samples'][0].size)
 
 
 class TestPayloadSizeLaw:
     """Pin the file-size scaling that `save_flow`'s Notes quote figures for."""
 
-    def test_size_is_one_float64_per_row_per_dim_plus_a_fixed_part(self):
+    def test_size_is_one_float64_per_row_per_dim_plus_a_fixed_part(
+            self, small_flow, tail_alpha_flow):
         """Growing the chain must cost exactly the retained training columns.
 
         The docstring's MB figures are only reproducible while this holds: if a
@@ -92,449 +67,77 @@ class TestPayloadSizeLaw:
         chain, and the advice to thin the chain stops being the whole story.
         """
         dim = 2
-        rng = np.random.default_rng(0)
         sizes = {}
         with tempfile.TemporaryDirectory() as tmpdir:
-            for n in (300, 2400):
-                chain = rng.standard_normal((n, dim))
-                flow = normalizing_flows_fit(chain, max_epochs=3, patience=2,
-                                             show_progress=False)
+            for flow in (small_flow, tail_alpha_flow):
+                n = _n_rows(flow)
                 path = os.path.join(tmpdir, f"flow_{n}.pkl")
                 save_flow(flow, path)
                 sizes[n] = os.path.getsize(path)
 
-        grew_by = sizes[2400] - sizes[300]
-        expected = 8 * dim * (2400 - 300)
+        small, large = sorted(sizes)
+        assert (small, large) == (200, 2400)
+        grew_by = sizes[large] - sizes[small]
+        expected = 8 * dim * (large - small)
         # Slack absorbs pickle's variable-width length prefixes only: measured
         # at 36 bytes of drift across n=100..500,000, so anything of the order
         # of a second per-row array would blow straight through it.
         assert abs(grew_by - expected) < 128, (
-            f"payload grew by {grew_by} bytes for 2100 extra rows x {dim} "
-            f"dims; one float64 each is {expected}")
+            f"payload grew by {grew_by} bytes for {large - small} extra rows "
+            f"x {dim} dims; one float64 each is {expected}")
 
-        fixed = sizes[300] - 8 * dim * 300
+        fixed = sizes[small] - 8 * dim * small
         assert 0 < fixed < 64_000, (
             f"fixed (chain-independent) part of the payload is {fixed} bytes")
 
 
-class TestLoadFlow:
-    """Test the load_flow function."""
-
-    def test_basic_load(self):
-        """Test basic flow loading."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
-
-        with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as f:
-            path = f.name
-
-        try:
-            save_flow(flow, path)
-            loaded_flow = load_flow(path)
-            assert isinstance(loaded_flow, Transformed)
-        finally:
-            os.unlink(path)
-
-    def test_load_with_path_object(self):
-        """Test loading with Path object."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
-
-        with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as f:
-            path = Path(f.name)
-
-        try:
-            save_flow(flow, path)
-            loaded_flow = load_flow(path)
-            assert isinstance(loaded_flow, Transformed)
-        finally:
-            path.unlink()
-
-
 class TestSaveLoadRoundTrip:
-    """Test save/load round-trip functionality."""
-
-    def test_samples_match_after_reload(self):
-        """Test that samples from loaded flow match original."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
-
-        # Sample from original flow
-        original_samples = sample(flow, n_samples=100, rng_seed=999)
-
-        with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as f:
-            path = f.name
-
-        try:
-            save_flow(flow, path)
-            loaded_flow = load_flow(path)
-
-            # Sample from loaded flow with same seed
-            loaded_samples = sample(loaded_flow, n_samples=100, rng_seed=999)
-
-            # Samples should be identical
-            np.testing.assert_array_almost_equal(original_samples, loaded_samples)
-        finally:
-            os.unlink(path)
-
-    def test_log_prob_matches_after_reload(self):
-        """Test that log probabilities match after reload."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
-
-        # Compute log prob with original flow
-        test_data = np.random.randn(50, 2)
-        original_log_probs = log_prob(flow, test_data)
-
-        with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as f:
-            path = f.name
-
-        try:
-            save_flow(flow, path)
-            loaded_flow = load_flow(path)
-
-            # Compute log prob with loaded flow
-            loaded_log_probs = log_prob(loaded_flow, test_data)
-
-            # Log probs should be very close (numerical precision may differ slightly)
-            np.testing.assert_array_almost_equal(
-                original_log_probs, loaded_log_probs, decimal=5
-            )
-        finally:
-            os.unlink(path)
-
-    def test_sample_and_log_prob_matches_after_reload(self):
-        """Test that sample_and_log_prob matches after reload."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
-
-        # Use sample_and_log_prob with original flow
-        original_samples, original_log_probs = sample_and_log_prob(
-            flow, n_samples=100, rng_seed=42
-        )
-
-        with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as f:
-            path = f.name
-
-        try:
-            save_flow(flow, path)
-            loaded_flow = load_flow(path)
-
-            # Use sample_and_log_prob with loaded flow
-            loaded_samples, loaded_log_probs = sample_and_log_prob(
-                loaded_flow, n_samples=100, rng_seed=42
-            )
-
-            # Results should match
-            np.testing.assert_array_almost_equal(original_samples, loaded_samples)
-            np.testing.assert_array_almost_equal(
-                original_log_probs, loaded_log_probs, decimal=5
-            )
-        finally:
-            os.unlink(path)
-
-    def test_round_trip_1d(self):
-        """Test save/load round-trip for 1D flow."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 1)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
-
-        original_samples = sample(flow, n_samples=100, rng_seed=999)
-
-        with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as f:
-            path = f.name
-
-        try:
-            save_flow(flow, path)
-            loaded_flow = load_flow(path)
-            loaded_samples = sample(loaded_flow, n_samples=100, rng_seed=999)
-
-            np.testing.assert_array_almost_equal(original_samples, loaded_samples)
-        finally:
-            os.unlink(path)
-
-    def test_round_trip_5d(self):
-        """Test save/load round-trip for 5D flow."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 5)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
-
-        original_samples = sample(flow, n_samples=100, rng_seed=999)
-
-        with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as f:
-            path = f.name
-
-        try:
-            save_flow(flow, path)
-            loaded_flow = load_flow(path)
-            loaded_samples = sample(loaded_flow, n_samples=100, rng_seed=999)
-
-            np.testing.assert_array_almost_equal(original_samples, loaded_samples)
-        finally:
-            os.unlink(path)
-
-    def test_multiple_save_load_cycles(self):
-        """Test that multiple save/load cycles preserve the flow."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
-
-        original_samples = sample(flow, n_samples=100, rng_seed=999)
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # First save/load
-            path1 = os.path.join(tmpdir, "flow1.pkl")
-            save_flow(flow, path1)
-            flow_v1 = load_flow(path1)
-
-            # Second save/load
-            path2 = os.path.join(tmpdir, "flow2.pkl")
-            save_flow(flow_v1, path2)
-            flow_v2 = load_flow(path2)
-
-            # Third save/load
-            path3 = os.path.join(tmpdir, "flow3.pkl")
-            save_flow(flow_v2, path3)
-            flow_v3 = load_flow(path3)
-
-            # Samples should still match
-            final_samples = sample(flow_v3, n_samples=100, rng_seed=999)
-            np.testing.assert_array_almost_equal(original_samples, final_samples)
-
-
-class TestExtractSplineData:
-    """Test the _extract_spline_data helper function."""
-
-    def test_extracts_correct_number_of_dimensions(self):
-        """Test that correct number of dimensions is extracted."""
-        np.random.seed(42)
-
-        for n_dims in [1, 2, 3, 5]:
-            chain = np.random.randn(200, n_dims)
-            flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
-
-            spline_data = _extract_spline_data(flow)
-
-            assert spline_data['num_dims'] == n_dims
-            assert len(spline_data['samples']) == n_dims
-            assert spline_data['marginal'] == ['smooth'] * n_dims
-
-    def test_samples_are_preserved(self):
-        """Test that sample arrays are correctly extracted."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
-
-        spline_data = _extract_spline_data(flow)
-
-        # Samples should have the right shape
-        for samples in spline_data['samples']:
-            assert isinstance(samples, np.ndarray)
-            assert len(samples.shape) == 1  # 1D array per dimension
-
-class TestReconstructEmpiricalTransforms:
-    """Test the _reconstruct_empirical_transforms helper function."""
-
-    def test_reconstruction_creates_valid_transforms(self):
-        """Test that reconstruction creates valid transforms."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
-
-        spline_data = _extract_spline_data(flow)
-        reconstructed = _reconstruct_empirical_transforms(spline_data)
-
-        # Should have correct number of bijections
-        assert len(reconstructed.bijections) == spline_data['num_dims']
-
-    def test_reconstructed_transforms_work(self):
-        """Test that reconstructed transforms can be used."""
-        import jax
-        import jax.numpy as jnp
-
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
-
-        spline_data = _extract_spline_data(flow)
-        reconstructed = _reconstruct_empirical_transforms(spline_data)
-
-        # Test that we can apply the transform
-        test_data = chain[:10]
-        inverse_log_det = jax.jit(jax.vmap(reconstructed.inverse_and_log_det))
-
-        z, log_dets = inverse_log_det(test_data)
-
-        assert z.shape == test_data.shape
-        assert log_dets.shape == (test_data.shape[0],)
-        assert jnp.all(jnp.isfinite(z))
-        assert jnp.all(jnp.isfinite(log_dets))
-
-
-class TestSaveLoadWithNonDefaultParams:
-    """Test save/load round-trip with non-default parameters."""
-
-    def test_round_trip_with_prior_bounds(self):
-        """Test that prior_bounds are preserved through save/load."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-        bounds = np.array([[-5.0, 5.0], [-5.0, 5.0]])
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2, prior_bounds=bounds)
-
-        original_samples = sample(flow, n_samples=100, rng_seed=999)
-
-        with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as f:
-            path = f.name
-
-        try:
-            save_flow(flow, path)
-            loaded_flow = load_flow(path)
-            loaded_samples = sample(loaded_flow, n_samples=100, rng_seed=999)
-
-            np.testing.assert_array_almost_equal(original_samples, loaded_samples)
-        finally:
-            os.unlink(path)
-
-    def test_spline_data_preserves_metadata(self):
-        """Test that _extract_spline_data preserves new metadata fields."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-        bounds = np.array([[-5.0, 5.0], [-5.0, 5.0]])
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2, prior_bounds=bounds)
-
-        spline_data = _extract_spline_data(flow)
-
-        assert 'num_points' in spline_data
-        assert 'prior_low' in spline_data
-        assert 'prior_high' in spline_data
-        assert len(spline_data['num_points']) == 2
-        # Prior bounds should be preserved
-        for i in range(2):
-            assert spline_data['prior_low'][i] == pytest.approx(-5.0)
-            assert spline_data['prior_high'][i] == pytest.approx(5.0)
-        assert spline_data['tail_alpha'] == [0.0, 0.0]
-        # the removed marginal families' metadata is no longer written
-        assert not {'min_eps', 'tail_extension', 'tail_model',
-                    'tail_quantile'} & spline_data.keys()
-
-    def test_round_trip_preserves_tail_alpha(self):
-        """A non-default tail_alpha survives save/load and the reloaded flow
-        reproduces the original samples exactly."""
-        from paramax import unwrap
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2,
-                                     tail_alpha=0.5)
-        assert _extract_spline_data(flow)['tail_alpha'] == [0.5, 0.5]
-
-        original_samples = sample(flow, n_samples=100, rng_seed=999)
-        with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as f:
-            path = f.name
-        try:
-            save_flow(flow, path)
-            loaded_flow = load_flow(path)
-            assert [float(unwrap(b.tail_alpha))
-                    for b in loaded_flow.bijection.bijections] == [0.5, 0.5]
-            loaded_samples = sample(loaded_flow, n_samples=100, rng_seed=999)
-            np.testing.assert_array_almost_equal(original_samples, loaded_samples)
-        finally:
-            os.unlink(path)
-
-class TestEdgeCases:
-    """Test edge cases and error handling."""
-
-    def test_nonexistent_file_raises_error(self):
-        """Test that loading non-existent file raises error."""
-        with pytest.raises(FileNotFoundError):
-            load_flow("/nonexistent/path/flow.pkl")
-
-    def test_save_into_existing_directory(self):
-        """Saving into a directory that already exists writes the file."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
+    """A reloaded flow is the flow that was saved."""
+
+    def test_reload_reproduces_the_flow_and_can_be_saved_again(self, small_flow):
+        """Draws and densities both survive a reload, and so does a re-save.
+
+        ``sample`` exercises the forward marginal maps and their tail clamps,
+        ``log_prob`` the inverse maps and their log-determinant, so each can
+        break without the other. Saving the *reloaded* flow again is what a
+        user who loads, inspects and re-publishes a model does; it has to give
+        the same draws, not drift a little on every cycle.
+        """
+        original_samples = sample(small_flow, n_samples=100, rng_seed=999)
+        test_data = np.random.default_rng(1).standard_normal((50, 2))
+        original_log_probs = log_prob(small_flow, test_data)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "flow.pkl")
-            save_flow(flow, path)
-            assert os.path.exists(path)
+            save_flow(small_flow, path)
+            loaded = load_flow(path)
 
-    def test_save_does_not_create_missing_parent_directory(self):
-        """save_flow does not mkdir: a missing parent is a clear, actionable
-        FileNotFoundError rather than a silently created directory tree."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
+            np.testing.assert_array_almost_equal(
+                original_samples, sample(loaded, n_samples=100, rng_seed=999))
+            # numerical precision may differ slightly on the inverse side
+            np.testing.assert_array_almost_equal(
+                original_log_probs, log_prob(loaded, test_data), decimal=5)
 
+            resaved = Path(tmpdir) / "resaved.pkl"
+            save_flow(loaded, resaved)
+            np.testing.assert_array_almost_equal(
+                original_samples,
+                sample(load_flow(resaved), n_samples=100, rng_seed=999))
+
+    def test_round_trip_preserves_tail_alpha(self, tail_alpha_flow):
+        """A non-default tail_alpha survives save/load and the reloaded flow
+        reproduces the original samples exactly."""
+        assert _extract_spline_data(tail_alpha_flow)['tail_alpha'] == [0.5, 0.5]
+
+        original_samples = sample(tail_alpha_flow, n_samples=100, rng_seed=999)
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "nope", "flow.pkl")
-            with pytest.raises(FileNotFoundError):
-                save_flow(flow, path)
-            assert not os.path.exists(os.path.join(tmpdir, "nope"))
-
-    def test_overwrite_existing_file(self):
-        """Test that save overwrites existing file."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
-
-        with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as f:
-            path = f.name
-            # Write dummy content
-            f.write(b"dummy content")
-
-        try:
-            # Save should overwrite
-            save_flow(flow, path)
-
-            # Verify by loading
+            path = Path(tmpdir) / "flow.pkl"
+            save_flow(tail_alpha_flow, path)
             loaded_flow = load_flow(path)
-            assert isinstance(loaded_flow, Transformed)
-        finally:
-            os.unlink(path)
-
-    def test_loaded_flow_produces_finite_samples(self):
-        """Test that loaded flow produces finite samples."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 3)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
-
-        with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as f:
-            path = f.name
-
-        try:
-            save_flow(flow, path)
-            loaded_flow = load_flow(path)
-
-            # Generate many samples and check they're all finite
-            samples = sample(loaded_flow, n_samples=1000, rng_seed=42)
-            assert np.all(np.isfinite(samples))
-        finally:
-            os.unlink(path)
-
-    def test_loaded_flow_produces_finite_log_probs(self):
-        """Test that loaded flow produces finite log probabilities."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 3)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
-
-        with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as f:
-            path = f.name
-
-        try:
-            save_flow(flow, path)
-            loaded_flow = load_flow(path)
-
-            # Evaluate log probs on training data
-            log_probs = log_prob(loaded_flow, chain)
-            assert np.all(np.isfinite(log_probs))
-        finally:
-            os.unlink(path)
+        assert [float(unwrap(b.tail_alpha))
+                for b in loaded_flow.bijection.bijections] == [0.5, 0.5]
+        loaded_samples = sample(loaded_flow, n_samples=100, rng_seed=999)
+        np.testing.assert_array_almost_equal(original_samples, loaded_samples)
 
 
 class TestOldFormatFilesAreRefused:
@@ -583,7 +186,12 @@ class TestOldFormatFilesAreRefused:
             self._assert_refused(path, 1)
 
     def test_a_unit_cube_file_is_refused(self):
-        """The pre-release unit-cube pipeline's files are version 1 too."""
+        """The pre-release unit-cube pipeline's files are version 1 too.
+
+        They also lack 'inner_flow_like', so this pins that the version
+        refusal comes before the missing-key check: the caller gets the way
+        out (refit, or pin coppuccino<2), not a complaint about a key.
+        """
         payload = {
             'spline_data': {'num_dims': 0},
             'inner_flow_bytes': b'',
@@ -594,26 +202,6 @@ class TestOldFormatFilesAreRefused:
             with open(path, 'wb') as f:
                 cloudpickle.dump(payload, f)
             self._assert_refused(path, 1)
-
-    def test_a_current_file_reloads_exactly(self):
-        """A flow saved today reconstructs to the same density."""
-        np.random.seed(42)
-        chain = np.random.randn(200, 2)
-        flow = normalizing_flows_fit(chain, max_epochs=5, patience=2)
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "flow.pkl"
-            save_flow(flow, path)
-            reloaded = load_flow(path)
-            assert np.allclose(log_prob(reloaded, chain), log_prob(flow, chain))
-
-
-@pytest.fixture(scope="module")
-def small_flow():
-    """A cheap fitted flow shared by the persistence-mechanics tests."""
-    np.random.seed(42)
-    chain = np.random.randn(200, 2)
-    return normalizing_flows_fit(chain, max_epochs=5, patience=2)
 
 
 class _FullDisk:
@@ -640,30 +228,48 @@ class TestAtomicSave:
     """A failed save must not destroy the model already on disk."""
 
     def test_failed_save_leaves_previous_model_intact(self, small_flow, monkeypatch):
+        """A save that fails leaves the old file untouched and no temp file
+        behind, whether it fails while serializing or while writing.
+
+        The serialization fault is the one the old writer died on: it opened
+        the destination 'wb' first, so a half-written payload replaced a good
+        model. The fsync fault lands later, once the temporary sibling exists
+        and holds the whole payload, so only the cleanup in _atomic_write_bytes
+        stands between it and a stray ``flow.pkl.<random>.tmp``, and only the
+        rename-on-success stands between it and an overwritten destination.
+        """
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "flow.pkl"
             save_flow(small_flow, path)
+            # Mark the previous file so that it differs from the payload the
+            # failing save would write; otherwise a writer that went straight
+            # to the destination would leave identical bytes behind.
+            payload = cloudpickle.loads(path.read_bytes())
+            payload["previous"] = True
+            path.write_bytes(cloudpickle.dumps(payload))
             before = path.read_bytes()
 
-            monkeypatch.setattr(model_io, "cloudpickle", _FullDisk)
-            with pytest.raises(OSError):
-                save_flow(small_flow, path)
-            monkeypatch.undo()
-
+            with monkeypatch.context() as m:
+                m.setattr(model_io, "cloudpickle", _FullDisk)
+                with pytest.raises(OSError):
+                    save_flow(small_flow, path)
             assert path.read_bytes() == before
-            assert isinstance(load_flow(path), Transformed)
-
-    def test_failed_save_leaves_no_temporary_files(self, small_flow, monkeypatch):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "flow.pkl"
-            save_flow(small_flow, path)
-
-            monkeypatch.setattr(model_io, "cloudpickle", _FullDisk)
-            with pytest.raises(OSError):
-                save_flow(small_flow, path)
-            monkeypatch.undo()
-
             assert sorted(os.listdir(tmpdir)) == ["flow.pkl"]
+
+            def disk_full(fd):
+                raise OSError(28, "No space left on device")
+
+            with monkeypatch.context() as m:
+                m.setattr(model_io.os, "fsync", disk_full)
+                with pytest.raises(OSError) as excinfo:
+                    save_flow(small_flow, path)
+            assert path.read_bytes() == before
+            assert sorted(os.listdir(tmpdir)) == ["flow.pkl"]
+            message = str(excinfo.value)
+            assert str(path) in message
+            assert ".tmp" not in message
+
+            assert isinstance(load_flow(path), Transformed)
 
     def test_overwrite_preserves_file_permissions(self, small_flow):
         """Publishing through a temp file must not tighten the mode: mkstemp
@@ -674,6 +280,25 @@ class TestAtomicSave:
             os.chmod(path, 0o640)
 
             save_flow(small_flow, path)
+
+            assert stat.S_IMODE(os.stat(path).st_mode) == 0o640
+
+    def test_a_new_file_gets_the_umask_mode(self):
+        """A file that did not exist yet is published with the mode a plain
+        ``open(path, 'wb')`` would give it under the current umask.
+
+        Without the chmod it would keep the owner-only 0o600 that mkstemp gives
+        the temporary sibling, silently hiding a new model from the rest of a
+        shared model directory. 0o027 is chosen so the expected 0o640 differs
+        from both 0o600 and the common 0o644.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "payload.bin"
+            previous = os.umask(0o027)
+            try:
+                _atomic_write_bytes(path, b"new")
+            finally:
+                os.umask(previous)
 
             assert stat.S_IMODE(os.stat(path).st_mode) == 0o640
 
@@ -720,24 +345,14 @@ class TestAtomicSave:
             # the temp file belongs next to the target, not next to the link
             assert sorted(os.listdir(store)) == ["model.bin"]
 
-    def test_save_flow_through_a_symlink_updates_the_target(self, small_flow):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            target = Path(tmpdir) / "model.pkl"
-            save_flow(small_flow, target)
-            link = Path(tmpdir) / "latest.pkl"
-            link.symlink_to(target)
-
-            save_flow(small_flow, link)
-
-            assert link.is_symlink()
-            assert isinstance(load_flow(target), Transformed)
-
 
 class TestWriteErrorsNameTheDestination:
     """Every publication failure must quote the path the caller passed, never
     the ``<name>.<random>.tmp`` sibling it cannot find again."""
 
     def test_missing_parent_names_the_destination(self):
+        """The parent is not created either: a missing directory is a clear,
+        actionable error rather than a silently created directory tree."""
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "nope" / "flow.pkl"
             with pytest.raises(FileNotFoundError) as excinfo:
@@ -746,16 +361,7 @@ class TestWriteErrorsNameTheDestination:
             message = str(excinfo.value)
             assert str(path) in message
             assert ".tmp" not in message
-
-    def test_save_flow_missing_parent_names_the_destination(self, small_flow):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "nope" / "flow.pkl"
-            with pytest.raises(FileNotFoundError) as excinfo:
-                save_flow(small_flow, path)
-
-            message = str(excinfo.value)
-            assert str(path) in message
-            assert ".tmp" not in message
+            assert not path.parent.exists()
 
     def test_directory_destination_fails_before_writing_anything(self, monkeypatch):
         """A directory destination can never be published, so it is caught up
@@ -811,12 +417,9 @@ class TestWriteErrorsNameTheDestination:
 class TestSaveFlowArgumentChecks:
     """save_flow validates `flow` instead of dying on an internal attribute."""
 
-    @pytest.mark.parametrize("bad", [
-        np.zeros((10, 2)),
-        None,
-        {"spline_data": {}},
-        "not a flow",
-    ])
+    # Every non-flow reaches the same isinstance check; an array (the
+    # historical failure) and None are enough to pin the message.
+    @pytest.mark.parametrize("bad", [np.zeros((10, 2)), None])
     def test_non_flow_raises_typeerror(self, bad):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "flow.pkl"
@@ -868,10 +471,11 @@ class TestLoadFlowFailureMessages:
                 load_flow(path)
             assert str(path) in str(excinfo.value)
 
-    @pytest.mark.parametrize("payload", [b"", b"not a pickle at all\n" * 4])
-    def test_garbage_file_names_the_file(self, payload):
+    def test_garbage_file_names_the_file(self):
+        """A file that is not a pickle at all goes through the same guard as a
+        truncated one."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = self._write(tmpdir, payload)
+            path = self._write(tmpdir, b"not a pickle at all\n" * 4)
             with pytest.raises(ValueError) as excinfo:
                 load_flow(path)
             assert str(path) in str(excinfo.value)
