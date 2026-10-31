@@ -2,14 +2,20 @@ import numpy as np
 import numpy.typing as npt
 from flowjax.distributions import Transformed
 
-from coppuccino.copula_flows import log_prob, normalizing_flows_fit
+from coppuccino.copula_flows import (
+    _MIN_SAMPLES_PER_DIM,
+    _validate_prior_bounds,
+    log_prob,
+    normalizing_flows_fit,
+)
 
 __all__ = ["compute_injection_hdr", "check_in_support"]
 
 
-# Each half of a cross-fit split has to support a flow fit and a usable
-# reference ECDF, so the split path refuses inputs it would silently degrade.
-_MIN_CROSS_FIT_HALF = 20
+# Each half of a cross-fit split has to clear normalizing_flows_fit's own row
+# floor, so the split path refuses inputs the fit would only reject later under
+# a message that names neither the split nor the caller's row count.
+_MIN_CROSS_FIT_HALF = _MIN_SAMPLES_PER_DIM + 1
 
 
 def _as_sample_matrix(samples: npt.ArrayLike) -> np.ndarray:
@@ -167,7 +173,7 @@ def compute_injection_hdr(samples: npt.ArrayLike, injection_params: npt.ArrayLik
     ----------
     samples : array_like
         Posterior samples from inference, shape (n_samples, n_params), with
-        at least 40 rows.
+        at least 42 rows.
     injection_params : array_like
         True parameter values to evaluate. Can be:
         - 1D array of shape (n_params,) for a single injection
@@ -206,9 +212,11 @@ def compute_injection_hdr(samples: npt.ArrayLike, injection_params: npt.ArrayLik
     ------
     ValueError
         If ``samples`` or ``injection_params`` contain NaN or Inf values, if
-        ``samples`` is not 2D or has fewer than 40 rows, if
-        ``injection_params`` is a scalar or has more than two dimensions, or
-        if its parameter count does not match ``samples``.
+        ``samples`` is not 2D or has fewer than 42 rows, if
+        ``injection_params`` is a scalar or has more than two dimensions, if
+        its parameter count does not match ``samples``, or if a
+        ``prior_bounds`` passed through ``nf_kwargs`` is malformed or does not
+        contain every row of ``samples``.
     RuntimeError
         If the fitted flow scores the reference half, or any in-support
         injection, non-finitely, which is what a diverged fit looks like (see
@@ -291,6 +299,11 @@ def compute_injection_hdr(samples: npt.ArrayLike, injection_params: npt.ArrayLik
     samples = _as_sample_matrix(samples)
     injection_params = np.asarray(injection_params, dtype=float)
     _require_finite(samples, "samples")
+    if nf_kwargs.get("prior_bounds") is not None:
+        # The fit only validates its own half; a row outside the box that the
+        # split sends to the reference half would be scored -inf and reported
+        # as a diverged fit instead.
+        nf_kwargs["prior_bounds"] = _validate_prior_bounds(nf_kwargs["prior_bounds"], samples)
     if injection_params.ndim == 0:
         raise ValueError("injection_params must be at least 1D")
     if injection_params.ndim > 2:

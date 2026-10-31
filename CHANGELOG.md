@@ -39,7 +39,7 @@ density.
   `compute_injection_hdr` fits on a random half of `samples` and ranks each
   injection against the other half. It no longer ranks against fresh draws
   from the fitted flow, so `num_samples` is gone (see Changed for why). The
-  same inputs give different values, and `samples` needs at least 40 rows.
+  same inputs give different values, and `samples` needs at least 42 rows.
 - **`sample` and `sample_and_log_prob` draw fresh randomness by default.**
   `rng_seed` now defaults to `None`, meaning new system entropy on each call,
   instead of a fixed `999`. Back-to-back calls used to return identical draws
@@ -123,8 +123,10 @@ density.
 - `log_prob` returns `-inf` strictly outside `prior_bounds`, from both the
   package-level `log_prob` and `FleetFlow.log_prob`. Testing
   `np.isfinite(log_prob(flow, x))` is therefore a support test; the bounds
-  themselves count as inside. `log_prob` accepts nested sequences and rejects
-  a mis-shaped array with a message naming the expected shape.
+  themselves count as inside. The flowjax method `flow.log_prob(x)` on a
+  fitted flow does not apply this mask, and scores such a point as if it sat
+  on the nearest wall. `log_prob` accepts nested sequences and rejects a
+  mis-shaped array with a message naming the expected shape.
 - `save_flow` and `FleetFlow.save` write atomically, to a temporary file in
   the destination directory that is then moved into place with `os.replace`.
   An interrupted save no longer leaves a truncated file where a readable

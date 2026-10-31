@@ -135,9 +135,8 @@ ignore = [
 
 [tool.ruff.lint.mccabe]
 # 15 is the cyclomatic complexity of the most complex function this project is
-# willing to accept without a written exemption. One legacy function exceeds it
-# (`make_empirical_cdf_spline`) and carries a per-function `noqa: C901` naming
-# the reason; everything else, and all new code, must stay under.
+# willing to accept. No function carries a `noqa: C901` exemption, and new code
+# must stay under rather than add one.
 max-complexity = 15
 
 [tool.ruff.lint.isort]

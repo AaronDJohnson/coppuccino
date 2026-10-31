@@ -345,7 +345,7 @@ class TestComputeInjectionHDR:
             compute_injection_hdr(samples, injections, rng_seed=0, **_FAST_FIT)
 
     def test_too_few_rows_and_removed_options_are_rejected(self):
-        """The split needs 40 rows, and 1.0.0's num_samples cannot sneak through.
+        """The split needs 42 rows, and 1.0.0's num_samples cannot sneak through.
 
         Every option after ``injection_params`` is keyword-only, so a 1.0.0
         positional ``num_samples`` raises instead of becoming the seed, and a
@@ -356,12 +356,44 @@ class TestComputeInjectionHDR:
         samples = rng.standard_normal((200, 2))
         injection = np.zeros(2)
 
-        with pytest.raises(ValueError, match="at least 40 rows; samples has 30"):
+        with pytest.raises(ValueError, match="at least 42 rows; samples has 30"):
             compute_injection_hdr(rng.standard_normal((30, 2)), injection, **_FAST_FIT)
         with pytest.raises(TypeError, match="positional"):
             compute_injection_hdr(samples, injection, 50_000)
         with pytest.raises(TypeError, match="num_samples"):
             compute_injection_hdr(samples, injection, num_samples=50_000, **_FAST_FIT)
+
+    @pytest.mark.parametrize("n_rows", [40, 41])
+    def test_the_row_floor_is_the_one_the_fit_half_needs(self, n_rows):
+        """Each half has to clear normalizing_flows_fit's own 21-row floor.
+
+        At 40 and 41 rows the fit half holds 20, so a 40-row floor let these
+        through only for the fit to refuse them with "Insufficient samples",
+        which names neither the split nor the row count the caller passed.
+        """
+        rng = np.random.default_rng(0)
+        with pytest.raises(ValueError, match=f"at least 42 rows; samples has {n_rows}"):
+            compute_injection_hdr(rng.standard_normal((n_rows, 2)), np.zeros(2), **_FAST_FIT)
+
+    def test_the_smallest_accepted_input_fits(self):
+        rng = np.random.default_rng(0)
+        hdrs = compute_injection_hdr(rng.standard_normal((42, 2)), np.zeros(2), **_FAST_FIT)
+        assert hdrs.shape == (1,)
+
+    @pytest.mark.parametrize("rng_seed", [0, 1, 2, 3])
+    def test_prior_bounds_are_checked_against_every_row(self, rng_seed):
+        """A row outside prior_bounds is a ValueError wherever the split puts it.
+
+        Checked on the fit half only, the row raised the right error when it
+        landed there (seeds 0 and 2) and otherwise reached the reference half,
+        which scored it -inf and raised "the fit likely diverged" (seeds 1 and
+        3): the wrong exception type, with advice to lower learning_rate.
+        """
+        samples = np.random.default_rng(0).uniform(-1.0, 1.0, (200, 2))
+        samples[0, 0] = 1.5
+        with pytest.raises(ValueError, match="outside prior_bounds"):
+            compute_injection_hdr(samples, np.zeros(2), rng_seed=rng_seed,
+                                  prior_bounds=[[-1.0, 1.0], [-1.0, 1.0]], **_FAST_FIT)
 
     def test_held_out_reference_ranks_against_the_unused_half(self):
         """The cross-fit reference set is the half of samples the fit never saw.

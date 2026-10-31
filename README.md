@@ -164,8 +164,10 @@ see `SmoothMarginalToGaussian` for the mechanism.
 - **Built for bounded posteriors.** With `prior_bounds` — the common situation
   for MCMC chains — the fitted support is exactly the prior box: draws land
   strictly inside it with no atoms on the walls, and `log_prob` returns `-inf`
-  outside it, so `np.isfinite(log_prob(flow, x))` is a support test. Inside the
-  box the density is strictly positive in float64 all the way to the walls: on
+  outside it, so `np.isfinite(log_prob(flow, x))` is a support test. (The mask
+  is in the package's `log_prob`; flowjax's own `flow.log_prob(x)` on the
+  fitted object scores a point outside the box as if it sat on the nearest
+  wall.) Inside the box the density is strictly positive in float64 all the way to the walls: on
   2000×2 `N(0,1)` data from `default_rng(s)` with `prior_bounds` at ±10 and ±50
   (`max_epochs=200`, `rng_seed=s`, $s = 0\ldots2$, both corners)
   `exp(log_prob)` at the corner runs
@@ -344,7 +346,7 @@ n=1500 samples (seeds 0–3) the mean credibility was 0.569–0.576 instead of 0
 against 0.499–0.526 for the held-out reference. The cost is a noisier single
 call — the flow sees half the rows and ranks against the other half — and that
 noise averages away over the events of a calibration study. `samples` needs at
-least 40 rows.
+least 42 rows.
 
 ## Marginal transforms
 

@@ -903,7 +903,25 @@ class TestPriorBoxIsHardSupport:
                             [np.inf, 0.5], [-1e-9, 0.5], [0.5, -3.0]])
         assert np.all(np.isneginf(log_prob(flow, outside)))
 
-    ON_BOX = np.array([[0.0, 0.5], [1.0, 0.5], [0.5, 0.0], [0.5, 1.0],
+    def test_a_single_point_scores_as_a_scalar_with_or_without_a_box(self):
+        """A (n_params,) query returns shape (), and the mask must not change it.
+
+        The mask is built row-wise from ``np.atleast_2d``, and broadcasting its
+        (1,) against the flow's () used to hand back (1,) for a bounded flow
+        only, so the same call changed shape with ``prior_bounds``.
+        """
+        bounded = self._bounded_flow()
+        unbounded = normalizing_flows_fit(
+            np.random.default_rng(4).standard_normal((400, 2)), max_epochs=3,
+            show_progress=False, rng_seed=1)
+        point = np.array([0.5, 0.5])
+        assert np.shape(log_prob(unbounded, point)) == ()
+        assert np.shape(log_prob(bounded, point)) == ()
+        outside = log_prob(bounded, np.array([1.5, 0.5]))
+        assert np.shape(outside) == ()
+        assert np.isneginf(outside)
+
+    ON_BOX =np.array([[0.0, 0.5], [1.0, 0.5], [0.5, 0.0], [0.5, 1.0],
                        [0.0, 0.0], [1.0, 1.0]])
 
     def test_the_bounds_themselves_are_reported_by_the_flow_not_the_mask(self):

@@ -1647,8 +1647,9 @@ def log_prob(flow: Transformed, samples: np.ndarray) -> np.ndarray:
     Returns
     -------
     np.ndarray
-        Log probability densities, shape (n_samples,). When the flow was fitted
-        with ``prior_bounds``, that box is hard support: a row lying strictly
+        Log probability densities, shape (n_samples,), or shape () for a
+        single (n_params,) point. When the flow was fitted with
+        ``prior_bounds``, that box is hard support: a row lying strictly
         outside it scores ``-inf``, so ``np.isfinite(log_prob(flow, x))`` is a
         support test. The bounds themselves are inside and score finitely.
 
@@ -1666,6 +1667,11 @@ def log_prob(flow: Transformed, samples: np.ndarray) -> np.ndarray:
     `samples` is coerced with ``np.asarray``, so a nested list works here just
     as it does on ``FleetFlow.log_prob``; flowjax alone would reject it with
     "Expected x to be arraylike; got list".
+
+    The ``-inf`` outside ``prior_bounds`` is applied here, not by the flow.
+    The flowjax method ``flow.log_prob(x)`` on the returned object does not
+    mask, and scores a point outside the box as if it sat on the nearest wall,
+    a finite value. Use this function whenever the support matters.
 
     Examples
     --------
@@ -1691,7 +1697,10 @@ def log_prob(flow: Transformed, samples: np.ndarray) -> np.ndarray:
     # support, so report -inf there and let finiteness be the support test.
     box = _prior_box(flow)
     if box is not None:
-        log_probs = np.where(_outside_prior_box(samples, box), -np.inf, log_probs)
+        # The mask is row-wise over np.atleast_2d, so for a single point it has
+        # shape (1,) against the flow's (); match it rather than broadcast.
+        outside = _outside_prior_box(samples, box).reshape(log_probs.shape)
+        log_probs = np.where(outside, -np.inf, log_probs)
     return log_probs
 
 
