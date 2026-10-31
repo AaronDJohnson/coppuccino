@@ -162,7 +162,7 @@ def compute_injection_hdr(samples: npt.ArrayLike, injection_params: npt.ArrayLik
     Compute Highest Density Region (HDR) credibility for injection parameters.
 
     The flow is fitted on a random half of ``samples``, and the HDR
-    credibility is the fraction of the *other* half that has equal or higher
+    credibility is the fraction of the *other* half that has strictly higher
     probability density, under that flow, than the injection parameters (so a
     point at the mode scores near 0 and a point in the tails near 1). This
     metric is used to validate Bayesian inference: if the inference is
@@ -247,7 +247,7 @@ def compute_injection_hdr(samples: npt.ArrayLike, injection_params: npt.ArrayLik
     -----
     The HDR credibility is computed as:
 
-        HDR = (# of reference points with log_prob >= log_prob(injection))
+        HDR = (# of reference points with log_prob > log_prob(injection))
               / (# of reference points)
 
     For well-calibrated Bayesian inference, HDR values should follow a uniform

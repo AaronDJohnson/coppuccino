@@ -137,7 +137,7 @@ bench = [
 ]
 dev = [
     { name = "mypy", specifier = ">=1.10" },
-    { name = "pytest", specifier = ">=7.0" },
+    { name = "pytest", specifier = ">=7.3.2" },
     { name = "ruff", specifier = ">=0.6" },
 ]
 
