@@ -374,8 +374,11 @@ def test_a_diverged_candidate_is_reported_as_failed_not_ok(data):
     assert np.all(np.isfinite(log_prob(flow, data[:50])))
 
 
-def test_tolerances_and_flags_are_keyword_only(data):
-    """Positional calls past ``n_workers`` used to bind to whichever option
-    occupied that slot; they now fail before any fitting starts."""
-    with pytest.raises(TypeError):
-        normalizing_flows_fit_auto(data, None, 0.15, False, 999, 1, 1.0)
+def test_options_are_keyword_only(data):
+    """Every option after ``chain`` is passed by name, so a positional call
+    fails before any fitting starts instead of binding to whichever option
+    occupies that slot."""
+    with pytest.raises(TypeError, match="positional"):
+        normalizing_flows_fit_auto(data, [{"knots": 2, "flow_layers": 1}],
+                                   refit_best=False, n_workers=1,
+                                   max_epochs=1, show_progress=False)

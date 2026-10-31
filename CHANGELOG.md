@@ -6,7 +6,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [2.0.0] — 2026-10-30
+## [2.0.0] — 2026-10-31
 
 This is the first release since 1.0.0, and every change below is measured
 against 1.0.0. Earlier drafts of this file had entries for 1.1.0, 2.0.0 and
@@ -58,7 +58,8 @@ density.
   held-out density is not finite. The default ladder is (`knots`, `flow_layers`) =
   (2, 4), (4, 6), (8, 8). `return_table=True` adds a per-candidate table
   whose rows all carry the same keys. `val_frac` must lie in (0, 1) and leave
-  enough rows on both sides of the split.
+  enough rows on both sides of the split. Every option after `chain` is
+  keyword-only.
 - `normalizing_flows_fit_fleet` and `FleetFlow` fit one flow per source for a
   catalog of chains that share a prior box, training all of them together
   under one `vmap`. A `FleetFlow` samples and scores every source in one call,

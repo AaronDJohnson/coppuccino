@@ -1083,12 +1083,12 @@ def _holdout_split(clean: np.ndarray, val_frac: float, rng_seed: int
 
 
 def normalizing_flows_fit_auto(chain: np.ndarray,
+                               *,
                                candidates: Optional[list] = None,
                                val_frac: float = 0.15,
                                refit_best: bool = True,
                                rng_seed: int = 999,
                                n_workers: Optional[int] = None,
-                               *,
                                comparable_sems: float = 1.0,
                                comparable_nats: float = 0.0,
                                verbose: bool = False,
@@ -1147,7 +1147,8 @@ def normalizing_flows_fit_auto(chain: np.ndarray,
     chain : np.ndarray
         Training samples with shape (n_samples, n_params). Rows containing
         non-finite values (NaN or +-inf) are dropped, with a warning naming
-        the count, before splitting; any other shape raises.
+        the count, before splitting; any other shape raises. Every other
+        argument is keyword-only.
     candidates : list of dict, optional
         Candidate keyword overrides for :func:`normalizing_flows_fit`. Each
         dict is merged over ``**shared_kwargs``. The default is a small
@@ -1185,19 +1186,17 @@ def normalizing_flows_fit_auto(chain: np.ndarray,
         and data split are fixed, so execution order cannot change the
         selection.
     comparable_sems : float, optional
-        Keyword-only. Tolerance in units of the *paired* standard error of the
-        score difference against the best candidate. Default 1.0 (the classic
+        Tolerance in units of the *paired* standard error of the score
+        difference against the best candidate. Default 1.0 (the classic
         one-standard-error rule).
     comparable_nats : float, optional
-        Keyword-only. Additional absolute tolerance in nats added to the
-        comparability threshold. Default 0.0. A value like 0.05 declares
-        models within 0.05 nats of KL comparable regardless of statistical
-        resolution.
+        Additional absolute tolerance in nats added to the comparability
+        threshold. Default 0.0. A value like 0.05 declares models within 0.05
+        nats of KL comparable regardless of statistical resolution.
     verbose : bool, optional
-        Keyword-only. Print one line per candidate. Default False.
+        Print one line per candidate. Default False.
     return_table : bool, optional
-        Keyword-only. If True, return ``(flow, table)``; see Returns for the
-        row schema.
+        If True, return ``(flow, table)``; see Returns for the row schema.
     **shared_kwargs
         Arguments passed to every candidate fit (e.g. ``prior_bounds``,
         ``num_points``, ``max_epochs``).
