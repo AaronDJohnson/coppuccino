@@ -18,7 +18,7 @@ uv sync            # create the environment and install coppuccino + dev deps
 Please run the same checks CI runs:
 
 ```bash
-uv run pytest              # full test suite
+uv run pytest -n auto      # full test suite, one worker per core
 uv run ruff check .        # lint (pyflakes, bugbear, comprehensions, isort,
                            #       simplify, and McCabe complexity <= 15)
 uv run mypy                # type check (src/coppuccino)

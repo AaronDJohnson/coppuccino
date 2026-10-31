@@ -92,6 +92,9 @@ exclude = ["/examples/data", "/tests/.claude"]
 [dependency-groups]
 dev = [
     "pytest>=7.3.2",
+    # Runs the suite across cores in CI (`-n auto`). 3.6.1 is the first
+    # release on execnet 2.1.
+    "pytest-xdist>=3.6.1",
     "ruff>=0.6",
     "mypy>=1.10",
 ]

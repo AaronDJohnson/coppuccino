@@ -71,8 +71,19 @@ jobs:
       - name: Verify lockfile is current
         run: uv lock --check
 
+      # Most of the suite's time is JAX tracing and compiling a fresh program
+      # for each fitted flow, not training. Two things cut it: one pytest worker
+      # per core (worksteal rebalances the few long tests), and a compilation
+      # cache shared by the workers, so a program another fit or worker already
+      # compiled is loaded instead of rebuilt. Measured locally with 4 workers:
+      # 205 s serial, 80 s with workers, 64 s with the cache as well. The cache
+      # starts empty on every run.
       - name: Run tests (${{ matrix.resolution }} resolution)
+        env:
+          JAX_COMPILATION_CACHE_DIR: ${{ runner.temp }}/jax-cache
+          JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS: "0"
+          JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES: "-1"
         run: >
           uv run --python ${{ matrix.python-version }}
           --resolution ${{ matrix.resolution }}
-          pytest tests/ -q
+          pytest tests/ -q -n auto --dist worksteal
