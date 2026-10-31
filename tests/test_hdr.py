@@ -17,7 +17,9 @@ from coppuccino.hdr import _in_support_mask, check_in_support, compute_injection
 _FAST_FIT = {"max_epochs": 5, "patience": 2, "show_progress": False}
 # Enough training that the fitted density is monotone along a ray from the
 # mode; each test using it names the seeds its assertions were verified on.
-_SHORT_FIT = {"max_epochs": 30, "patience": 10, "show_progress": False}
+# A 30-epoch fit kept margin on the newest dependencies but not on the oldest
+# supported ones, which train differently.
+_TRAINED_FIT = {"max_epochs": 150, "patience": 25, "show_progress": False}
 
 
 def _split(samples, rng_seed):
@@ -212,9 +214,10 @@ class TestComputeInjectionHDR:
         """HDR rises monotonically along a ray leaving the mode.
 
         Radii 0, 1.5 and 3.0 of a 2-D standard normal; the outermost point's
-        analytic credibility is 0.989 and the estimate landed within 0.012 of
-        it on seeds 0, 1 and 42. A 5-epoch fit is not enough: it missed by
-        0.12 on seed 42.
+        analytic credibility is 0.989 and the estimate landed within 0.015 of
+        it on seeds 0, 1 and 42, on both the newest and the oldest supported
+        dependencies. A 5-epoch fit missed by 0.12 on seed 42, and a 30-epoch
+        one by 0.087 on seed 1 under the oldest dependencies.
         """
         rng = np.random.default_rng(42)
         samples = rng.standard_normal((3000, 2))
@@ -225,7 +228,7 @@ class TestComputeInjectionHDR:
             samples,
             injection_params,
             rng_seed=42,
-            **_SHORT_FIT,
+            **_TRAINED_FIT,
         )
 
         assert hdr.shape == (3,)
@@ -486,8 +489,10 @@ class TestComputeInjectionHDR:
 
         Points at squared radius 0, 4.05 and 9.8 of a 5-D standard normal; the
         outermost analytic credibility is 0.919 and the estimate stayed within
-        0.026 of it on seeds 0, 1 and 42 (the assertion allows 0.06). A 5-epoch
-        fit is not enough here: it missed by 0.11 on seed 42.
+        0.027 of it on seeds 0, 1 and 42, on both the newest and the oldest
+        supported dependencies (the assertion allows 0.06). A 5-epoch fit
+        missed by 0.11 on seed 42, and a 30-epoch one reached 0.060 there under
+        the oldest dependencies.
         """
         rng = np.random.default_rng(42)
         samples = rng.standard_normal((2000, 5))
@@ -497,7 +502,7 @@ class TestComputeInjectionHDR:
             samples,
             injection_params,
             rng_seed=42,
-            **_SHORT_FIT,
+            **_TRAINED_FIT,
         )
 
         assert hdr.shape == (3,)
