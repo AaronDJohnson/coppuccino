@@ -33,15 +33,30 @@ jobs:
         run: uv run --python 3.12 mypy
 
   test:
+    name: test (${{ matrix.os }}, ${{ matrix.python-version }}, ${{ matrix.resolution }}, ${{ matrix.shard.name }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest]
+        os: [ubuntu-latest, macos-latest]
         python-version: ["3.11", "3.12", "3.13", "3.14"]
         # "highest" uses the committed uv.lock; "lowest-direct" exercises the
         # oldest supported dependency versions declared in pyproject.toml.
         resolution: ["highest", "lowest-direct"]
+        # Each configuration runs the whole suite, split across two runners
+        # so that neither takes much more than half the time. The second
+        # shard is "everything the first one does not name", so a new test
+        # file lands there without editing this list.
+        shard:
+          - name: single-flow
+            args: >-
+              tests/test_copula_flows.py tests/test_bijections.py
+              tests/test_model_io.py tests/test_hdr.py
+          - name: fleet-and-selection
+            args: >-
+              tests/
+              --ignore=tests/test_copula_flows.py --ignore=tests/test_bijections.py
+              --ignore=tests/test_model_io.py --ignore=tests/test_hdr.py
         exclude:
           # The oldest pinned numpy/scipy predate cp313/cp314 wheels, so the
           # lowest-direct floors aren't installable on 3.13+ (a normal install
@@ -50,15 +65,14 @@ jobs:
             resolution: "lowest-direct"
           - python-version: "3.14"
             resolution: "lowest-direct"
-        include:
           # Thin macOS slice: confirm runtime on the oldest and newest Python
           # (full Python x resolution sweep stays on the faster Ubuntu runners).
           - os: macos-latest
-            python-version: "3.11"
-            resolution: "highest"
+            resolution: "lowest-direct"
           - os: macos-latest
-            python-version: "3.14"
-            resolution: "highest"
+            python-version: "3.12"
+          - os: macos-latest
+            python-version: "3.13"
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
@@ -72,18 +86,10 @@ jobs:
         run: uv lock --check
 
       # Most of the suite's time is JAX tracing and compiling a fresh program
-      # for each fitted flow, not training. Two things cut it: one pytest worker
-      # per core (worksteal rebalances the few long tests), and a compilation
-      # cache shared by the workers, so a program another fit or worker already
-      # compiled is loaded instead of rebuilt. Measured locally with 4 workers:
-      # 205 s serial, 80 s with workers, 64 s with the cache as well. The cache
-      # starts empty on every run.
-      - name: Run tests (${{ matrix.resolution }} resolution)
-        env:
-          JAX_COMPILATION_CACHE_DIR: ${{ runner.temp }}/jax-cache
-          JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS: "0"
-          JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES: "-1"
+      # for each fitted flow, not training, and that work is spread over one
+      # pytest worker per core (worksteal rebalances the few long tests).
+      - name: Run tests (${{ matrix.resolution }} resolution, ${{ matrix.shard.name }})
         run: >
           uv run --python ${{ matrix.python-version }}
           --resolution ${{ matrix.resolution }}
-          pytest tests/ -q -n auto --dist worksteal
+          pytest ${{ matrix.shard.args }} -q -n auto --dist worksteal
