@@ -110,10 +110,16 @@ testpaths = ["tests"]
 # Unknown marks are a typo, not a feature: fail rather than silently skipping
 # the selection the mark was meant to drive.
 addopts = "--strict-markers --strict-config"
-# No allowances: the suite passes with warnings as errors and nothing filtered.
-# Two `ignore:` entries were carried here briefly and both proved inert -- the
-# suite is byte-identical with and without them -- so they are not kept.
-filterwarnings = ["error"]
+# Warnings are errors, with one allowance. CI shares a JAX compilation cache
+# between pytest-xdist workers (see test.yml), and JAX writes its entries
+# without a lock, so a worker can read an entry another worker is still
+# writing. JAX then warns and compiles that program afresh: a half-written
+# entry never decompresses, so it cannot be loaded as the wrong program. That
+# warning is the only one let through.
+filterwarnings = [
+    "error",
+    "ignore:Error reading persistent compilation cache entry:UserWarning",
+]
 
 [tool.ruff]
 line-length = 100
