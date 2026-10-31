@@ -3,6 +3,7 @@ import logging
 import re
 from types import SimpleNamespace
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -470,12 +471,24 @@ class TestWeightDecayReachesTheOptimizer:
                                       weights)
         np.testing.assert_allclose(np.asarray(updates), -1e-3 * 1e-2 * np.ones(3))
 
-    def test_no_weight_decay_leaves_flowjax_its_default_optimizer(
-            self, monkeypatch, bounded_chain):
-        fit_kwargs = self._captured_fit_kwargs(monkeypatch, bounded_chain,
-                                               weight_decay=0.0)
-        assert "optimizer" not in fit_kwargs
-        assert fit_kwargs["learning_rate"] == 1e-3
+    def test_no_weight_decay_trains_with_plain_adam(self, monkeypatch,
+                                                    bounded_chain):
+        """Without decay the optimizer is Adam at the requested learning rate.
+
+        That is what flowjax would build itself from ``learning_rate``. The
+        optimizer is handed over anyway so that every fit at one learning
+        rate shares a single optimizer object, which the compiled training
+        step is cached against.
+        """
+        import optax
+
+        fit_kwargs = self._captured_fit_kwargs(
+            monkeypatch, bounded_chain, learning_rate=1e-3, weight_decay=0.0)
+        optimizer, adam = fit_kwargs["optimizer"], optax.adam(1e-3)
+        weights, gradient = jnp.ones(3), jnp.array([0.5, -2.0, 1e-3])
+        updates, _ = optimizer.update(gradient, optimizer.init(weights), weights)
+        expected, _ = adam.update(gradient, adam.init(weights), weights)
+        np.testing.assert_array_equal(np.asarray(updates), np.asarray(expected))
 
 
 @contextlib.contextmanager
@@ -506,6 +519,9 @@ def _compile_log():
 # flowjax's jitted training step. JAX names the program "step" up to 0.4.x and
 # "jit(step)" from 0.5 on.
 _TRAINING_STEP_COMPILE = re.compile(r"Compiling (?:jit\()?step\b")
+# Any jitted program whose name ends in log_prob: the divergence check's pass
+# over the training rows, whatever function wraps it.
+_DENSITY_PASS_COMPILE = re.compile(r"Compiling (?:jit\()?\w*log_prob\b")
 
 
 class TestTrainingCompilesOnce:
@@ -528,6 +544,52 @@ class TestTrainingCompilesOnce:
                                   show_progress=False)
         step_compiles = [m for m in compiled if _TRAINING_STEP_COMPILE.match(m)]
         assert len(step_compiles) == 1, step_compiles
+
+    def test_a_second_fit_of_one_architecture_reuses_the_compiled_programs(
+            self, bounded_chain):
+        """Fitting the same architecture again compiles no training step.
+
+        flowjax caches its compiled step against the loss object, the
+        optimizer and every function stored in the flow, all by identity, and
+        it makes a fresh loss and optimizer per call while every new flow
+        carries freshly made functions, so each fit used to compile from
+        scratch. The divergence check's density pass is reused the same way
+        when the chain has the same shape.
+        """
+        knobs = {"max_epochs": 2, "flow_layers": 1, "show_progress": False}
+        jax.clear_caches()
+        with _compile_log() as first:
+            normalizing_flows_fit(bounded_chain, rng_seed=0, **knobs)
+        with _compile_log() as second:
+            normalizing_flows_fit(bounded_chain, rng_seed=1, **knobs)
+        # The first fit shows both programs compiling, so an empty match in
+        # the second is not just a pattern that never matches.
+        for pattern in (_TRAINING_STEP_COMPILE, _DENSITY_PASS_COMPILE):
+            assert [m for m in first if pattern.match(m)]
+            assert not [m for m in second if pattern.match(m)], pattern.pattern
+
+    def test_sharing_the_template_functions_does_not_change_the_fit(
+            self, monkeypatch, bounded_chain):
+        """A new flow takes its stored functions from a cached template.
+
+        Those functions are what flowjax's step cache compares by identity,
+        and they are rebuilt per flow. Swapping in the template's copies is
+        only sound if they carry nothing of a particular flow (its seed, its
+        permutations), so the trained flow must not depend on the swap.
+        """
+        def trained_leaves(flow):
+            return [np.asarray(leaf) for leaf in jax.tree_util.tree_leaves(flow)
+                    if eqx.is_inexact_array(leaf)]
+
+        knobs = {"max_epochs": 3, "flow_layers": 2, "rng_seed": 7,
+                 "show_progress": False}
+        shared = trained_leaves(normalizing_flows_fit(bounded_chain, **knobs))
+        monkeypatch.setattr("coppuccino.copula_flows._share_template_functions",
+                            lambda flow, architecture: flow)
+        unshared = trained_leaves(normalizing_flows_fit(bounded_chain, **knobs))
+        assert len(shared) == len(unshared)
+        for a, b in zip(shared, unshared):
+            np.testing.assert_array_equal(a, b)
 
 
 class TestDivergenceGuard:

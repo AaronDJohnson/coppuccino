@@ -1,16 +1,19 @@
+import functools
 import warnings
-from typing import Any, Callable, NamedTuple, Optional
+from typing import Callable, NamedTuple, Optional
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
+import optax
 from equinox import filter_jit
 from flowjax.bijections import Stack
 from flowjax.distributions import Normal, Transformed
 from flowjax.flows import triangular_spline_flow
 from flowjax.train import fit_to_data
+from flowjax.train.losses import MaximumLikelihoodLoss
 from paramax import non_trainable, unwrap
 from paramax.wrappers import NonTrainable
 
@@ -222,10 +225,21 @@ def _copula_mean_log_prob(copula, z_train: jnp.ndarray) -> float:
     float
         The mean, or NaN if any row scored non-finitely.
     """
-    values = np.asarray(filter_jit(copula.log_prob)(z_train), dtype=float)
+    values = np.asarray(_dist_log_prob(copula, z_train), dtype=float)
     if not np.all(np.isfinite(values)):
         return float("nan")
     return float(np.mean(values))
+
+
+@filter_jit
+def _dist_log_prob(dist, points: jnp.ndarray) -> jnp.ndarray:
+    """``dist.log_prob(points)``, compiled once per copula architecture.
+
+    A module-level function, so that the untrained and the trained copula of
+    one fit, and every later fit of the same architecture and chain shape,
+    share one compiled program (see :func:`_new_copula`).
+    """
+    return dist.log_prob(points)
 
 
 def _assert_fit_converged(flow: Transformed, initial_copula,
@@ -471,6 +485,100 @@ def _without_weak_types(tree):
         tree)
 
 
+# A fit spends about 1.6 s compiling flowjax's training step before it trains
+# anything, and flowjax caches that compile against the loss object, the
+# optimizer and every plain function stored in the flow, all compared by
+# identity. It builds a fresh loss and optimizer on every call, and each new
+# flow carries freshly made functions, so on its own no fit ever reused
+# another's compile. Handing over one loss, one optimizer per setting and the
+# functions of one template per architecture lets every later fit of that
+# architecture skip the compile.
+_MAXIMUM_LIKELIHOOD = MaximumLikelihoodLoss()
+
+
+@functools.lru_cache(maxsize=64)
+def _optimizer(learning_rate: float, weight_decay: float):
+    """The optax optimizer for one ``(learning_rate, weight_decay)``, built once.
+
+    Without decay this is plain Adam, which is what flowjax would build from
+    ``learning_rate`` itself. With decay it is AdamW, as continuous capacity
+    control: it decays the trainable (conditioner) weights toward zero. In
+    the coupling layers the spline parameters are (conditioner output +
+    identity initialization), so the decay pulls every layer toward the
+    identity map, and a generous architecture then limits its own effective
+    capacity instead of fitting sampling noise.
+    """
+    if weight_decay > 0.0:
+        return optax.adamw(learning_rate, weight_decay=weight_decay)
+    return optax.adam(learning_rate)
+
+
+def _build_copula(key, n_params: int, knots: int, flow_layers: int,
+                  tanh_max_val: float) -> Transformed:
+    """flowjax's triangular spline flow over a standard normal base."""
+    return triangular_spline_flow(
+        key,
+        base_dist=Normal(jnp.zeros(n_params)),
+        knots=knots,
+        flow_layers=flow_layers,
+        tanh_max_val=tanh_max_val,
+        invert=True,
+    )
+
+
+def _is_function_leaf(leaf) -> bool:
+    """True for a plain function stored in a flow (not an array or a module)."""
+    return (callable(leaf) and not eqx.is_array(leaf)
+            and not isinstance(leaf, eqx.Module))
+
+
+@functools.lru_cache(maxsize=32)
+def _template_functions(architecture: tuple) -> tuple:
+    """Structure and function leaves of one untrained copula architecture.
+
+    Array leaves are dropped (stored as None): only the functions are shared.
+    """
+    template = _build_copula(jr.key(0), *architecture)
+    leaves, treedef = jax.tree_util.tree_flatten(template,
+                                                 is_leaf=_is_function_leaf)
+    return treedef, tuple(leaf if _is_function_leaf(leaf) else None
+                          for leaf in leaves)
+
+
+def _share_template_functions(flow: Transformed,
+                              architecture: tuple) -> Transformed:
+    """``flow`` with its stored functions replaced by the template's copies.
+
+    The functions are flowjax's parameterizations (a softmax onto the knot
+    interval, a softplus for the knot derivatives, the triangular mask). They
+    depend on the architecture alone, so the swap changes no number; a test
+    holds that by fitting with and without it. Arrays, including the
+    seed-dependent layer permutations, stay this flow's own. A flow whose
+    structure differs from the template's is returned unchanged.
+    """
+    treedef, template_leaves = _template_functions(architecture)
+    leaves, flow_treedef = jax.tree_util.tree_flatten(flow,
+                                                      is_leaf=_is_function_leaf)
+    if flow_treedef != treedef:
+        return flow
+    return jax.tree_util.tree_unflatten(flow_treedef, [
+        shared if _is_function_leaf(shared) and _is_function_leaf(own) else own
+        for shared, own in zip(template_leaves, leaves)])
+
+
+def _new_copula(key, n_params: int, knots: int, flow_layers: int,
+                tanh_max_val: float) -> Transformed:
+    """An untrained copula flow, ready to reuse compiled training programs.
+
+    It has no weakly typed parameters (:func:`_without_weak_types`) and it
+    carries its architecture's shared functions
+    (:func:`_share_template_functions`).
+    """
+    architecture = (n_params, knots, flow_layers, tanh_max_val)
+    flow = _without_weak_types(_build_copula(key, *architecture))
+    return _share_template_functions(flow, architecture)
+
+
 def _fit_chain_entry(
     input_flow: Transformed,
     transform: Stack,
@@ -533,22 +641,12 @@ def _fit_chain_entry(
     key = jr.key(rng_seed)
     x_train, _ = inverse_log_det(chain_entry)
 
-    kwargs: dict[str, Any] = {
-        'max_epochs': max_epochs,
-        'max_patience': patience,
-        'learning_rate': learning_rate,
-        'show_progress': show_progress,
-    }
-    if weight_decay and weight_decay > 0.0:
-        # Continuous capacity control: AdamW decays the trainable (conditioner)
-        # weights toward zero. In the coupling layers the spline parameters are
-        # (conditioner output + identity initialization), so the decay pulls
-        # every layer toward the identity map -- a generous architecture then
-        # self-limits its effective capacity instead of fitting sampling noise.
-        import optax
-        kwargs['optimizer'] = optax.adamw(learning_rate, weight_decay=weight_decay)
-
-    updated_flow, _losses = fit_to_data(key, input_flow, x_train, **kwargs)
+    updated_flow, _losses = fit_to_data(
+        key, input_flow, x_train,
+        loss_fn=_MAXIMUM_LIKELIHOOD,
+        optimizer=_optimizer(float(learning_rate), float(weight_decay)),
+        max_epochs=max_epochs, max_patience=patience,
+        show_progress=show_progress)
 
     # apply the empirical marginal transforms on top of the trained copula
     return Transformed(updated_flow, transform)
@@ -748,14 +846,7 @@ def normalizing_flows_fit(chain: np.ndarray, *, rng_seed: int = 999,
 
     n_params = clean_chain.shape[1]
     # Gaussianized copula: triangular spline flow on unbounded space.
-    flow = _without_weak_types(triangular_spline_flow(
-        key,
-        base_dist=Normal(jnp.zeros(n_params)),
-        knots=knots,
-        flow_layers=flow_layers,
-        tanh_max_val=tanh_max_val,
-        invert=True
-    ))
+    flow = _new_copula(key, n_params, knots, flow_layers, tanh_max_val)
 
     # Keep the untrained copula: it is the baseline the divergence check
     # compares the fitted density against.
