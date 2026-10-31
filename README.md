@@ -361,10 +361,28 @@ analytic tails — whose forward map, inverse, and derivative share one
 parameterization, so samples land strictly inside the support and the
 reported density describes the stream that `sample` actually emits.
 The exception is a bound that the training chain itself touches. There `sample`
-redraws any row that saturates at the wall, so a thin sliver next to the wall
-still has mass under `log_prob` but is never emitted. The sliver is empty for a
-chain strictly inside its box, and it grows with the share of rows sitting on
-the wall (the `sample` docstring gives measured rates).
+redraws any row that saturates at the wall, so a sliver next to the wall still
+has mass under `log_prob` but is never emitted. The sliver is empty for a chain
+strictly inside its box, and it grows with the share of rows sitting on the
+wall (the `sample` docstring gives measured rates). It is narrow, but it can
+hold much of the wall's mass, so a chain with real point masses on a bound
+comes back with too little there. On 1500×2 chains of
+`clip(N(0.77, 0.25), -1, 1)` in a ±1 box, 16–18% of the first parameter's rows
+sit exactly on +1, and 8.1–14.6% of draws land within 0.01 of it, against
+17.3–18.7% of the chain (default settings, `rng_seed=s` for the fit and for
+200,000 draws, $s = 0\ldots2$).
+
+A bound the chain does not reach has a smaller problem of its own. Between the
+outermost data point and the wall the copula extrapolates, and the reported
+density runs high there, most of all on the wall itself. On 3000×2 `U(0, 1)`
+data in its own box, where the true log-density is 0 everywhere, `log_prob` is
++2.0 to +4.3 at the edge midpoints and +3.5 to +12.1 at the corners, against
+−0.08 in the interior, and back to −0.3 to −0.1 by 0.001 inside the wall
+(default settings, seeds 0–2). The gap is narrow (under $10^{-3}$ here) and
+holds 0.24–0.46% of draws where the truth puts 0.09–0.14%, and
+`compute_injection_hdr` gives an injection beyond the samples its 1.0
+sentinel, so the cost falls mainly on a pointwise `log_prob` read at or next
+to the wall.
 `num_points` sets how many quantile knots the bulk uses (default 200, clamped
 to between 20 and a third of the samples).
 

@@ -513,6 +513,27 @@ def save_flow(flow: Transformed, path: Union[str, Path]) -> None:
     _atomic_write_bytes(path, cloudpickle.dumps(save_dict))
 
 
+def _read_payload(path, writer: str):
+    """Unpickle a saved model file, naming ``path`` if it is not one.
+
+    ``writer`` is the save method the file should have come from, quoted in the
+    error. ``open`` is outside the guard: its own errors (missing file,
+    directory, permissions) already name the path.
+    """
+    with open(path, 'rb') as f:
+        try:
+            return cloudpickle.load(f)
+        except Exception as exc:
+            # A truncated or non-pickle file surfaces as UnpicklingError,
+            # EOFError or UnicodeDecodeError, none of which mention the file
+            # being read -- unhelpful when the caller is walking a directory.
+            raise ValueError(
+                f"{path} could not be deserialized as a coppuccino model "
+                f"({type(exc).__name__}: {exc}). The file is truncated or was "
+                f"not written by {writer}."
+            ) from exc
+
+
 def load_flow(path: Union[str, Path]) -> Transformed:
     """
     Load a copula flow model from disk.
@@ -560,22 +581,7 @@ def load_flow(path: Union[str, Path]) -> Transformed:
     >>> samples = sample(flow, n_samples=100, rng_seed=42)
     """
     path = Path(path)
-
-    # open() is outside the guard: its own errors (missing file, directory,
-    # permissions) already name the path.
-    with open(path, 'rb') as f:
-        try:
-            save_dict = cloudpickle.load(f)
-        except Exception as exc:
-            # A truncated or non-pickle file surfaces as UnpicklingError,
-            # EOFError or UnicodeDecodeError, none of which mention the file
-            # being read -- unhelpful when the caller is walking a directory.
-            raise ValueError(
-                f"{path} could not be deserialized as a coppuccino model "
-                f"({type(exc).__name__}: {exc}). The file is truncated or was "
-                "not written by save_flow."
-            ) from exc
-
+    save_dict = _read_payload(path, "save_flow")
     _check_payload(save_dict, path, FLOW_KIND)
 
     # _check_payload has already parsed the stamp, so this cast cannot fail.

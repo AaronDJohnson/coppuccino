@@ -839,10 +839,10 @@ class TestTailClampRedrawIsLoadBearing:
     it.
 
     Measured on this fixture at 4,000 draws with ``rng_seed=1``: the raw
-    draw's most repeated value occupies 406 rows (10.15%), the emitted
+    draw's most repeated value occupies 436 rows (10.90%), the emitted
     stream's occupies 1 -- the floor of the statistic, i.e. no repeat at all.
     Stubbing ``_clamped_rows`` to return all-False makes the emitted stream
-    *bitwise identical* to the raw one, restoring all 406.
+    *bitwise identical* to the raw one, restoring all 436.
     """
 
     N_DRAWS = 4000
@@ -854,8 +854,9 @@ class TestTailClampRedrawIsLoadBearing:
 
     def _raw_atom_fraction(self, flow, seed):
         """Same statistic on the untreated draw ``sample`` starts from."""
-        raw = np.asarray(filter_jit(flow.sample)(
-            jax.random.key(seed), (self.N_DRAWS,)))
+        # ``sample`` splits the seed's key and draws from the first half
+        draw_key = jax.random.split(jax.random.key(seed))[0]
+        raw = np.asarray(filter_jit(flow.sample)(draw_key, (self.N_DRAWS,)))
         fraction = self._largest_atom_fraction(raw)
         # If the fixture ever stopped producing clamped rows the comparisons
         # below would pass vacuously, so make that a failure in its own right.
@@ -878,6 +879,48 @@ class TestTailClampRedrawIsLoadBearing:
         assert self._largest_atom_fraction(emitted) < 0.01
         # and the densities that come back with them stay usable
         assert np.all(np.isfinite(log_probs))
+
+    @pytest.mark.parametrize("verb", [sample, sample_and_log_prob])
+    def test_no_draw_reuses_a_key_another_draw_consumed(
+            self, wall_atom_flow, monkeypatch, verb):
+        """Each draw, raw or replacement, gets keys no other draw has touched.
+
+        flowjax splits a draw's key into one key per row. The redraw loop used
+        to split the raw draw's key again, so under jax's default
+        partitionable threefry its first replacement block came from row 1's
+        key, and the key it carried forward was row 0's. The dependence that
+        left was below noise when measured, but it breaks jax's rule that a key
+        is used once, so the assertion is on the keys themselves: every draw's
+        key, and every per-row key split from it, is distinct.
+        """
+        from coppuccino import copula_flows as cf_mod
+
+        draws = []
+        real_jit = cf_mod.filter_jit
+
+        def recording_jit(fn):
+            jitted = real_jit(fn)
+
+            def call(*args, **kwargs):
+                dtype = getattr(args[0], "dtype", None)
+                if dtype is not None and jax.dtypes.issubdtype(dtype, jax.dtypes.prng_key):
+                    draws.append((args[0], int(np.prod(args[1]))))
+                return jitted(*args, **kwargs)
+            return call
+
+        monkeypatch.setattr(cf_mod, "filter_jit", recording_jit)
+        verb(wall_atom_flow, self.N_DRAWS, rng_seed=1)
+        assert len(draws) > 1, "the fixture no longer triggers a redraw"
+
+        def key_bytes(keys):
+            data = np.asarray(jax.random.key_data(keys)).reshape(-1, 2)
+            return {tuple(row) for row in data.tolist()}
+
+        seen: set = set()
+        for key, n_rows in draws:
+            used = key_bytes(key) | key_bytes(jax.random.split(key, n_rows))
+            assert not used & seen
+            seen |= used
 
 
 class TestPriorBoxIsHardSupport:

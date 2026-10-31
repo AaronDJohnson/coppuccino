@@ -68,7 +68,11 @@ density.
   uniform base. Its input contract is stricter: `prior_bounds` is required,
   finite and ordered, chains must be finite, and a column that is constant
   within a source is an error. `FleetFlow.sample(rng_seed=s, source_index=i)`
-  reproduces `FleetFlow.sample(rng_seed=s)[i]`.
+  reproduces `FleetFlow.sample(rng_seed=s)[i]`. The options after
+  `prior_bounds` are keyword-only and range-checked by name. A source whose
+  validation loss never improves on its untrained initialization, which is
+  what a diverged fit looks like, is returned untrained and named in a
+  warning; if no source improves, the fit raises `RuntimeError`.
 - New `normalizing_flows_fit` options: `tail_alpha` (tail heaviness on
   unbounded sides, 0 to 10, where 0 gives Gaussian tails), `weight_decay`
   (AdamW decay on the trainable copula parameters) and `show_progress`.
@@ -105,7 +109,20 @@ density.
   in self-normalized importance weights. But the truncated sliver is never
   proposed. It is empty for a chain strictly inside its box and grows with the
   share of rows on a wall. Chains with 52–54% of their rows clipped onto a wall
-  redrew 18–21% of raw draws; the protocol is in `sample`'s docstring.
+  redrew 18–21% of raw draws; the protocol is in `sample`'s docstring. The
+  sliver can hold much of the wall's mass, so draws come back with too little
+  of it. On 1500×2 chains of `clip(N(0.77, 0.25), -1, 1)` in a ±1 box, at
+  default settings and seeds 0–2, 16–18% of the first parameter's rows sit
+  exactly on +1, and 8.1–14.6% of draws land within 0.01 of it, against
+  17.3–18.7% of the chain.
+- **At a bound the training chain does not reach**, the density is too high
+  between the outermost data point and the wall, most of all on the wall. On
+  3000×2 `U(0, 1)` data in its own box, where the true log-density is 0
+  everywhere, `log_prob` is +2.0 to +4.3 at the edge midpoints and +3.5 to
+  +12.1 at the corners, against −0.08 in the interior, and back to −0.3 to
+  −0.1 by 0.001 inside the wall (default settings, seeds 0–2). That gap is
+  under 0.001 wide there and held 0.24–0.46% of draws, where the truth puts
+  0.09–0.14%.
 - **Why `compute_injection_hdr` changed its reference.** The reference points
   are now posterior rows the fit never saw. An injection drawn from the
   posterior is exchangeable with them, so its rank is uniform for any fitted

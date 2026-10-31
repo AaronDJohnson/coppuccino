@@ -1469,7 +1469,9 @@ def _redraw_clamped_rows(draw: Callable[[jax.Array, int], tuple],
     limits : tuple of np.ndarray
         Per-dimension clamp limits from :func:`_smooth_clamp_limits`.
     key : jax PRNG key
-        Seed for the replacement draws; split on each round.
+        Seed for the replacement draws; split on each round. It must not be
+        the key the raw draw used: flowjax splits that one into per-row keys,
+        and splitting it again here hands out some of those same keys.
     n_samples : int
         The requested draw count, which caps the replacement block size.
     verb : str
@@ -1619,14 +1621,14 @@ def sample(flow: Transformed, n_samples: int, rng_seed: Optional[int] = None) ->
     """
     _reject_fleet_flow(flow, "sample", "fleet.sample(n_samples, rng_seed=...)")
     n_samples = _validate_n_samples(n_samples, "sample")
-    key = jr.key(_resolve_seed(rng_seed))
+    key, redraw_key = jr.split(jr.key(_resolve_seed(rng_seed)))
     # Use filter_jit for improved performance
     samples = np.array(filter_jit(flow.sample)(key, (n_samples,)))
     limits = _smooth_clamp_limits(flow)
     if limits is not None:
         _redraw_clamped_rows(
             lambda sub, block: (filter_jit(flow.sample)(sub, (block,)),),
-            (samples,), limits, key, n_samples, "sample")
+            (samples,), limits, redraw_key, n_samples, "sample")
     return samples
 
 
@@ -1770,7 +1772,7 @@ def sample_and_log_prob(flow: Transformed, n_samples: int, rng_seed: Optional[in
     _reject_fleet_flow(flow, "sample_and_log_prob",
                        "fleet.sample_and_log_prob(n_samples, rng_seed=...)")
     n_samples = _validate_n_samples(n_samples, "sample_and_log_prob")
-    key = jr.key(_resolve_seed(rng_seed))
+    key, redraw_key = jr.split(jr.key(_resolve_seed(rng_seed)))
     jax_samples, jax_log_probs = filter_jit(
         flow.sample_and_log_prob)(key, (n_samples,))
     # Bind the numpy views to their own names: rebinding the jax Arrays in place
@@ -1782,7 +1784,7 @@ def sample_and_log_prob(flow: Transformed, n_samples: int, rng_seed: Optional[in
         _redraw_clamped_rows(
             lambda sub, block: filter_jit(
                 flow.sample_and_log_prob)(sub, (block,)),
-            (samples, log_probs), limits, key, n_samples,
+            (samples, log_probs), limits, redraw_key, n_samples,
             "sample_and_log_prob")
         # The forward pass computes the log-det at the generated z, while
         # log_prob reconstructs z from the float-truncated x. Near a hard

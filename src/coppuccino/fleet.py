@@ -37,6 +37,7 @@ Example
 >>> x7 = fleet.sample(512, rng_seed=0, source_index=7)  # doctest: +SKIP
 """
 import io
+import warnings
 from typing import Any, Callable, Optional
 
 import cloudpickle
@@ -56,11 +57,18 @@ from coppuccino.bijections import (
     _rqs_forward,
     _rqs_inverse,
 )
+from coppuccino.copula_flows import (
+    _require_finite_float,
+    _require_positive_int,
+    _resolve_seed,
+    _validate_n_samples,
+)
 from coppuccino.model_io import (
     FLEET_KIND,
     FORMAT_VERSION,
     _atomic_write_bytes,
     _check_payload,
+    _read_payload,
 )
 
 __all__ = ["normalizing_flows_fit_fleet", "FleetFlow"]
@@ -638,7 +646,7 @@ class FleetFlow:
         one source (negatives count from the end). Fresh entropy when
         ``rng_seed`` is None; for a fixed seed the single-source draws are the
         corresponding slice of the whole-fleet draws."""
-        from coppuccino.copula_flows import _resolve_seed
+        n_samples = _validate_n_samples(n_samples, "FleetFlow.sample")
         key = jr.key(_resolve_seed(rng_seed))
         keys = jr.split(key, self.n_sources)
         if source_index is None:
@@ -663,6 +671,7 @@ class FleetFlow:
         two would score the *pre*-inverse u instead, which near a wall differs
         from the reconstructed value by nats.
         """
+        n_samples = _validate_n_samples(n_samples, "FleetFlow.sample_and_log_prob")
         x = self.sample(n_samples, rng_seed=rng_seed, source_index=source_index)
         return x, self.log_prob(x, source_index=source_index)
 
@@ -731,12 +740,12 @@ class FleetFlow:
         Raises
         ------
         ValueError
-            If the file holds a single copula flow (saved by ``save_flow``)
-            rather than a fleet, or was written in a newer save format than
-            this install understands.
+            If the file cannot be unpickled (truncated, or not a saved model),
+            holds a single copula flow (saved by ``save_flow``) rather than a
+            fleet, or was written in a newer save format than this install
+            understands.
         """
-        with open(path, "rb") as f:
-            d = cloudpickle.load(f)
+        d = _read_payload(path, "FleetFlow.save")
         # Fleet and single-flow payloads share no keys, so without this the
         # wrong file dies on `KeyError: 'arch'`. Files written before the
         # stamps existed are still recognised, by their key set.
@@ -774,6 +783,7 @@ class FleetFlow:
 
 def normalizing_flows_fit_fleet(chains: np.ndarray,
                                 prior_bounds: np.ndarray,
+                                *,
                                 knots: int = 4,
                                 flow_layers: int = 6,
                                 learning_rate: float = 1e-3,
@@ -810,11 +820,17 @@ def normalizing_flows_fit_fleet(chains: np.ndarray,
         anchors its outermost marginal knots on the bounds, so -- unlike
         ``normalizing_flows_fit`` -- it has no representation for an
         unbounded side.
+
+    Every option below is keyword-only.
+
     knots, flow_layers : int, optional
-        Fleet-wide copula architecture. Defaults 4 and 6.
+        Fleet-wide copula architecture. Defaults 4 and 6; ``knots >= 2``,
+        ``flow_layers >= 1``.
     learning_rate, max_epochs, patience, batch_size, val_prop : optional
         Training controls. ``patience`` acts on the fleet-mean validation
         loss; per-source best parameters are tracked and returned regardless.
+        ``learning_rate`` must be positive, the three counts at least 1, and
+        ``val_prop`` in (0, 1) with at least one row left to train on.
     num_points : int, optional
         Marginal CDF quantile-grid size (clamped to ``n_samples // 3``).
     rng_seed : int, optional
@@ -834,9 +850,20 @@ def normalizing_flows_fit_fleet(chains: np.ndarray,
     ------
     ValueError
         If ``chains`` is not 3-D, is too short, holds a non-finite value, has
-        a constant column, or leaves its box; or if ``prior_bounds`` has the
+        a constant column, or leaves its box; if ``prior_bounds`` has the
         wrong shape, a non-finite side, or a row that is not strictly
-        increasing.
+        increasing; or if a training option is out of range.
+    RuntimeError
+        If no source's validation loss ever improves on its untrained
+        initialization, which is what a diverged fit looks like.
+
+    Warns
+    -----
+    UserWarning
+        If some, but not all, sources never improve on their untrained
+        initialization. They are returned untrained, and the warning names
+        them. Neither check applies with ``warm_start``, where keeping the
+        starting parameters means keeping an earlier fit.
 
     Notes
     -----
@@ -858,6 +885,9 @@ def normalizing_flows_fit_fleet(chains: np.ndarray,
     much less than proportionally, since the parameter copies above do not
     shrink with it.
     """
+    _validate_fleet_hyperparameters(knots, flow_layers, learning_rate,
+                                    max_epochs, patience, batch_size,
+                                    val_prop, num_points, rng_seed)
     chains = np.asarray(chains, dtype=float)
     if chains.ndim != 3:
         raise ValueError(f"chains must be (n_sources, n_samples, dim); "
@@ -880,7 +910,7 @@ def normalizing_flows_fit_fleet(chains: np.ndarray,
     # per-source val split (shared indices; sizes identical by construction)
     rng = np.random.default_rng(rng_seed)
     perm = rng.permutation(n_samp)
-    n_val = max(1, int(round(n_samp * val_prop)))
+    n_val = _validation_rows(n_samp, val_prop)
     # map the two halves separately. Mapping the whole chain and then slicing
     # it would pin a second (n_sources, n_samples, dim) buffer -- 1.3 GB at the
     # documented 10^4-source scale -- for the whole fit, alongside a marginal
@@ -925,9 +955,14 @@ def normalizing_flows_fit_fleet(chains: np.ndarray,
     key = jr.key(rng_seed)
     best_val = np.asarray(val_loss(params))
     best_params = params
+    # A warm-started source begins from an earlier fit, so returning its
+    # starting parameters is not a failure; only a cold start is checked.
+    ever_improved = np.full(n_src, warm_start is not None)
     fleet_best = float(np.mean(best_val))
     stall = 0
+    epochs_run = 0
     for epoch in range(max_epochs):
+        epochs_run += 1
         key, sub = jr.split(key)
         order = jr.permutation(sub, n_tr)
         for s in range(steps):
@@ -945,6 +980,7 @@ def normalizing_flows_fit_fleet(chains: np.ndarray,
                     imp.reshape((-1,) + (1,) * (n.ndim - 1)), n, b),
                 best_params, params)
             best_val = np.where(improved, v, best_val)
+            ever_improved |= improved
         if verbose:
             print(f"[fleet] epoch {epoch + 1}/{max_epochs}: "
                   f"mean val NLL {np.mean(v):.4f} "
@@ -957,4 +993,73 @@ def normalizing_flows_fit_fleet(chains: np.ndarray,
             if stall >= patience:
                 break
 
+    _report_untrained_sources(ever_improved, epochs_run, learning_rate)
     return FleetFlow(best_params, static, arch, xk, yk, dk, lo, hi)
+
+
+def _validate_fleet_hyperparameters(knots, flow_layers, learning_rate,
+                                    max_epochs, patience, batch_size,
+                                    val_prop, num_points, rng_seed) -> None:
+    """Range-check the fleet's training knobs, naming the offending one.
+
+    Unchecked, ``batch_size=-1`` made the step count negative and skipped
+    every step, a non-positive ``learning_rate`` never improved on the
+    initialization, and ``max_epochs=0`` never trained: all three returned an
+    untrained fleet without an error. ``batch_size=0``, ``val_prop=1.0`` and
+    ``knots=0`` died on a bare ``ZeroDivisionError``. The bounds match
+    ``normalizing_flows_fit``'s.
+    """
+    _require_positive_int("rng_seed", rng_seed, 0)
+    _require_positive_int("knots", knots, 2)
+    _require_positive_int("flow_layers", flow_layers, 1)
+    _require_positive_int("max_epochs", max_epochs, 1)
+    _require_positive_int("patience", patience, 1)
+    _require_positive_int("batch_size", batch_size, 1)
+    _require_positive_int("num_points", num_points, 2)
+    _require_finite_float("learning_rate", learning_rate, 0.0)
+    _require_finite_float("val_prop", val_prop, 0.0)
+    if not float(val_prop) < 1.0:
+        raise ValueError(f"val_prop must be a finite float in (0, 1); got {val_prop!r}.")
+
+
+def _validation_rows(n_samp: int, val_prop: float) -> int:
+    """Per-source validation-split size, refusing one that leaves no training rows."""
+    n_val = max(1, int(round(n_samp * val_prop)))
+    if n_val >= n_samp:
+        raise ValueError(
+            f"val_prop={val_prop!r} puts all {n_samp} samples per source in "
+            "the validation split, leaving none to train on.")
+    return n_val
+
+
+def _report_untrained_sources(ever_improved: np.ndarray, epochs_run: int,
+                              learning_rate: float) -> None:
+    """Raise if no source trained, warn naming the ones that did not.
+
+    A source's best parameters move only when its validation loss improves, so
+    a source that never improves comes back exactly as initialized. That is
+    what divergence looks like here: measured on four Beta(2, 5) sources over
+    20 epochs, ``learning_rate=0.1`` left one of them at its initialization
+    and every rate from 1 up left all four, each returning normally with a
+    training log-density of 0.49-0.97 against 1.28 for a 1e-3 fit. A NaN
+    loss is never an improvement either, so a source that starts from NaN is
+    caught the same way.
+    """
+    stuck = np.flatnonzero(~ever_improved)
+    if not len(stuck):
+        return
+    setting = f"after {epochs_run} epoch(s) at learning_rate={learning_rate!r}"
+    if len(stuck) == len(ever_improved):
+        raise RuntimeError(
+            "normalizing_flows_fit_fleet: no source's validation loss improved "
+            f"on its untrained initialization {setting}; this is what a "
+            "diverged fit looks like. Retry with a smaller learning_rate.")
+    shown = ", ".join(str(int(i)) for i in stuck[:20])
+    if len(stuck) > 20:
+        shown += ", ..."
+    warnings.warn(
+        f"normalizing_flows_fit_fleet: {len(stuck)} of {len(ever_improved)} "
+        f"sources never improved on their untrained initialization {setting}, "
+        f"and are returned untrained: [{shown}]. This is what a diverged fit "
+        "looks like; refit those sources with a smaller learning_rate.",
+        stacklevel=3)

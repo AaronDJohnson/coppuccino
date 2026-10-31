@@ -598,6 +598,90 @@ def test_input_validation(chains):
         normalizing_flows_fit_fleet(chains * 3.0, BOUNDS, max_epochs=1)
 
 
+@pytest.mark.parametrize("kwargs, name", [
+    ({"batch_size": -1}, "batch_size"),
+    ({"batch_size": 0}, "batch_size"),
+    ({"val_prop": 0.0}, "val_prop"),
+    ({"val_prop": 1.0}, "val_prop"),
+    ({"val_prop": float("nan")}, "val_prop"),
+    # rounds to every row, leaving nothing to train on
+    ({"val_prop": 0.9999}, "val_prop"),
+    ({"learning_rate": -1e-2}, "learning_rate"),
+    ({"learning_rate": 0.0}, "learning_rate"),
+    ({"max_epochs": 0}, "max_epochs"),
+    ({"patience": 0}, "patience"),
+    ({"knots": 1}, "knots"),
+    ({"flow_layers": 0}, "flow_layers"),
+    ({"num_points": 1}, "num_points"),
+    ({"rng_seed": -1}, "rng_seed"),
+    ({"rng_seed": 1.5}, "rng_seed"),
+])
+def test_training_settings_are_checked_by_name(chains, kwargs, name):
+    """The fleet's training knobs get the single-flow fit's range checks.
+
+    Unchecked, a negative batch_size, a non-positive learning_rate or
+    max_epochs=0 returned a fleet that never trained, and batch_size=0,
+    val_prop=1.0 or knots=0 died on a bare ZeroDivisionError.
+    """
+    with pytest.raises(ValueError, match=name):
+        normalizing_flows_fit_fleet(chains, BOUNDS, **kwargs)
+
+
+def test_fit_options_are_keyword_only(chains):
+    with pytest.raises(TypeError, match="positional"):
+        normalizing_flows_fit_fleet(chains, BOUNDS, 4)
+
+
+def test_a_source_that_never_trains_is_named(chains, monkeypatch):
+    """A source left at its initialization is reported, and the rest are kept.
+
+    Per-source best parameters only move when that source's validation loss
+    improves, so a source that never improves comes back untrained. Source 2
+    is started from NaN parameters here, so its loss is NaN throughout, which
+    no comparison ever counts as an improvement.
+    """
+    real = fleet_mod._stack_params
+
+    def poisoned(*args, **kwargs):
+        params, static = real(*args, **kwargs)
+        params = jax.tree_util.tree_map(
+            lambda a: a.at[2].set(jnp.nan) if eqx.is_inexact_array(a) else a, params)
+        return params, static
+
+    monkeypatch.setattr(fleet_mod, "_stack_params", poisoned)
+    with pytest.warns(UserWarning, match=r"1 of 6 sources .*\[2\]"):
+        fl = normalizing_flows_fit_fleet(chains, BOUNDS, max_epochs=3, rng_seed=1)
+    lp = fl.log_prob(chains[:, :200])
+    assert np.all(np.isfinite(np.delete(lp, 2, axis=0)))
+
+
+def test_a_fleet_that_never_trains_raises(chains):
+    """At an absurd learning_rate no source improves on its initialization."""
+    with pytest.raises(RuntimeError, match="learning_rate"):
+        normalizing_flows_fit_fleet(chains, BOUNDS, max_epochs=3, learning_rate=10.0,
+                                    rng_seed=1)
+
+
+@pytest.mark.parametrize("n_samples", [0, -3, 10.5])
+def test_draw_counts_are_checked(fleet, n_samples):
+    with pytest.raises(ValueError, match="n_samples"):
+        fleet.sample(n_samples, rng_seed=0)
+    with pytest.raises(ValueError, match="n_samples"):
+        fleet.sample_and_log_prob(n_samples, rng_seed=0)
+
+
+def test_a_damaged_fleet_file_is_named(fleet):
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, "fleet.pkl")
+        fleet.save(p)
+        with open(p, "rb") as f:
+            head = f.read(200)
+        with open(p, "wb") as f:
+            f.write(head)
+        with pytest.raises(ValueError, match="fleet.pkl"):
+            FleetFlow.load(p)
+
+
 def test_prior_bounds_get_the_single_flow_path_diagnosis(chains):
     """Reversed, degenerate and non-finite boxes each used to be reported as
     something else: the first two as 'chains contain samples outside
