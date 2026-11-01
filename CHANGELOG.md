@@ -6,7 +6,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [2.0.0] — 2026-10-31
+## [2.0.0] — 2026-11-01
 
 This is the first release since 1.0.0, and every change below is measured
 against 1.0.0. Earlier drafts of this file had entries for 1.1.0, 2.0.0 and
