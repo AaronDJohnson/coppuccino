@@ -408,7 +408,10 @@ class TestTrainingKnobValidation:
          ({"tanh_max_val": 0.0}, "tanh_max_val"),
          ({"weight_decay": -5.0}, "weight_decay"),
          ({"flow_layers": -1}, "flow_layers"),
-         ({"flow_layers": 0}, "flow_layers")],
+         ({"flow_layers": 0}, "flow_layers"),
+         ({"batch_size": 0}, "batch_size"),
+         ({"batch_size": -8}, "batch_size"),
+         ({"batch_size": 64.0}, "batch_size")],
     )
     def test_out_of_range_knob_names_itself_and_its_value(
             self, bounded_chain, kwargs, parameter):
@@ -434,6 +437,24 @@ class _StopBeforeTraining(Exception):
     """Raised by a ``fit_to_data`` spy once it has seen its arguments."""
 
 
+def _captured_fit_kwargs(monkeypatch, chain, **kwargs):
+    """The keyword arguments ``normalizing_flows_fit`` hands to flowjax.
+
+    A spy on the ``fit_to_data`` that module calls records them and stops
+    before any training happens.
+    """
+    captured = {}
+
+    def spy(key, dist, x, **fit_kwargs):
+        captured.update(fit_kwargs)
+        raise _StopBeforeTraining
+
+    monkeypatch.setattr("coppuccino.copula_flows.fit_to_data", spy)
+    with pytest.raises(_StopBeforeTraining):
+        normalizing_flows_fit(chain, show_progress=False, **kwargs)
+    return captured
+
+
 class TestWeightDecayReachesTheOptimizer:
     """``weight_decay`` is wired through to the optimizer flowjax trains with.
 
@@ -443,19 +464,6 @@ class TestWeightDecayReachesTheOptimizer:
     captures its keyword arguments and stops before any training happens.
     """
 
-    @staticmethod
-    def _captured_fit_kwargs(monkeypatch, chain, **kwargs):
-        captured = {}
-
-        def spy(key, dist, x, **fit_kwargs):
-            captured.update(fit_kwargs)
-            raise _StopBeforeTraining
-
-        monkeypatch.setattr("coppuccino.copula_flows.fit_to_data", spy)
-        with pytest.raises(_StopBeforeTraining):
-            normalizing_flows_fit(chain, show_progress=False, **kwargs)
-        return captured
-
     def test_a_positive_weight_decay_decays_the_weights(self, monkeypatch,
                                                         bounded_chain):
         """The optimizer handed over is AdamW with the requested decay.
@@ -463,7 +471,7 @@ class TestWeightDecayReachesTheOptimizer:
         At zero gradient Adam's update is exactly zero, so any update at all
         is the decoupled decay term, ``-learning_rate * weight_decay * w``.
         """
-        fit_kwargs = self._captured_fit_kwargs(
+        fit_kwargs = _captured_fit_kwargs(
             monkeypatch, bounded_chain, learning_rate=1e-3, weight_decay=1e-2)
         optimizer = fit_kwargs["optimizer"]
         weights = jnp.ones(3)
@@ -482,13 +490,29 @@ class TestWeightDecayReachesTheOptimizer:
         """
         import optax
 
-        fit_kwargs = self._captured_fit_kwargs(
+        fit_kwargs = _captured_fit_kwargs(
             monkeypatch, bounded_chain, learning_rate=1e-3, weight_decay=0.0)
         optimizer, adam = fit_kwargs["optimizer"], optax.adam(1e-3)
         weights, gradient = jnp.ones(3), jnp.array([0.5, -2.0, 1e-3])
         updates, _ = optimizer.update(gradient, optimizer.init(weights), weights)
         expected, _ = adam.update(gradient, adam.init(weights), weights)
         np.testing.assert_array_equal(np.asarray(updates), np.asarray(expected))
+
+
+class TestBatchSizeReachesFlowjax:
+    """``batch_size`` is the number of rows per optimizer step flowjax takes."""
+
+    def test_the_default_is_flowjax_s_own_100(self, monkeypatch, bounded_chain):
+        """Unchanged from before the option existed, when flowjax chose it."""
+        assert _captured_fit_kwargs(monkeypatch, bounded_chain)["batch_size"] == 100
+
+    @pytest.mark.parametrize("batch_size", [1, 256])
+    def test_a_requested_batch_size_is_handed_over(self, monkeypatch,
+                                                   bounded_chain, batch_size):
+        """Including 1, the smallest value the validator accepts."""
+        fit_kwargs = _captured_fit_kwargs(monkeypatch, bounded_chain,
+                                          batch_size=batch_size)
+        assert fit_kwargs["batch_size"] == batch_size
 
 
 @contextlib.contextmanager

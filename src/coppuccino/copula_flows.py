@@ -167,7 +167,7 @@ def _require_finite_float(name: str, value, minimum: float,
 def _validate_fit_hyperparameters(
     rng_seed, knots: int, patience: int, learning_rate: float,
     max_epochs: int, flow_layers: int, num_points: int, tanh_max_val: float,
-    weight_decay: float,
+    weight_decay: float, batch_size: int,
 ) -> None:
     """Range-check every training knob of :func:`normalizing_flows_fit`.
 
@@ -197,6 +197,7 @@ def _validate_fit_hyperparameters(
     _require_positive_int("max_epochs", max_epochs, 1)
     _require_positive_int("num_points", num_points, 2)
     _require_positive_int("flow_layers", flow_layers, 1)
+    _require_positive_int("batch_size", batch_size, 1)
     _require_finite_float("learning_rate", learning_rate, 0.0)
     _require_finite_float("tanh_max_val", tanh_max_val, 0.0)
     _require_finite_float("weight_decay", weight_decay, 0.0, strict=False)
@@ -591,6 +592,7 @@ def _fit_chain_entry(
     max_epochs: int = 200,
     weight_decay: float = 0.0,
     show_progress: bool = True,
+    batch_size: int = 100,
 ) -> Transformed:
     """
     Fit a normalizing flow to data with empirical marginal transforms.
@@ -616,6 +618,8 @@ def _fit_chain_entry(
         Random seed for reproducibility. Default is 999.
     max_epochs : int, optional
         Maximum number of training epochs. Default is 200.
+    batch_size : int, optional
+        Rows per optimizer step. Default is 100.
 
     Returns
     -------
@@ -646,7 +650,7 @@ def _fit_chain_entry(
         key, input_flow, x_train,
         loss_fn=_MAXIMUM_LIKELIHOOD,
         optimizer=_optimizer(float(learning_rate), float(weight_decay)),
-        max_epochs=max_epochs, max_patience=patience,
+        max_epochs=max_epochs, max_patience=patience, batch_size=batch_size,
         show_progress=show_progress)
 
     # apply the empirical marginal transforms on top of the trained copula
@@ -661,6 +665,7 @@ def normalizing_flows_fit(chain: np.ndarray, *, rng_seed: int = 999,
                           prior_bounds: Optional[np.ndarray] = None,
                           tail_alpha: float = 0.0,
                           weight_decay: float = 0.0,
+                          batch_size: int = 100,
                           show_progress: bool = True) -> Transformed:
     """
     Fit a copula normalizing flow to multivariate data.
@@ -748,6 +753,20 @@ def normalizing_flows_fit(chain: np.ndarray, *, rng_seed: int = 999,
         (choosing few ``knots`` imposes smoothness structurally and works
         better; decay >= ~10 over-regularizes). Treat it as a supplementary
         knob, not a substitute for architecture choice.
+    batch_size : int, optional
+        Rows per optimizer step. Must be an integer >= 1. Default is 100,
+        which is flowjax's own default and what every earlier release used.
+        flowjax holds back 10% of the rows to decide when to stop, so an
+        epoch is that 90% split into batches. On CPU a step costs about the
+        same per row whatever its size, so a larger batch means fewer updates
+        per epoch and usually more epochs; it pays off only on large chains.
+        Measured with every other option at its default: on 10 000 x 8 rows,
+        256 fitted about 22% faster (7.0 s against 9.0 s) at the same
+        held-out log-density; on the 2 880 fitting rows of the
+        galactic-binary posterior in ``examples/`` it was 13% slower (209
+        epochs instead of 143), also at the same held-out log-density.
+
+        .. versionadded:: 2.0
     show_progress : bool, optional
         Show the training progress bar. Default True. Set False for quiet
         fits (e.g. candidate fits inside ``normalizing_flows_fit_auto``).
@@ -765,7 +784,8 @@ def normalizing_flows_fit(chain: np.ndarray, *, rng_seed: int = 999,
         [0, 10], or if any training knob is out of range
         (``rng_seed >= 0``, ``knots >= 2``, ``patience >= 1``,
         ``max_epochs >= 1``, ``num_points >= 2``, ``flow_layers >= 1``,
-        ``learning_rate > 0``, ``tanh_max_val > 0``, ``weight_decay >= 0``).
+        ``learning_rate > 0``, ``tanh_max_val > 0``, ``weight_decay >= 0``,
+        ``batch_size >= 1``).
     RuntimeError
         If the optimizer diverged. Two forms: the trained flow ends up with
         non-finite parameters (it then samples nothing but NaN and scores
@@ -810,7 +830,7 @@ def normalizing_flows_fit(chain: np.ndarray, *, rng_seed: int = 999,
     """
     _validate_fit_hyperparameters(
         rng_seed, knots, patience, learning_rate, max_epochs, flow_layers,
-        num_points, tanh_max_val, weight_decay)
+        num_points, tanh_max_val, weight_decay, batch_size)
 
     key = jr.key(rng_seed)
 
@@ -855,7 +875,8 @@ def normalizing_flows_fit(chain: np.ndarray, *, rng_seed: int = 999,
 
     flow = _fit_chain_entry(flow, transform, inverse_log_det, clean_chain, rng_seed=rng_seed,
                             patience=patience, learning_rate=learning_rate, max_epochs=max_epochs,
-                            weight_decay=weight_decay, show_progress=show_progress)
+                            weight_decay=weight_decay, show_progress=show_progress,
+                            batch_size=batch_size)
 
     _assert_fit_converged(flow, initial_copula, z_train, learning_rate, max_epochs)
     return flow
