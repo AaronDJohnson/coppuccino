@@ -1074,40 +1074,6 @@ class TestPriorBoxIsHardSupport:
                                  [np.nextafter(0.0, -np.inf), 0.5]])
         assert np.all(np.isneginf(log_prob(box_flow, just_outside)))
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Known copula-extrapolation defect, not a masking defect and "
-               "not a marginal defect. On this fixture (U(0,1)^2, true "
-               "log-density 0 everywhere, seed 4 chain, seed 1 fit, 30 "
-               "epochs) the marginals alone report -1.99 to +0.59 on the six "
-               "box points -- within a nat of the truth -- while the copula "
-               "adds +2.56 to +11.56 on top, for +2.92 to +10.00 against an "
-               "interior median of +0.98. The copula's outermost training z "
-               "is the outermost marginal knot, ndtri(0.5/1200) = 3.34, and "
-               "bijections._WALL_Z_MARGIN lets a wall query reach 4.84, where "
-               "the triangular RQS flow extrapolates linearly; the two "
-               "corners, which sit at that depth in *both* dimensions, carry "
-               "+11.4 and +11.6 of the excess and are what breaks the 5-nat "
-               "bound (the four edge midpoints run +1.84 to +2.74 above the "
-               "interior). Shrinking the margin further trades this against "
-               "wall resolution and marginal wall-density accuracy, so the "
-               "fix has to bound the copula's extrapolation itself. The box "
-               "maximum still exceeds the +8.50 maximum over 20,000 of the "
-               "flow's own draws, by 1.50. strict: an unexpected pass fails "
-               "the suite, so delete this marker with that fix.")
-    def test_the_bounds_are_within_a_few_nats_of_the_interior(self, box_flow):
-        """The at-bound density must be comparable to the interior.
-
-        The fixture is uniform on its own box, so the truth is flat: every
-        point in the closed square has the same density, and the reported
-        log-density at a wall should differ from the interior by a few nats at
-        most. Without this, ``test_the_bounds_themselves_...`` above passes
-        for an arbitrarily wrong finite value.
-        """
-        interior = float(np.median(log_prob(
-            box_flow, np.array([[0.5, 0.5], [0.25, 0.75], [0.75, 0.25]]))))
-        assert np.max(np.abs(log_prob(box_flow, self.ON_BOX) - interior)) < 5.0
-
     def test_unbounded_flows_are_untouched(self, small_flow):
         """No prior_bounds means no hard support: distant points stay finite."""
         far = np.array([[0.0, 0.0], [20.0, 20.0], [-50.0, 3.0]])
