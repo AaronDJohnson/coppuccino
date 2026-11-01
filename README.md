@@ -308,8 +308,8 @@ training columns, not the marginal maps, and the marginals 1.0.0 built from
 them no longer exist. Refit the chain, or read the file under `coppuccino<2`.
 
 Key options to `normalizing_flows_fit` include `flow_layers` and `knots`
-(flow capacity), `max_epochs`, `learning_rate`, `patience` (training),
-`prior_bounds`, and `tail_alpha` (the marginal tails, below). See
+(flow capacity), `max_epochs`, `learning_rate`, `patience`, `batch_size`
+(training), `prior_bounds`, and `tail_alpha` (the marginal tails, below). See
 the docstrings for the full list. `normalizing_flows_fit_auto` fits a small
 ladder of capacities concurrently and returns the smallest model whose
 held-out fit is statistically comparable to the best.

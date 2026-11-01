@@ -76,7 +76,8 @@ density.
   warning; if no source improves, the fit raises `RuntimeError`.
 - New `normalizing_flows_fit` options: `tail_alpha` (tail heaviness on
   unbounded sides, 0 to 10, where 0 gives Gaussian tails), `weight_decay`
-  (AdamW decay on the trainable copula parameters) and `show_progress`.
+  (AdamW decay on the trainable copula parameters), `batch_size` (rows per
+  optimizer step, default 100 as before) and `show_progress`.
 - `normalizing_flows_fit` and `normalizing_flows_fit_auto` warn, with a count,
   when they drop rows that contain NaN or ±inf. 1.0.0 dropped NaN rows without
   saying so and let infinities through.
@@ -86,6 +87,16 @@ density.
 
 ### Changed
 
+- **A repeat fit compiles nothing.** A fit with the same chain shape,
+  `prior_bounds` and options as an earlier fit in the same process reuses its
+  compiled training step, density and marginal programs. 1.0.0 compiled four
+  programs again on every fit, the training step twice. One exception: tied
+  values in a column, such as rows sitting on a bound, merge spline knots.
+  The size of the marginal map then depends on the chain, and the map from
+  data to copula space compiles again when that size changes. On a 10,000×8
+  chain at default settings without `prior_bounds`, on CPU, the first fit in
+  a process takes about 13 s in both versions. Refitting the same chain, which
+  trains for 60 epochs in both, takes 7.2 s against 9.6 s.
 - **The marginal map.** Each marginal is a single clip-free monotone map of all
   of R onto the support: a rational-quadratic-spline bulk at the data
   quantiles, joined to analytic tails. Its forward map, inverse and derivative
@@ -181,9 +192,9 @@ sign that anything was wrong:
   accepted a box narrower than the data.
 - `normalizing_flows_fit` range-checks every training option. Integers are
   required for `rng_seed >= 0`, `knots >= 2`, `patience >= 1`,
-  `max_epochs >= 1`, `num_points >= 2` and `flow_layers >= 1`. Finite values
-  are required for `learning_rate > 0`, `tanh_max_val > 0` and
-  `weight_decay >= 0`. Each raises `ValueError` naming the option and the
+  `max_epochs >= 1`, `num_points >= 2`, `flow_layers >= 1` and
+  `batch_size >= 1`. Finite values are required for `learning_rate > 0`,
+  `tanh_max_val > 0` and `weight_decay >= 0`. Each raises `ValueError` naming the option and the
   value. `max_epochs=0` and a negative `learning_rate` used to return a flow
   that looked fitted.
 - `normalizing_flows_fit` raises `RuntimeError` when training diverges. That
