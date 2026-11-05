@@ -35,7 +35,7 @@ dependencies = [
     "scipy>=1.10,<2.0.0; python_version < '3.12'",
     "scipy>=1.11.3,<2.0.0; python_version >= '3.12'",
     "equinox>=0.13.2,<0.14.0",
-    "flowjax>=17.2.1,<18.0.0",
+    "flowjax>=17.2.1,<20.0.0",
     # jaxtyping >=0.3.6 carries the Python 3.12 `issubclass` typing fix.
     "jaxtyping>=0.3.6,<0.4.0",
     # paramax is still pre-1.0, where a minor release may break API, and
