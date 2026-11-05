@@ -28,6 +28,52 @@ __all__ = [
 # Minimum samples per dimension needed to build a usable empirical CDF.
 _MIN_SAMPLES_PER_DIM = 20
 
+# Rows per call of every jitted density evaluation. Each call is padded to
+# exactly this many rows (see _in_row_blocks), so one compiled program serves
+# every row count. Without it, every chain length and every query count
+# compiled programs of its own, and each compile's memory stayed with the
+# process.
+_ROW_BLOCK = 1024
+
+
+def _without_chains(tree):
+    """``tree`` with each smooth marginal's stored training column removed.
+
+    A :class:`SmoothMarginalToGaussian` keeps its column as reconstruction
+    metadata for :mod:`coppuccino.model_io`, and nothing evaluates it. jit
+    keys its cache on the shape of every array it is handed, though, used or
+    not, so passing the column in compiled a new program for every chain
+    length.
+    """
+    def strip(node):
+        if isinstance(node, SmoothMarginalToGaussian):
+            return eqx.tree_at(lambda b: b.samples, node, None)
+        return node
+    return jax.tree_util.tree_map(
+        strip, tree, is_leaf=lambda node: isinstance(node, SmoothMarginalToGaussian))
+
+
+def _in_row_blocks(fn: Callable, tree, x) -> object:
+    """``fn(tree, x)``, evaluated over the rows of ``x`` in fixed-size blocks.
+
+    ``fn`` is a jitted function whose outputs all have one entry per row of
+    ``x``. Each call gets exactly ``_ROW_BLOCK`` rows, the last block padded
+    with copies of the first row, so ``fn`` compiles once whatever the row
+    count. Padding, slicing and joining are done in NumPy, because eager jax
+    operations compile per shape too. A 1-D ``x`` is one point. Returns NumPy
+    arrays, in the structure ``fn`` returns.
+    """
+    x = np.asarray(x)
+    if x.ndim == 1:
+        return jax.tree_util.tree_map(lambda a: a[0], _in_row_blocks(fn, tree, x[None]))
+    n = len(x)
+    if n == 0:
+        return jax.tree_util.tree_map(np.asarray, fn(tree, x))
+    padded = np.concatenate([x, np.repeat(x[:1], -n % _ROW_BLOCK, axis=0)])
+    blocks = [jax.tree_util.tree_map(np.asarray, fn(tree, padded[i:i + _ROW_BLOCK]))
+              for i in range(0, len(padded), _ROW_BLOCK)]
+    return jax.tree_util.tree_map(lambda *parts: np.concatenate(parts)[:n], *blocks)
+
 
 def _validate_chain(chain, name: str = "chain") -> np.ndarray:
     """Coerce a training chain to a 2-D float array.
@@ -226,7 +272,7 @@ def _copula_mean_log_prob(copula, z_train: jnp.ndarray) -> float:
     float
         The mean, or NaN if any row scored non-finitely.
     """
-    values = np.asarray(_dist_log_prob(copula, z_train), dtype=float)
+    values = np.asarray(_in_row_blocks(_dist_log_prob, copula, z_train), dtype=float)
     if not np.all(np.isfinite(values)):
         return float("nan")
     return float(np.mean(values))
@@ -237,8 +283,11 @@ def _dist_log_prob(dist, points: jnp.ndarray) -> jnp.ndarray:
     """``dist.log_prob(points)``, compiled once per copula architecture.
 
     A module-level function, so that the untrained and the trained copula of
-    one fit, and every later fit of the same architecture and chain shape,
-    share one compiled program (see :func:`_new_copula`).
+    one fit, and every later fit of the same architecture, share one compiled
+    program (see :func:`_new_copula`). Callers hand it fixed-size row blocks
+    (:func:`_in_row_blocks`) and flows without their stored chains
+    (:func:`_without_chains`), so neither the chain length nor the query count
+    reaches its signature.
     """
     return dist.log_prob(points)
 
@@ -396,7 +445,8 @@ def _create_empirical_transforms(samples: np.ndarray, num_points: int = 200,
     transform : Stack
         Stacked empirical transforms for each parameter dimension.
     inverse_log_det : callable
-        JIT-compiled vectorized function computing inverse transform and log determinant.
+        Maps rows to copula space, returning ``(z, log_det)`` as NumPy arrays.
+        It runs one compiled program, whatever the number of rows.
 
     Raises
     ------
@@ -455,7 +505,7 @@ def _create_empirical_transforms(samples: np.ndarray, num_points: int = 200,
             )
 
     transform = Stack(empirical_transforms)
-    inverse_log_det = functools.partial(_to_copula_space, transform)
+    inverse_log_det = functools.partial(_in_row_blocks, _to_copula_space, _without_chains(transform))
 
     return transform, inverse_log_det
 
@@ -1821,7 +1871,7 @@ def log_prob(flow: Transformed, samples: np.ndarray) -> np.ndarray:
     """
     _reject_fleet_flow(flow, "log_prob", "fleet.log_prob(x)")
     samples = _coerce_query_points(samples)
-    log_probs = np.array(filter_jit(flow.log_prob)(samples))
+    log_probs = np.array(_in_row_blocks(_dist_log_prob, _without_chains(flow), samples))
     # Each marginal evaluates an out-of-range query at its nearest bound, so an
     # unmasked point outside the prior box is scored as if it sat on the wall --
     # a finite plateau that is bitwise identical at the bound and at infinity,
