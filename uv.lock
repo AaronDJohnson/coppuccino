@@ -102,6 +102,7 @@ dependencies = [
     { name = "optax" },
     { name = "paramax" },
     { name = "scipy" },
+    { name = "tqdm" },
 ]
 
 [package.dev-dependencies]
@@ -129,6 +130,7 @@ requires-dist = [
     { name = "paramax", specifier = ">=0.0.3,<0.1.0" },
     { name = "scipy", marker = "python_full_version < '3.12'", specifier = ">=1.10,<2.0.0" },
     { name = "scipy", marker = "python_full_version >= '3.12'", specifier = ">=1.11.3,<2.0.0" },
+    { name = "tqdm", specifier = ">=4.66,<5.0" },
 ]
 
 [package.metadata.requires-dev]

@@ -31,9 +31,34 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   it ties with its own copy in the reference half, and the tie broke the
   other way, one rank (1/177 and 1/147). Saved files keep
   format 3: they store the chains, and the knots are rebuilt, padded, on load.
-  flowjax's training loop still compiles its shuffling, batching and
-  early-stopping helpers per row count, and its validation loss when the
-  validation split is under `batch_size` rows.
+- **Fits train with coppuccino's own loop instead of flowjax's
+  `fit_to_data`, and refits are different fits.** flowjax's loop compiled its
+  train/validation split, its shuffles, its batching and its early-stopping
+  test once per row count or epoch count, and its validation loss and step
+  again when a split was smaller than a batch. The new loop keeps flowjax's
+  schedule (10% validation split, batches of `batch_size` with a final partial
+  batch dropped, stop after `patience` epochs without improvement, keep the
+  best validation epoch) with no shape that follows the chain: rows are split
+  and shuffled on the host, a split smaller than a batch is one padded batch
+  with its padding rows weighted 0, 16 optimizer steps run per compiled call
+  in a `lax.scan`, and the validation loss is evaluated in 1024-row blocks.
+  After the first fit of an architecture, a fit compiles nothing.
+
+  Two choices differ from flowjax, so a refit with the same `rng_seed` is not
+  the fit 2.0.0 made. The shuffles come from NumPy seeded with `rng_seed`
+  rather than from jax keys, and the validation loss is the mean over every
+  validation row, where flowjax dropped a final partial batch. On the same 32
+  chains the fits came out equally good (per-chain median log-density within
+  about 0.1 nats of 2.0.0's), and the HDRs of the 23 injections inside their
+  chain's support moved by a median of 0.062 and at most 0.186. Refitting with
+  only the training seed changed, the same half split, moved them by a
+  median of 0.039 and at most 0.271.
+
+  Against the fixed shapes alone, total fit time fell from 155 s to 141 s
+  (chains under 2,000 rows: 1.9 s to 1.4 s each). The process stayed flat at
+  0.88 GB through all 32 fits, where it had grown to 2.46 GB. One step per
+  compiled call instead of 16 took 172 s, with bit-identical results.
+  `tqdm`, which draws the progress bar, is now a direct dependency.
 
 ## [2.0.0] — 2026-11-01
 
