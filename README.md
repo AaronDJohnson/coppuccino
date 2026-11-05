@@ -465,7 +465,7 @@ If you use coppuccino in your research, please cite it:
   author  = {Johnson, Aaron D.},
   title   = {coppuccino: copula normalizing flows in JAX},
   year    = {2026},
-  version = {2.0.0},
+  version = {2.1.0},
   url     = {https://github.com/AaronDJohnson/coppuccino}
 }
 ```
