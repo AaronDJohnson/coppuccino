@@ -6,6 +6,35 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Fits of chains of different lengths share their compiled programs.**
+  2.0.0 reused them only for a chain of the same shape, so a batch of fits on
+  chains of varying length, such as one `compute_injection_hdr` per catalogue
+  source, compiled the copula-space map and every density pass again for each
+  chain. Three shapes followed the chain, and none does now:
+  - The marginal knot arrays are padded to `max(20, num_points)` entries by
+    repeating the last knot. The tie drop had left a data-dependent count.
+    The spline kernel stops its bin search at the last real knot, so every
+    marginal value is bit-identical to the unpadded map.
+  - `log_prob`, the copula-space map and the divergence check evaluate rows
+    in fixed blocks of 1024, so the row count never reaches jit.
+  - Each marginal's stored training column, which only `save_flow` reads, is
+    left out of what jit is handed.
+
+  On 32 posterior chains of 103 to 11,396 rows by 8 columns, fitted one after
+  another in one process with `compute_injection_hdr`, total fit time fell
+  from 394 s to 155 s (chains under 2,000 rows: 8.0 s to 1.9 s each), and the
+  process peaked at 2.46 GB instead of 3.50 GB. Evaluated in blocks, a
+  density can move in its last digits (at most 3e-14 nats in that run). Every
+  HDR was unchanged except two whose injection was a row of the chain itself:
+  it ties with its own copy in the reference half, and the tie broke the
+  other way, one rank (1/177 and 1/147). Saved files keep
+  format 3: they store the chains, and the knots are rebuilt, padded, on load.
+  flowjax's training loop still compiles its shuffling, batching and
+  early-stopping helpers per row count, and its validation loss when the
+  validation split is under `batch_size` rows.
+
 ## [2.0.0] — 2026-11-01
 
 This is the first release since 1.0.0, and every change below is measured

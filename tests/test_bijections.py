@@ -382,3 +382,55 @@ class TestFloat32Path:
         core = np.abs(np.asarray(z)) <= 3.0
         assert np.max(np.abs(back[core] - np.asarray(z)[core])) < 1e-3
         assert clamps[0] > 0.0 and clamps[1] < 1.0
+
+
+class TestPaddedKnots:
+    """Every marginal's knot arrays have one length, set by ``num_points``.
+
+    The tie drop leaves a data-dependent number of knots, and jit compiles one
+    program per array shape, so unpadded knots compiled the marginal maps
+    afresh for nearly every chain. Padding repeats the last knot, which the
+    kernel never selects.
+    """
+
+    @staticmethod
+    def _chains():
+        rng = np.random.default_rng(3)
+        return {
+            "continuous": rng.normal(size=5000),
+            "tied": np.round(rng.normal(size=500), 2),
+            "short": rng.normal(size=90),  # n // 3 caps the knot count at 30
+        }
+
+    @pytest.mark.parametrize("num_points", [10, 200])
+    def test_knot_arrays_have_one_length_whatever_the_chain(self, num_points):
+        for name, x in self._chains().items():
+            m, _ = bijections._smooth_marginal_map(x, num_points=num_points)
+            shapes = {a.shape for a in (m.knot_z, m.knot_theta, m.knot_slope)}
+            assert shapes == {(max(20, num_points),)}, (name, shapes)
+
+    @pytest.mark.parametrize("bounds", [(None, None), (-4.0, 4.0)])
+    def test_padding_leaves_every_value_bit_identical(self, monkeypatch, bounds):
+        """Including the outermost knots, where the bin search ends."""
+        lo, hi = bounds
+        padded = {name: bijections._smooth_marginal_map(x, prior_low=lo, prior_high=hi)[0]
+                  for name, x in self._chains().items()}
+        unpadded_knots = bijections._rqs_bulk_knots
+        monkeypatch.setattr(bijections, "_rqs_bulk_knots",
+                            lambda *a, pad_to=None, **k: unpadded_knots(*a, **k))
+        for name, x in self._chains().items():
+            raw, _ = bijections._smooth_marginal_map(x, prior_low=lo, prior_high=hi)
+            pad = padded[name]
+            assert raw.knot_z.shape[0] < pad.knot_z.shape[0] or name == "continuous"
+            z = np.concatenate([np.linspace(-9.0, 9.0, 4001), [raw.z1, raw.zK]])
+            theta = np.concatenate([np.linspace(-6.0, 6.0, 4001), [raw.th1, raw.thK]])
+            for f, q in [(bijections._marginal_theta, z),
+                         (bijections._marginal_log_dtheta_dz, z),
+                         (bijections._marginal_z, theta)]:
+                np.testing.assert_array_equal(np.asarray(f(q, pad)), np.asarray(f(q, raw)),
+                                              err_msg=f"{name} {f.__name__}")
+
+    def test_pad_to_below_the_knot_count_is_refused(self):
+        x = np.linspace(0.0, 1.0, 50)
+        with pytest.raises(ValueError, match="pad_to"):
+            bijections._rqs_bulk_knots(x, x, pad_to=10)

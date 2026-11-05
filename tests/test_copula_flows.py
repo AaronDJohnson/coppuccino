@@ -13,8 +13,12 @@ from flowjax.distributions import Normal, Transformed
 
 from coppuccino.copula_flows import (
     _MIN_SAMPLES_PER_DIM,
+    _ROW_BLOCK,
     _assert_fit_converged,
     _create_empirical_transforms,
+    _dist_log_prob,
+    _in_row_blocks,
+    _without_chains,
     log_prob,
     normalizing_flows_fit,
     normalizing_flows_fit_auto,
@@ -622,6 +626,32 @@ class TestCompiledProgramsAreReused:
         assert [m for m in first if m.startswith("Compiling")]
         assert not [m for m in second if m.startswith("Compiling")], second
 
+    def test_a_chain_of_another_length_reuses_the_density_programs(self):
+        """A longer chain, with ties, compiles none of coppuccino's programs.
+
+        The copula-space map and every density pass used to compile per row
+        count, and the marginal maps per knot count (which the tie drop makes
+        data-dependent) and per stored-chain length. flowjax's own helpers
+        (the shuffle, the batching) still compile per row count, so only
+        coppuccino's programs and the training step are counted.
+        """
+        ours = re.compile(r"Compiling (?:jit\()?(?:_to_copula_space|_dist_log_prob|step)\b")
+        rng = np.random.default_rng(5)
+        short = np.tanh(rng.standard_normal((600, 2))) * 3.0
+        long_tied = np.round(np.tanh(rng.standard_normal((1700, 2))) * 3.0, 2)
+        knobs = {"max_epochs": 2, "flow_layers": 1, "show_progress": False,
+                 "prior_bounds": [[-3.0, 3.0], [-np.inf, np.inf]]}
+        jax.clear_caches()
+        with _compile_log() as first:
+            flow = normalizing_flows_fit(short, rng_seed=0, **knobs)
+            log_prob(flow, short)
+        with _compile_log() as second:
+            flow = normalizing_flows_fit(long_tied, rng_seed=1, **knobs)
+            log_prob(flow, long_tied[:7])
+            log_prob(flow, long_tied)
+        assert [m for m in first if ours.match(m)]
+        assert not [m for m in second if ours.match(m)], second
+
     def test_sharing_the_template_functions_does_not_change_the_fit(
             self, monkeypatch, bounded_chain):
         """A new flow takes its stored functions from a cached template.
@@ -1112,3 +1142,38 @@ class TestPriorBoxIsHardSupport:
         assert np.isneginf(got[1])
         assert np.isfinite(got[2])
         assert np.isfinite(got[3])
+
+
+class TestRowBlocks:
+    """Density evaluations run in fixed blocks of ``_ROW_BLOCK`` rows."""
+
+    @pytest.mark.parametrize("n", [0, 1, 7, _ROW_BLOCK - 1, _ROW_BLOCK,
+                                   _ROW_BLOCK + 1, 2 * _ROW_BLOCK + 5])
+    def test_blocks_reproduce_one_call_bit_for_bit(self, small_flow, n):
+        x = np.tanh(np.random.default_rng(n).standard_normal((n, 2))) * 3.0
+        flow = _without_chains(small_flow)
+        np.testing.assert_array_equal(_in_row_blocks(_dist_log_prob, flow, x),
+                                      np.asarray(_dist_log_prob(flow, x)))
+
+    def test_a_single_point_gives_a_scalar(self, small_flow):
+        point = np.array([0.1, -0.2])
+        value = _in_row_blocks(_dist_log_prob, _without_chains(small_flow), point)
+        assert np.shape(value) == ()
+        np.testing.assert_array_equal(value, log_prob(small_flow, point[None])[0])
+
+    def test_a_tuple_output_is_blocked_per_entry(self):
+        rng = np.random.default_rng(1)
+        _, inverse_log_det = _create_empirical_transforms(rng.normal(size=(300, 2)))
+        x = rng.normal(size=(_ROW_BLOCK + 3, 2))
+        z, log_det = inverse_log_det(x)
+        assert z.shape == (_ROW_BLOCK + 3, 2) and log_det.shape == (_ROW_BLOCK + 3,)
+        assert np.all(np.isfinite(z)) and np.all(np.isfinite(log_det))
+
+    def test_stripping_the_chains_keeps_everything_else(self, small_flow):
+        stripped = _without_chains(small_flow)
+        assert all(bij.samples is None for bij in stripped.bijection.bijections)
+        # The flow itself keeps its chains: model_io saves them.
+        assert all(bij.samples is not None for bij in small_flow.bijection.bijections)
+        x = np.random.default_rng(4).normal(size=(50, 2))
+        np.testing.assert_array_equal(np.asarray(_dist_log_prob(stripped, x)),
+                                      np.asarray(_dist_log_prob(small_flow, x)))

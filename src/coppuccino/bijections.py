@@ -56,7 +56,8 @@ def _rqs_bin(index_knots: Array, query: Array, xk: Array, yk: Array,
     Parameters
     ----------
     index_knots : jax.Array
-        1-D strictly increasing knots to search in.
+        1-D strictly increasing knots to search in, optionally followed by
+        repeats of the last knot.
     query : jax.Array
         Points to locate; any shape.
     xk, yk, dk : jax.Array
@@ -68,7 +69,13 @@ def _rqs_bin(index_knots: Array, query: Array, xk: Array, yk: Array,
         Left knot, bin width, left value, bin height, secant slope and the
         two knot derivatives of the containing bin, shaped like ``query``.
     """
-    n_bins = index_knots.shape[0] - 1
+    # The knots may end in repeats of their last value, the padding that gives
+    # every marginal the same array shape (see :func:`_rqs_bulk_knots`). The
+    # last real bin ends at the first occurrence of that value, so the search
+    # stops there; on unpadded knots this is ``len(index_knots) - 1``, the
+    # plain bin count, and on padded ones it picks the same bin unpadded
+    # knots would.
+    n_bins = jnp.searchsorted(index_knots, index_knots[-1], side="left")
     k = jnp.clip(jnp.searchsorted(index_knots, query, side="right") - 1, 0, n_bins - 1)
     x0, x1 = xk[k], xk[k + 1]
     y0, y1 = yk[k], yk[k + 1]
@@ -241,12 +248,18 @@ def _rqs_bulk(
 
 
 def _rqs_bulk_knots(xg: ArrayLike, cdf_vals: ArrayLike,
-                    edge_slope_floor: float = 0.0) -> tuple[Array, Array, Array]:
+                    edge_slope_floor: float = 0.0,
+                    pad_to: Optional[int] = None) -> tuple[Array, Array, Array]:
     """The knots ``(xk, yk, dk)`` behind :func:`_rqs_bulk`'s callables.
 
     Same parameters as :func:`_rqs_bulk`; the three arrays are what
     :func:`_rqs_forward`, :func:`_rqs_inverse` and :func:`_rqs_derivative`
-    take.
+    take. With ``pad_to``, each array is extended to that length by
+    repeating its last entry. The kernel never selects a padded bin (see
+    :func:`_rqs_bin`), so the map is unchanged, but its arrays then have a
+    shape set by ``pad_to`` alone rather than by how many knots survive the
+    tie drop: jit compiles one program per shape, and that count depends on
+    the data.
     """
     xg = np.asarray(xg, dtype=float)
     yg = np.asarray(cdf_vals, dtype=float)
@@ -260,6 +273,10 @@ def _rqs_bulk_knots(xg: ArrayLike, cdf_vals: ArrayLike,
     # exact-at-bound sampling atom
     yk[-1] = yg[-1]
     dk = _rqs_knot_derivatives(xk, yk, edge_slope_floor=edge_slope_floor)
+    if pad_to is not None:
+        if pad_to < len(xk):
+            raise ValueError(f"pad_to={pad_to} is below the {len(xk)} knots.")
+        xk, yk, dk = (np.pad(a, (0, pad_to - len(a)), mode="edge") for a in (xk, yk, dk))
 
     return jnp.asarray(xk), jnp.asarray(yk), jnp.asarray(dk)
 
@@ -713,6 +730,9 @@ def _smooth_marginal_map(samples: np.ndarray, num_points: int = 200,
     x = np.asarray(samples, dtype=float)
     x = x[~np.isnan(x)]
     n = len(x)
+    # The knot arrays are padded to the largest count any chain can produce
+    # under this setting, so their shape does not depend on the chain.
+    knot_slots = max(20, num_points)
     num_points = max(20, min(num_points, n // 3))
     if not 0.0 <= tail_alpha <= _TAIL_ALPHA_MAX:
         raise ValueError(
@@ -790,7 +810,7 @@ def _smooth_marginal_map(samples: np.ndarray, num_points: int = 200,
     # parameterization supplies forward, inverse and derivative. The edge
     # slope floor keeps the join slopes m1/mK (and hence the tail rates)
     # non-degenerate when PCHIP's endpoint rule returns 0.
-    knots = _rqs_bulk_knots(zq, thq, edge_slope_floor=0.05)
+    knots = _rqs_bulk_knots(zq, thq, edge_slope_floor=0.05, pad_to=knot_slots)
 
     z1, zK = float(zq[0]), float(zq[-1])
     th1, thK = float(thq[0]), float(thq[-1])
