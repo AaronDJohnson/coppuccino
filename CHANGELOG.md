@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.1.0] — 2026-11-05
+
 ### Changed
 
 - **Fits of chains of different lengths share their compiled programs.**
@@ -315,6 +317,7 @@ Initial public release.
 - Optional `prior_bounds` extension, Gaussian `tail_extension`, and an
   experimental peaks-over-threshold Generalized Pareto tail (`tail_model="gpd"`).
 
-[Unreleased]: https://github.com/AaronDJohnson/coppuccino/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/AaronDJohnson/coppuccino/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/AaronDJohnson/coppuccino/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/AaronDJohnson/coppuccino/compare/v1.0.0...v2.0.0
 [1.0.0]: https://github.com/AaronDJohnson/coppuccino/releases/tag/v1.0.0
