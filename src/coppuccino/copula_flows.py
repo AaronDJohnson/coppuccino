@@ -12,8 +12,6 @@ from equinox import filter_jit
 from flowjax.bijections import Stack
 from flowjax.distributions import Normal, Transformed
 from flowjax.flows import triangular_spline_flow
-from flowjax.train import fit_to_data
-from flowjax.train.losses import MaximumLikelihoodLoss
 from paramax import non_trainable, unwrap
 from paramax.wrappers import NonTrainable
 
@@ -537,15 +535,146 @@ def _without_weak_types(tree):
         tree)
 
 
-# A fit spends about 1.6 s compiling flowjax's training step before it trains
-# anything, and flowjax caches that compile against the loss object, the
-# optimizer and every plain function stored in the flow, all compared by
-# identity. It builds a fresh loss and optimizer on every call, and each new
-# flow carries freshly made functions, so on its own no fit ever reused
-# another's compile. Handing over one loss, one optimizer per setting and the
-# functions of one template per architecture lets every later fit of that
-# architecture skip the compile.
-_MAXIMUM_LIKELIHOOD = MaximumLikelihoodLoss()
+# ----------------------------------------------------------------------
+# Training loop
+#
+# flowjax's ``fit_to_data`` compiles its train/validation split, its per-epoch
+# shuffles, its batching and its early-stopping test once per row count (and
+# per epoch count), and its validation loss again whenever the validation
+# split is smaller than a batch. coppuccino trains with its own loop instead,
+# in which no shape depends on the chain: rows are split and shuffled on the
+# host, every optimizer step sees one (batch_size, d) batch with per-row
+# weights, ``_STEPS_PER_CALL`` steps run per compiled call, and the
+# validation loss is evaluated in fixed row blocks. Every fit of one
+# architecture and batch size then runs on the programs the first one
+# compiled. The compiled programs are cached against the optimizer and the
+# flow's stored functions, compared by identity, which is why there is one
+# optimizer per setting (:func:`_optimizer`) and one template's functions per
+# architecture (:func:`_share_template_functions`).
+# ----------------------------------------------------------------------
+
+# Optimizer steps per compiled call. One call per step costs a dispatch per
+# step; a call scans this many, skipping the slots an epoch does not fill.
+_STEPS_PER_CALL = 16
+
+
+def _weighted_nll(params, static, x: jnp.ndarray, weight: jnp.ndarray) -> jnp.ndarray:
+    """Mean negative log-density of the rows of ``x`` that have weight 1.
+
+    Padding rows carry weight 0 and drop out of the mean, which is the plain
+    mean over the real rows, flowjax's ``MaximumLikelihoodLoss``.
+    """
+    dist = unwrap(eqx.combine(params, static))
+    return -jnp.sum(weight * dist.log_prob(x)) / jnp.maximum(jnp.sum(weight), 1.0)
+
+
+@filter_jit
+def _train_steps(params, opt_state, static, xs: jnp.ndarray, weights: jnp.ndarray,
+                 optimizer):
+    """Take one optimizer step per batch of ``xs``, skipping all-zero-weight batches.
+
+    ``xs`` is ``(_STEPS_PER_CALL, batch_size, d)`` and ``weights`` is
+    ``(_STEPS_PER_CALL, batch_size)``. A skipped slot is a ``lax.cond``
+    branch that returns its input, so it costs no gradient.
+    """
+    def one_step(carry, batch):
+        x, weight = batch
+
+        def update(carry):
+            params, opt_state = carry
+            grads = eqx.filter_grad(_weighted_nll)(params, static, x, weight)
+            updates, opt_state = optimizer.update(grads, opt_state, params=params)
+            return eqx.apply_updates(params, updates), opt_state
+
+        return jax.lax.cond(jnp.any(weight > 0), update, lambda c: c, carry), None
+
+    (params, opt_state), _ = jax.lax.scan(one_step, (params, opt_state), (xs, weights))
+    return params, opt_state
+
+
+@filter_jit
+def _row_nll(model, x: jnp.ndarray) -> jnp.ndarray:
+    """Negative log-density of each row of ``x`` under ``(params, static)``."""
+    params, static = model
+    return -unwrap(eqx.combine(params, static)).log_prob(x)
+
+
+def _batch_slots(rows: np.ndarray, batch_size: int):
+    """``rows`` cut into training batches, grouped for :func:`_train_steps`.
+
+    As in flowjax, a final partial batch is dropped, unless it is the only
+    batch, in which case it is padded and its padding rows weighted 0. Yields
+    ``(xs, weights)`` pairs of ``_STEPS_PER_CALL`` batches each, the last
+    group padded with all-zero-weight batches.
+    """
+    n, d = rows.shape
+    n_batches = max(n // batch_size, 1)
+    used = min(n, n_batches * batch_size)
+    xs = np.zeros((n_batches * batch_size, d))
+    weights = np.zeros(n_batches * batch_size)
+    xs[:used], weights[:used] = rows[:used], 1.0
+    xs = xs.reshape(n_batches, batch_size, d)
+    weights = weights.reshape(n_batches, batch_size)
+    pad = -n_batches % _STEPS_PER_CALL
+    xs = np.concatenate([xs, np.zeros((pad, batch_size, d))])
+    weights = np.concatenate([weights, np.zeros((pad, batch_size))])
+    for i in range(0, len(xs), _STEPS_PER_CALL):
+        yield xs[i:i + _STEPS_PER_CALL], weights[i:i + _STEPS_PER_CALL]
+
+
+def _train_copula(flow: Transformed, x: np.ndarray, *, optimizer, rng_seed: int,
+                  max_epochs: int, patience: int, batch_size: int,
+                  show_progress: bool, val_prop: float = 0.1
+                  ) -> tuple[Transformed, list]:
+    """Fit ``flow`` to the copula-space rows ``x`` by maximum likelihood.
+
+    The schedule is flowjax's ``fit_to_data``: hold out ``round(val_prop *
+    n)`` rows for validation, train on shuffled batches of ``batch_size``
+    each epoch (a final partial batch dropped), stop once the validation loss
+    has not improved for more than ``patience`` epochs, and return the
+    parameters of the best validation epoch. Two things differ. The shuffles
+    come from NumPy seeded with ``rng_seed`` rather than from jax keys, so a
+    fit is not the one flowjax would make from the same seed, and the
+    validation loss is the mean over every validation row, where flowjax
+    drops a final partial batch.
+
+    Returns the fitted flow and the validation loss of each epoch.
+    """
+    rng = np.random.default_rng(rng_seed)
+    x = np.asarray(x, dtype=float)
+    order = rng.permutation(len(x))
+    n_train = len(x) - round(val_prop * len(x))
+    # A training split smaller than one batch is a single batch padded with
+    # zero-weight rows (see _batch_slots), so the batch shape stays fixed.
+    train, val = x[order[:n_train]], x[order[n_train:]]
+
+    params, static = eqx.partition(
+        flow, eqx.is_inexact_array, is_leaf=lambda leaf: isinstance(leaf, NonTrainable))
+    opt_state = optimizer.init(params)
+    best_params, best_loss, fruitless = params, np.inf, 0
+    val_losses: list = []
+    progress = None
+    if show_progress:
+        from tqdm import tqdm
+        progress = tqdm(total=max_epochs)
+    for _ in range(max_epochs):
+        train = train[rng.permutation(n_train)]
+        for xs, weights in _batch_slots(train, batch_size):
+            params, opt_state = _train_steps(params, opt_state, static, xs, weights, optimizer)
+        loss = float(np.mean(np.asarray(_in_row_blocks(_row_nll, (params, static), val), dtype=float)))
+        val_losses.append(loss)
+        if progress is not None:
+            progress.update()
+            progress.set_postfix({"val": loss})
+        if loss <= best_loss:
+            best_params, best_loss, fruitless = params, loss, 0
+        else:
+            fruitless += 1
+            if fruitless > patience:
+                break
+    if progress is not None:
+        progress.close()
+    return eqx.combine(best_params, static), val_losses
 
 
 @functools.lru_cache(maxsize=64)
@@ -693,15 +822,13 @@ def _fit_chain_entry(
     >>> # Fit the flow
     >>> fitted_flow = _fit_chain_entry(flow, transform, inverse_log_det, data)
     """
-    key = jr.key(rng_seed)
     x_train, _ = inverse_log_det(chain_entry)
 
-    updated_flow, _losses = fit_to_data(
-        key, input_flow, x_train,
-        loss_fn=_MAXIMUM_LIKELIHOOD,
+    updated_flow, _losses = _train_copula(
+        input_flow, x_train,
         optimizer=_optimizer(float(learning_rate), float(weight_decay)),
-        max_epochs=max_epochs, max_patience=patience, batch_size=batch_size,
-        show_progress=show_progress)
+        rng_seed=rng_seed, max_epochs=max_epochs, patience=patience,
+        batch_size=batch_size, show_progress=show_progress)
 
     # apply the empirical marginal transforms on top of the trained copula
     return Transformed(updated_flow, transform)
@@ -806,11 +933,13 @@ def normalizing_flows_fit(chain: np.ndarray, *, rng_seed: int = 999,
     batch_size : int, optional
         Rows per optimizer step. Must be an integer >= 1. Default is 100,
         which is flowjax's own default and what every earlier release used.
-        flowjax holds back 10% of the rows to decide when to stop, so an
-        epoch is that 90% split into batches. On CPU a step costs about the
-        same per row whatever its size, so a larger batch means fewer updates
-        per epoch and usually more epochs; it pays off only on large chains.
-        Measured with every other option at its default: on 10 000 x 8 rows,
+        The fit holds back 10% of the rows to decide when to stop, so an
+        epoch is that 90% split into batches, a final partial batch dropped;
+        a split smaller than one batch is a single batch. On CPU a step costs
+        about the same per row whatever its size, so a larger batch means
+        fewer updates per epoch and usually more epochs; it pays off only on
+        large chains. Measured with 2.0.0 and every other option at its
+        default: on 10 000 x 8 rows,
         256 fitted about 22% faster (7.0 s against 9.0 s) at the same
         held-out log-density; on the 2 880 fitting rows of the
         galactic-binary posterior in ``examples/`` it was 13% slower (209
@@ -944,7 +1073,7 @@ def _n_trainable_params(flow: Transformed) -> int:
     candidates); this is the model-size measure ``normalizing_flows_fit_auto``
     uses to pick the smallest comparable candidate.
 
-    ``paramax.NonTrainable`` subtrees are excluded too: flowjax's training loop
+    ``paramax.NonTrainable`` subtrees are excluded too: the training loop
     partitions them out of the optimizer, so they carry no fitted degrees of
     freedom and must not count toward "model size".
     """
