@@ -52,6 +52,8 @@ dependencies = [
     # but a direct import deserves a direct declaration)
     "optax>=0.2.2,<0.3.0",
     "cloudpickle>=2.2.1,<4.0.0",
+    # the training loop's progress bar (flowjax depends on it as well)
+    "tqdm>=4.66,<5.0",
 ]
 
 [project.urls]

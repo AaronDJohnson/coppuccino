@@ -10,14 +10,22 @@ import numpy as np
 import pytest
 from equinox import filter_jit
 from flowjax.distributions import Normal, Transformed
+from paramax.wrappers import NonTrainable
 
 from coppuccino.copula_flows import (
     _MIN_SAMPLES_PER_DIM,
     _ROW_BLOCK,
+    _STEPS_PER_CALL,
     _assert_fit_converged,
+    _batch_slots,
     _create_empirical_transforms,
     _dist_log_prob,
     _in_row_blocks,
+    _new_copula,
+    _optimizer,
+    _train_copula,
+    _train_steps,
+    _weighted_nll,
     _without_chains,
     log_prob,
     normalizing_flows_fit,
@@ -438,33 +446,33 @@ class TestTrainingKnobValidation:
 
 
 class _StopBeforeTraining(Exception):
-    """Raised by a ``fit_to_data`` spy once it has seen its arguments."""
+    """Raised by a ``_train_copula`` spy once it has seen its arguments."""
 
 
 def _captured_fit_kwargs(monkeypatch, chain, **kwargs):
-    """The keyword arguments ``normalizing_flows_fit`` hands to flowjax.
+    """The keyword arguments ``normalizing_flows_fit`` hands to its training loop.
 
-    A spy on the ``fit_to_data`` that module calls records them and stops
+    A spy on the ``_train_copula`` that module calls records them and stops
     before any training happens.
     """
     captured = {}
 
-    def spy(key, dist, x, **fit_kwargs):
+    def spy(dist, x, **fit_kwargs):
         captured.update(fit_kwargs)
         raise _StopBeforeTraining
 
-    monkeypatch.setattr("coppuccino.copula_flows.fit_to_data", spy)
+    monkeypatch.setattr("coppuccino.copula_flows._train_copula", spy)
     with pytest.raises(_StopBeforeTraining):
         normalizing_flows_fit(chain, show_progress=False, **kwargs)
     return captured
 
 
 class TestWeightDecayReachesTheOptimizer:
-    """``weight_decay`` is wired through to the optimizer flowjax trains with.
+    """``weight_decay`` is wired through to the optimizer the fit trains with.
 
     The only fit that exercises it otherwise asserts a finite density, which
     plain Adam gives too, so dropping the AdamW branch in ``_fit_chain_entry``
-    left the suite green. A spy on the ``fit_to_data`` that module calls
+    left the suite green. A spy on the ``_train_copula`` that module calls
     captures its keyword arguments and stops before any training happens.
     """
 
@@ -503,8 +511,8 @@ class TestWeightDecayReachesTheOptimizer:
         np.testing.assert_array_equal(np.asarray(updates), np.asarray(expected))
 
 
-class TestBatchSizeReachesFlowjax:
-    """``batch_size`` is the number of rows per optimizer step flowjax takes."""
+class TestBatchSizeReachesTheTrainingLoop:
+    """``batch_size`` is the number of rows per optimizer step."""
 
     def test_the_default_is_flowjax_s_own_100(self, monkeypatch, bounded_chain):
         """Unchanged from before the option existed, when flowjax chose it."""
@@ -544,9 +552,9 @@ def _compile_log():
         logger.removeHandler(handler)
 
 
-# flowjax's jitted training step. JAX names the program "step" up to 0.4.x and
-# "jit(step)" from 0.5 on.
-_TRAINING_STEP_COMPILE = re.compile(r"Compiling (?:jit\()?step\b")
+# The jitted training steps. JAX names the program "_train_steps" up to 0.4.x
+# and "jit(_train_steps)" from 0.5 on.
+_TRAINING_STEP_COMPILE = re.compile(r"Compiling (?:jit\()?_train_steps\b")
 # Any jitted program whose name ends in log_prob: the divergence check's pass
 # over the training rows, whatever function wraps it.
 _DENSITY_PASS_COMPILE = re.compile(r"Compiling (?:jit\()?\w*log_prob\b")
@@ -626,31 +634,34 @@ class TestCompiledProgramsAreReused:
         assert [m for m in first if m.startswith("Compiling")]
         assert not [m for m in second if m.startswith("Compiling")], second
 
-    def test_a_chain_of_another_length_reuses_the_density_programs(self):
-        """A longer chain, with ties, compiles none of coppuccino's programs.
+    def test_chains_of_other_lengths_compile_nothing(self):
+        """Longer, tied and shorter-than-a-batch chains: no program compiles.
 
         The copula-space map and every density pass used to compile per row
         count, and the marginal maps per knot count (which the tie drop makes
-        data-dependent) and per stored-chain length. flowjax's own helpers
-        (the shuffle, the batching) still compile per row count, so only
-        coppuccino's programs and the training step are counted.
+        data-dependent) and per stored-chain length. flowjax's training loop
+        compiled its split, shuffles, batching and early-stopping test per row
+        count, and its validation loss and step again for a split smaller
+        than a batch. The 70-row chain has a 63-row training split and a
+        7-row validation split, both under ``batch_size``.
         """
-        ours = re.compile(r"Compiling (?:jit\()?(?:_to_copula_space|_dist_log_prob|step)\b")
         rng = np.random.default_rng(5)
         short = np.tanh(rng.standard_normal((600, 2))) * 3.0
         long_tied = np.round(np.tanh(rng.standard_normal((1700, 2))) * 3.0, 2)
-        knobs = {"max_epochs": 2, "flow_layers": 1, "show_progress": False,
+        tiny = np.tanh(rng.standard_normal((70, 2))) * 3.0
+        knobs = {"max_epochs": 3, "flow_layers": 1, "show_progress": False,
                  "prior_bounds": [[-3.0, 3.0], [-np.inf, np.inf]]}
         jax.clear_caches()
         with _compile_log() as first:
             flow = normalizing_flows_fit(short, rng_seed=0, **knobs)
             log_prob(flow, short)
-        with _compile_log() as second:
-            flow = normalizing_flows_fit(long_tied, rng_seed=1, **knobs)
-            log_prob(flow, long_tied[:7])
-            log_prob(flow, long_tied)
-        assert [m for m in first if ours.match(m)]
-        assert not [m for m in second if ours.match(m)], second
+        with _compile_log() as later:
+            for seed, chain in enumerate([long_tied, tiny], start=1):
+                flow = normalizing_flows_fit(chain, rng_seed=seed, **knobs)
+                log_prob(flow, chain[:7])
+                log_prob(flow, chain)
+        assert [m for m in first if _TRAINING_STEP_COMPILE.match(m)]
+        assert not [m for m in later if m.startswith("Compiling")], later
 
     def test_sharing_the_template_functions_does_not_change_the_fit(
             self, monkeypatch, bounded_chain):
@@ -1177,3 +1188,77 @@ class TestRowBlocks:
         x = np.random.default_rng(4).normal(size=(50, 2))
         np.testing.assert_array_equal(np.asarray(_dist_log_prob(stripped, x)),
                                       np.asarray(_dist_log_prob(small_flow, x)))
+
+
+class TestTrainingLoop:
+    """coppuccino's own loop keeps flowjax's schedule with fixed shapes."""
+
+    @staticmethod
+    def _copula(dim=2):
+        return _new_copula(jax.random.key(0), dim, 4, 1, 3.0)
+
+    @pytest.mark.parametrize("n, full_batches", [(250, 2), (63, 1), (3400, 34)])
+    def test_batches_drop_a_partial_batch_unless_it_is_the_only_one(self, n, full_batches):
+        rows = np.arange(n * 2, dtype=float).reshape(n, 2) + 1.0
+        groups = list(_batch_slots(rows, 100))
+        xs = np.concatenate([g[0] for g in groups])
+        weights = np.concatenate([g[1] for g in groups])
+        assert all(g[0].shape == (_STEPS_PER_CALL, 100, 2) for g in groups)
+        assert len(xs) == -(-full_batches // _STEPS_PER_CALL) * _STEPS_PER_CALL
+        used = min(n, full_batches * 100)
+        assert weights.sum() == used
+        # The weighted rows are the leading rows, in order; the rest are zero.
+        np.testing.assert_array_equal(xs.reshape(-1, 2)[weights.reshape(-1) > 0], rows[:used])
+        assert not xs.reshape(-1, 2)[weights.reshape(-1) == 0].any()
+
+    def test_the_weighted_loss_is_the_mean_over_the_real_rows(self):
+        flow = self._copula()
+        params, static = eqx.partition(flow, eqx.is_inexact_array)
+        x = np.random.default_rng(0).normal(size=(10, 2))
+        padded = np.concatenate([x, np.zeros((6, 2))])
+        weight = np.concatenate([np.ones(10), np.zeros(6)])
+        np.testing.assert_allclose(float(_weighted_nll(params, static, padded, weight)),
+                                   -float(np.mean(np.asarray(flow.log_prob(x)))), rtol=1e-12)
+
+    def test_a_slot_without_weight_takes_no_step(self):
+        params, static = eqx.partition(self._copula(), eqx.is_inexact_array)
+        optimizer = _optimizer(1e-2, 0.0)
+        opt_state = optimizer.init(params)
+        xs = np.random.default_rng(1).normal(size=(_STEPS_PER_CALL, 100, 2))
+        new_params, new_state = _train_steps(params, opt_state, static, xs,
+                                             np.zeros((_STEPS_PER_CALL, 100)), optimizer)
+        for a, b in zip(jax.tree_util.tree_leaves((params, opt_state)),
+                        jax.tree_util.tree_leaves((new_params, new_state))):
+            np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+        # One weighted slot is one step: Adam's step count goes up by one.
+        weights = np.zeros((_STEPS_PER_CALL, 100))
+        weights[3] = 1.0
+        _, stepped = _train_steps(params, opt_state, static, xs, weights, optimizer)
+        assert int(stepped[0].count) == int(opt_state[0].count) + 1
+
+    def test_training_stops_after_patience_and_returns_the_best_epoch(self, monkeypatch):
+        """Validation losses 3, 2, 2.5, 2.6, ... at patience 1: stop after epoch 4, keep epoch 2."""
+        import coppuccino.copula_flows as cf
+
+        scripted = iter([3.0, 2.0, 2.5, 2.6, 2.7, 2.8])
+        seen = []
+
+        def scripted_losses(fn, model, rows):
+            seen.append(model[0])
+            return np.full(len(rows), next(scripted))
+
+        monkeypatch.setattr(cf, "_in_row_blocks", scripted_losses)
+        x = np.random.default_rng(2).normal(size=(400, 2))
+        flow, losses = _train_copula(self._copula(), x, optimizer=_optimizer(1e-2, 0.0),
+                                     rng_seed=0, max_epochs=6, patience=1, batch_size=100,
+                                     show_progress=False)
+        assert losses == [3.0, 2.0, 2.5, 2.6]
+        best = eqx.partition(flow, eqx.is_inexact_array,
+                             is_leaf=lambda leaf: isinstance(leaf, NonTrainable))[0]
+        for a, b in zip(jax.tree_util.tree_leaves(best), jax.tree_util.tree_leaves(seen[1])):
+            np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+    def test_one_seed_gives_one_fit(self, bounded_chain):
+        knobs = {"max_epochs": 3, "flow_layers": 1, "rng_seed": 4, "show_progress": False}
+        a, b = (normalizing_flows_fit(bounded_chain, **knobs) for _ in range(2))
+        np.testing.assert_array_equal(log_prob(a, bounded_chain), log_prob(b, bounded_chain))
