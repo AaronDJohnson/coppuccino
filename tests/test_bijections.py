@@ -356,20 +356,33 @@ class TestSharedRQSKernel:
         assert floored[0] == 0.05 * (steepening[1] - steepening[0]) / (xk[1] - xk[0])
 
 
+
+def _x64_disabled():
+    """Context manager that turns x64 off, on old and new jax alike.
+
+    ``jax.experimental.disable_x64`` was removed in jax 0.9.0; its replacement,
+    the ``jax.enable_x64`` config context manager, is absent from 0.7.2.
+    """
+    if hasattr(jax, "enable_x64"):
+        return jax.enable_x64(False)
+    return jax.experimental.disable_x64()
+
+
 class TestFloat32Path:
     """The x64-disabled path had no coverage anywhere in tests/.
 
     ``coppuccino`` enables x64 on import, but that is a process-wide setting
     a caller can turn back off, and several constants in this module are
-    float64 literals that underflow below it. Everything here runs inside
-    ``jax.experimental.disable_x64()``.
+    float64 literals that underflow below it. Everything here runs with x64
+    switched off (``jax.enable_x64(False)``, or
+    ``jax.experimental.disable_x64()`` on jax releases that predate it).
     """
 
     def test_smooth_marginal_stays_a_finite_monotone_map_without_x64(self):
         """The bounded tails must not go NaN or non-monotone in float32."""
         rng = np.random.default_rng(1)
         x = np.clip(rng.beta(0.5, 3.0, 3000), 0.0, 1.0)
-        with jax.experimental.disable_x64():
+        with _x64_disabled():
             theta_of_z, z_of_theta, log_dtheta_dz, clamps = (
                 make_smooth_marginal(x, prior_low=0.0, prior_high=1.0))
             z = jnp.asarray(np.linspace(-7.0, 7.0, 1001, dtype=np.float32))

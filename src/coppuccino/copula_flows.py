@@ -1040,9 +1040,11 @@ def normalizing_flows_fit(chain: np.ndarray, *, rng_seed: int = 999,
     # The training chain in copula space. inverse_log_det is the jitted
     # marginal map; _fit_chain_entry calls the same compiled function, so this
     # is a cache hit rather than a second trace. The post-fit divergence check
-    # needs it.
+    # needs it. `device_put` rather than `jnp.asarray`: from jax 0.10 the latter
+    # lifts a host array through `lax.stage`, an identity program compiled
+    # once per shape, so every new chain length would compile it again.
     z_train, _ = inverse_log_det(clean_chain)
-    z_train = jnp.asarray(z_train)
+    z_train = jax.device_put(z_train)
 
     n_params = clean_chain.shape[1]
     # Gaussianized copula: triangular spline flow on unbounded space.
