@@ -416,15 +416,15 @@ tails. Bounded sides ignore it.
 ## Requirements
 
 - Python 3.11–3.14
-- JAX / jaxlib >=0.4.38,<0.8
+- JAX / jaxlib >=0.7.2,<0.13
 - NumPy >=1.26,<3
 - SciPy >=1.10 (>=1.11.3 on Python 3.12, which is where cp312 wheels became
   routinely available; 1.11.2 is the first release that carries them)
 - Equinox >=0.13.2,<0.14
 - jaxtyping >=0.3.6,<0.4
-- FlowJAX >=17.2.1,<18
-- paramax >=0.0.3,<0.1 (pre-1.0, so the ceiling is on the minor; flowjax leaves
-  it unbounded, so a paramax 0.1.0 release would make that pairing
+- FlowJAX >=19.2.1,<20
+- paramax >=0.0.5,<0.1 (pre-1.0, so the ceiling is on the minor; flowjax
+  leaves it unbounded, so a paramax 0.1.0 release would make that pairing
   unsatisfiable until coppuccino widens the line — see `CHANGELOG.md`)
 - optax >=0.2.2,<0.3 (the fleet optimiser, and `normalizing_flows_fit(weight_decay=...)`)
 - cloudpickle >=2.2.1,<4 (used by `save_flow` / `load_flow`)
@@ -434,25 +434,19 @@ oldest versions that pass the test suite on 3.11/3.12; on 3.13 and 3.14 a normal
 install resolves newer versions (the oldest floors predate cp313/cp314 wheels),
 which is what the CI "highest" jobs exercise there.
 
-The JAX upper bound is set by the flowjax 17.2.1 pairing, not by choice.
-flowjax declares no ceiling of its own (`jax>=0.4.16`), so the real cap is
-measured rather than declared. On Python 3.11 with flowjax 17.2.1, equinox
-0.13.8, jaxtyping 0.3.11 and paramax 0.0.5, jax+jaxlib
-**0.8.2 and above** (0.8.2, 0.8.3 and 0.9.2 tested) fail at fit time, not in a
-corner, inside flowjax's own `arraylike_to_array` input check: it rejects the
-`BatchTracer` these versions pass through `vmap`. `normalizing_flows_fit` fails
-raising `TypeError: Expected input to be arraylike; got BatchTracer` while
-applying the marginal `Stack` to the training chain, before the copula flow is
-built at all, and `normalizing_flows_fit_fleet` fails with
-`Expected x to be arraylike; got BatchTracer` inside its vmapped training loss.
-jax 0.7.2, 0.8.0 and 0.8.1 all fit, sample and score. All of those ship
-cp311–cp314 wheels. The declared `<0.8` ceiling is therefore stricter than the
-core measurement requires — 0.8.0 and 0.8.1 fit — but it is not gratuitous: run
-against jax 0.8.1 in that same environment the test suite reports 2 failed, 413
-passed, 1 xfailed, both failures in the float32 (x64-disabled) path, where the
-supported configuration (the committed lock, jax 0.7.2) is fully green. The
-exact ranges (including per-Python markers) live in
-`pyproject.toml` and `pip`/`uv` resolve them automatically. The example
+The JAX upper bound is the newest release tested. The committed lock resolves
+flowjax 19.2.1, equinox 0.13.8, paramax 0.0.5 and jaxtyping 0.3.11 with jax
+0.12.1 on Python 3.12+ and jax 0.10.2 on Python 3.11 (jax 0.11+ requires 3.12
+or newer); the full test suite passes on both. The JAX floor of 0.7.2 is
+flowjax 19's own requirement (`jax>=0.7.0`) less the 0.7.0 and 0.7.1 releases
+that equinox excludes.
+
+flowjax 17.x is no longer supported. Its `arraylike_to_array` input check
+rejects the `BatchTracer` that jax 0.8.2 and later pass through `vmap`, so
+fits fail with `TypeError: Expected input to be arraylike; got BatchTracer`.
+That incompatibility set the old `<0.8` JAX ceiling. The exact ranges
+(including per-Python markers) live in `pyproject.toml` and `pip`/`uv` resolve
+them automatically. The example
 notebooks need a few extra packages — see
 [`examples/requirements.txt`](examples/requirements.txt).
 

@@ -6,6 +6,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Dependency ranges moved to the current jax and flowjax.**
+  jax/jaxlib from `>=0.4.38,<0.8` to `>=0.7.2,<0.13`, flowjax from
+  `>=17.2.1,<18` to `>=19.2.1,<20`, paramax from `>=0.0.3` to `>=0.0.5`. The
+  lock now resolves jax 0.12.1 (0.10.2 on Python 3.11) and flowjax 19.2.1.
+  flowjax 17.x rejected the `BatchTracer` that jax 0.8.2+ passes through
+  `vmap`, which is what had capped jax below 0.8; the raised floors rule that
+  pairing out.
+- The training chain is moved to device with `jax.device_put` rather than
+  `jnp.asarray`. From jax 0.10, `jnp.asarray` on a NumPy array runs a
+  `lax.stage` program compiled per shape, which compiled once for every new
+  chain length.
+
 ## [2.1.0] — 2026-11-05
 
 ### Changed

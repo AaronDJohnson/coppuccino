@@ -227,7 +227,8 @@ class TestLogProbAccuracy:
         # residual std <= 0.279 on both the current and the oldest supported
         # dependencies. On current ones the best validation epoch is 22
         # (seeds 1, 2: 25, 39), so 40 returns the same flow as 120. On the
-        # oldest (jax 0.4.38, optax 0.2.2) it is 55 (65, 49), so 40 stops
+        # then-oldest (jax 0.4.38, optax 0.2.2; the jax floor is now 0.7.2,
+        # not re-measured) it is 55 (65, 49), so 40 stops
         # short, but the 120-epoch fit scores no better: corr 0.961 to 0.969,
         # std 0.237 to 0.276. Rows are what buy the margin: on current
         # dependencies 4000 rows give 0.944 / 0.331 and 2000 rows fail the
@@ -1160,11 +1161,20 @@ class TestRowBlocks:
 
     @pytest.mark.parametrize("n", [0, 1, 7, _ROW_BLOCK - 1, _ROW_BLOCK,
                                    _ROW_BLOCK + 1, 2 * _ROW_BLOCK + 5])
-    def test_blocks_reproduce_one_call_bit_for_bit(self, small_flow, n):
+    def test_blocks_reproduce_one_call(self, small_flow, n):
+        """Blocked evaluation matches one unblocked call to round-off.
+
+        This was bit-for-bit on jax 0.7.2. On jax 0.12.1 XLA compiles the
+        unblocked program for 2048+ rows differently from the 1024-row block
+        program, and the two disagree by a few ulp (about 2e-15 absolute on
+        log densities of order 1) on a few percent of rows. The reference
+        call is what moved; the blocked result is unchanged.
+        """
         x = np.tanh(np.random.default_rng(n).standard_normal((n, 2))) * 3.0
         flow = _without_chains(small_flow)
-        np.testing.assert_array_equal(_in_row_blocks(_dist_log_prob, flow, x),
-                                      np.asarray(_dist_log_prob(flow, x)))
+        np.testing.assert_allclose(_in_row_blocks(_dist_log_prob, flow, x),
+                                   np.asarray(_dist_log_prob(flow, x)),
+                                   rtol=1e-13, atol=1e-13)
 
     def test_a_single_point_gives_a_scalar(self, small_flow):
         point = np.array([0.1, -0.2])
